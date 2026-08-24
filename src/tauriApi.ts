@@ -8,20 +8,86 @@ export interface AppHealth {
   message: string;
 }
 
-export interface FoundationNote {
-  id: number;
-  title: string;
-  createdAtUtc: string;
+export interface AppointmentSummary {
+  id: string;
+  customerId: string;
+  staffId: string;
+  startAtUtc: string;
+  endAtUtc: string;
+  totalDurationMinutes: number;
+  status: string;
+  note: string | null;
+  customerName: string;
+  customerPhone: string;
+  staffName: string;
+  serviceNames: string[];
+}
+
+export interface CustomerInput {
+  firstName: string;
+  lastName: string;
+  phone: string;
+  email?: string | null;
+  notes?: string | null;
+  whatsappReminderEnabled?: boolean;
+  whatsappConsentConfirmed?: boolean;
+}
+
+export interface StaffInput {
+  firstName: string;
+  lastName?: string | null;
+  phone?: string | null;
+  specialtyNote?: string | null;
+  colorKey: string;
+  isActive?: boolean;
+}
+
+export interface CategoryInput {
+  name: string;
+  isActive?: boolean;
+}
+
+export interface ServiceInput {
+  categoryId: string;
+  name: string;
+  durationMinutes?: number | null;
+  isActive?: boolean;
+}
+
+export interface AppointmentInput {
+  customerId: string;
+  staffId: string;
+  localDate: string;
+  localStartTime: string;
+  serviceIds: string[];
+  status?: string;
+  note?: string | null;
 }
 
 export async function getAppHealth(): Promise<AppHealth> {
   return invoke<AppHealth>("app_health");
 }
 
-export async function createFoundationNote(title: string): Promise<FoundationNote> {
-  return invoke<FoundationNote>("create_foundation_note", { title });
+export async function listAppointmentsByDate(localDate: string): Promise<AppointmentSummary[]> {
+  return invoke<AppointmentSummary[]>("appointment_list_by_date", { localDate, limit: 20 });
 }
 
-export async function listFoundationNotes(limit = 10): Promise<FoundationNote[]> {
-  return invoke<FoundationNote[]>("list_foundation_notes", { limit });
-}
+export const coreDataCommands = [
+  "customer_create",
+  "customer_update",
+  "customer_set_active",
+  "customer_search",
+  "staff_create",
+  "staff_update",
+  "staff_set_active",
+  "staff_list",
+  "staff_set_services",
+  "service_category_create",
+  "service_create",
+  "service_update",
+  "service_set_active",
+  "service_list",
+  "appointment_create",
+  "appointment_update",
+  "appointment_list_by_date"
+] as const;

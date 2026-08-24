@@ -9,14 +9,26 @@ test("React shell keeps the required navigation and appointment action", async (
     assert.match(source, new RegExp(`"${label}"`));
   }
   assert.match(source, /\+ Yeni Randevu/);
+  assert.match(source, /listAppointmentsByDate/);
 });
 
-test("Tauri Rust boundary exposes only named foundation commands", async () => {
+test("Tauri Rust boundary exposes only named core data commands", async () => {
   const source = await readFile(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
 
   assert.match(source, /app_health/);
-  assert.match(source, /create_foundation_note/);
-  assert.match(source, /list_foundation_notes/);
+  for (const command of [
+    "customer_create",
+    "customer_search",
+    "staff_list",
+    "staff_set_services",
+    "service_list",
+    "appointment_create",
+    "appointment_update",
+    "appointment_list_by_date"
+  ]) {
+    assert.match(source, new RegExp(command));
+  }
   assert.doesNotMatch(source, /read_file/);
   assert.doesNotMatch(source, /execute_sql/);
+  assert.doesNotMatch(source, /executeSql/);
 });

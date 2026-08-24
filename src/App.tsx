@@ -1,15 +1,21 @@
-import { useEffect, useMemo, useState } from "react";
-import type { AppHealth, FoundationNote } from "./tauriApi";
-import { createFoundationNote, getAppHealth, listFoundationNotes } from "./tauriApi";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import type { AppHealth, AppointmentSummary } from "./tauriApi";
+import { getAppHealth, listAppointmentsByDate } from "./tauriApi";
 
 const navigationItems = ["Bugun", "Takvim", "Musteriler", "Hizmetler", "Personel", "Ayarlar"] as const;
+
+function todayLocalDate(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+}
 
 export function App() {
   const [activeItem, setActiveItem] = useState<(typeof navigationItems)[number]>("Bugun");
   const [health, setHealth] = useState<AppHealth | null>(null);
-  const [notes, setNotes] = useState<FoundationNote[]>([]);
+  const [appointments, setAppointments] = useState<AppointmentSummary[]>([]);
   const [status, setStatus] = useState("Hazirlaniyor");
 
+  const localDate = useMemo(() => todayLocalDate(), []);
   const todayLabel = useMemo(() => {
     return new Intl.DateTimeFormat("tr-TR", {
       weekday: "long",
@@ -18,24 +24,18 @@ export function App() {
     }).format(new Date());
   }, []);
 
-  async function refreshFoundation() {
-    const [nextHealth, nextNotes] = await Promise.all([getAppHealth(), listFoundationNotes()]);
+  const refreshCoreData = useCallback(async () => {
+    const [nextHealth, todaysAppointments] = await Promise.all([getAppHealth(), listAppointmentsByDate(localDate)]);
     setHealth(nextHealth);
-    setNotes(nextNotes);
-    setStatus(nextHealth.ok ? "SQLite hazir" : "Kontrol gerekiyor");
-  }
+    setAppointments(todaysAppointments);
+    setStatus(nextHealth.ok ? "SQLite core hazir" : "Kontrol gerekiyor");
+  }, [localDate]);
 
   useEffect(() => {
-    void refreshFoundation().catch((error) => {
+    void refreshCoreData().catch((error) => {
       setStatus(error instanceof Error ? error.message : "Native komut yanit vermedi");
     });
-  }, []);
-
-  async function handleFoundationWrite() {
-    setStatus("Kaydediliyor");
-    await createFoundationNote(`Foundation smoke ${new Date().toISOString()}`);
-    await refreshFoundation();
-  }
+  }, [refreshCoreData]);
 
   return (
     <div className="app-shell">
@@ -74,15 +74,12 @@ export function App() {
 
         <section className="today-panel" aria-labelledby="today-title">
           <div>
-            <p className="eyebrow">Foundation</p>
-            <h2 id="today-title">Randevu akisi icin temiz baslangic</h2>
-            <p>
-              Bu shell yeni Tauri mimarisinin ilk iskeletidir. Eski Electron arayuzu kopyalanmadi;
-              gunluk salon kullanimi icin sade bir ana akisa yer acildi.
-            </p>
+            <p className="eyebrow">Core data</p>
+            <h2 id="today-title">Bugunun randevu akisi</h2>
+            <p>Bu ekran Tauri Rust komutu ile lokal SQLite appointment sorgusunu cagirir.</p>
           </div>
-          <button type="button" className="secondary-action" onClick={() => void handleFoundationWrite()}>
-            SQLite yaz/oku testi
+          <button type="button" className="secondary-action" onClick={() => void refreshCoreData()}>
+            Randevulari yenile
           </button>
         </section>
 
@@ -96,21 +93,21 @@ export function App() {
             <strong>{health ? `v${health.schemaVersion}` : "..."}</strong>
           </div>
           <div className="status-card status-card--wide">
-            <span>Test veri yolu</span>
+            <span>Local veri yolu</span>
             <strong>{health?.databasePath ?? "..."}</strong>
           </div>
         </section>
 
-        <section className="notes-panel" aria-label="SQLite foundation kayitlari">
-          <h2>Son SQLite kayitlari</h2>
-          {notes.length === 0 ? (
-            <p>Henüz smoke kaydi yok.</p>
+        <section className="notes-panel" aria-label="Bugunun randevulari">
+          <h2>Bugunun randevulari</h2>
+          {appointments.length === 0 ? (
+            <p>Bugun icin lokal randevu kaydi yok.</p>
           ) : (
             <ul>
-              {notes.map((note) => (
-                <li key={note.id}>
-                  <span>{note.title}</span>
-                  <time>{new Date(note.createdAtUtc).toLocaleString("tr-TR")}</time>
+              {appointments.map((appointment) => (
+                <li key={appointment.id}>
+                  <span>{appointment.customerName} - {appointment.serviceNames.join(", ")}</span>
+                  <time>{new Date(appointment.startAtUtc).toLocaleTimeString("tr-TR", { hour: "2-digit", minute: "2-digit" })}</time>
                 </li>
               ))}
             </ul>
