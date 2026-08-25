@@ -64,12 +64,44 @@ export interface AppointmentInput {
   note?: string | null;
 }
 
+export interface GoogleConnectionStatus {
+  configured: boolean;
+  connected: boolean;
+  pendingSyncCount: number;
+  blockedSyncCount: number;
+}
+
+export interface CloudConnectionStatus {
+  configured: boolean;
+  sessionPresent: boolean;
+}
+
 export async function getAppHealth(): Promise<AppHealth> {
   return invoke<AppHealth>("app_health");
 }
 
 export async function listAppointmentsByDate(localDate: string): Promise<AppointmentSummary[]> {
   return invoke<AppointmentSummary[]>("appointment_list_by_date", { localDate, limit: 20 });
+}
+
+export async function getGoogleCalendarStatus(): Promise<GoogleConnectionStatus> {
+  return invoke<GoogleConnectionStatus>("google_calendar_status");
+}
+
+export async function getCloudConnectionStatus(): Promise<CloudConnectionStatus> {
+  return invoke<CloudConnectionStatus>("cloud_connection_status");
+}
+
+export async function requestCloudOtp(email: string): Promise<boolean> {
+  return invoke<boolean>("cloud_request_otp", { email });
+}
+
+export async function verifyCloudOtp(email: string, otp: string): Promise<CloudConnectionStatus> {
+  return invoke<CloudConnectionStatus>("cloud_verify_otp", { email, otp });
+}
+
+export async function disconnectCloud(): Promise<boolean> {
+  return invoke<boolean>("cloud_disconnect");
 }
 
 export const coreDataCommands = [
@@ -89,5 +121,10 @@ export const coreDataCommands = [
   "service_list",
   "appointment_create",
   "appointment_update",
-  "appointment_list_by_date"
+  "appointment_list_by_date",
+  "google_calendar_status",
+  "cloud_connection_status",
+  "cloud_request_otp",
+  "cloud_verify_otp",
+  "cloud_disconnect"
 ] as const;

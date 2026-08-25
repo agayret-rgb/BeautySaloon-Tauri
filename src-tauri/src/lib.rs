@@ -10,12 +10,14 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 use thiserror::Error;
 
+mod services;
+
 const CORE_SCHEMA_VERSION: i64 = 13;
 const ISTANBUL_OFFSET_MINUTES: i64 = 180;
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Error)]
-enum AppError {
+pub(crate) enum AppError {
     #[error("App data yolu hazirlanamadi: {0}")]
     AppDataPath(String),
     #[error("VALIDATION_ERROR: {0}")]
@@ -1763,6 +1765,73 @@ fn auth_logout(state: tauri::State<'_, AppState>) -> Result<bool, AppError> {
     Ok(true)
 }
 
+#[tauri::command]
+fn google_calendar_status(state: tauri::State<'_, AppState>) -> Result<services::google::GoogleConnectionStatus, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    let protector = services::secure_store::WindowsDpapiProtector;
+    services::google::google_connection_status(&connection, services::secure_store::secure_storage_available(&protector))
+}
+
+#[tauri::command]
+fn cloud_connection_status(state: tauri::State<'_, AppState>) -> Result<services::supabase::SupabaseConnectionStatus, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    let (project_url, publishable_key): (Option<String>, Option<String>) = connection.query_row(
+        "SELECT project_url, publishable_key FROM cloud_reminder_settings WHERE id=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(services::supabase::SupabaseConnectionStatus {
+        configured: project_url.is_some() && publishable_key.is_some(),
+        session_present: services::reminder_cloud::has_session_secret(&connection)?,
+    })
+}
+
+#[tauri::command]
+fn cloud_request_otp(email: String, state: tauri::State<'_, AppState>) -> Result<bool, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    let config = read_supabase_config(&connection)?.ok_or_else(|| AppError::Validation("CLOUD_NOT_CONFIGURED".to_string()))?;
+    let mut transport = services::google::ReqwestHttpTransport;
+    services::supabase::request_email_otp(&mut transport, &config, &email)?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn cloud_verify_otp(email: String, otp: String, state: tauri::State<'_, AppState>) -> Result<services::supabase::SupabaseConnectionStatus, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    let config = read_supabase_config(&connection)?.ok_or_else(|| AppError::Validation("CLOUD_NOT_CONFIGURED".to_string()))?;
+    let mut transport = services::google::ReqwestHttpTransport;
+    let session = services::supabase::verify_email_otp(&mut transport, &config, &email, &otp)?;
+    let protector = services::secure_store::WindowsDpapiProtector;
+    services::secure_store::store_supabase_session(&connection, &protector, &session)?;
+    Ok(services::supabase::SupabaseConnectionStatus {
+        configured: true,
+        session_present: true,
+    })
+}
+
+#[tauri::command]
+fn cloud_disconnect(state: tauri::State<'_, AppState>) -> Result<bool, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    services::secure_store::delete_secret(&connection, "cloud_supabase_session")?;
+    Ok(true)
+}
+
+fn read_supabase_config(connection: &Connection) -> Result<Option<services::supabase::SupabaseConfig>, AppError> {
+    let row: Option<(Option<String>, Option<String>)> = connection
+        .query_row(
+            "SELECT project_url, publishable_key FROM cloud_reminder_settings WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.and_then(|(project_url, publishable_key)| {
+        Some(services::supabase::SupabaseConfig {
+            project_url: project_url?,
+            publishable_key: publishable_key?,
+        })
+    }))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -1800,7 +1869,12 @@ pub fn run() {
             reminder_reconcile_all_mock,
             whatsapp_list_candidates,
             auth_mock_verify_otp,
-            auth_logout
+            auth_logout,
+            google_calendar_status,
+            cloud_connection_status,
+            cloud_request_otp,
+            cloud_verify_otp,
+            cloud_disconnect
         ])
         .run(tauri::generate_context!())
         .expect("error while running BeautySaloon");
@@ -2279,5 +2353,153 @@ mod tests {
         connection.execute("DELETE FROM secure_secrets WHERE secret_key='supabase_mock_session'", []).expect("logout");
         let after: i64 = connection.query_row("SELECT COUNT(*) FROM secure_secrets WHERE secret_key='supabase_mock_session'", [], |row| row.get(0)).expect("after");
         assert_eq!(after, 0);
+    }
+
+    #[test]
+    fn google_real_client_boundaries_validate_oauth_state_refresh_and_same_event_updates() {
+        let auth_url = services::google::build_google_auth_url("client-id", "http://127.0.0.1:4444/oauth2callback", "state-1").expect("auth url");
+        assert!(auth_url.contains("scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcalendar.events"));
+        assert_eq!(
+            services::google::parse_oauth_callback("http://127.0.0.1:4444/oauth2callback?state=state-1&code=abc", "state-1").expect("code"),
+            "abc"
+        );
+        assert!(services::google::parse_oauth_callback("http://127.0.0.1:4444/oauth2callback?state=bad&code=abc", "state-1").is_err());
+
+        let config = services::google::GoogleOAuthConfig {
+            client_id: "client-id".into(),
+            client_secret: "client-secret".into(),
+            calendar_id: Some("primary".into()),
+        };
+        let mut transport = services::google::FakeHttpTransport::new(vec![
+            services::google::HttpResponse { status: 200, body: br#"{"refresh_token":"refresh-1","access_token":"access-1"}"#.to_vec() },
+            services::google::HttpResponse { status: 200, body: br#"{"access_token":"access-2"}"#.to_vec() },
+            services::google::HttpResponse { status: 200, body: br#"{"id":"event-1"}"#.to_vec() },
+            services::google::HttpResponse { status: 200, body: br#"{"id":"event-1"}"#.to_vec() },
+        ]);
+        let tokens = services::google::exchange_auth_code(&mut transport, &config, "http://127.0.0.1:4444/oauth2callback", "abc").expect("exchange");
+        assert_eq!(tokens.refresh_token, "refresh-1");
+        let access = services::google::refresh_access_token(&mut transport, &config, &tokens.refresh_token).expect("refresh");
+        assert_eq!(access, "access-2");
+
+        let (_temp, mut connection) = open_temp();
+        let (customer, staff, service) = seed_core(&mut connection);
+        let appointment = create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id,
+                staff_id: staff.id,
+                local_date: "2026-08-25".into(),
+                local_start_time: "15:00".into(),
+                service_ids: vec![service.id],
+                status: Some("planned".into()),
+                note: None,
+            },
+        )
+        .expect("appointment");
+        connection.execute("INSERT INTO appointment_google_calendar_sync (appointment_id, google_event_id, created_at_utc, updated_at_utc) VALUES (?1, NULL, ?2, ?2) ON CONFLICT DO NOTHING", params![appointment.id, now_iso()]).expect("sync row");
+        let payload = services::google::build_calendar_event(&appointment);
+        let created_id = services::google::upsert_calendar_event(&mut transport, &access, "primary", None, &payload).expect("create");
+        services::google::mark_google_outbox_synced(&connection, &appointment.id, &created_id, &appointment.start_at_utc).expect("mark");
+        services::google::reject_unrelated_event_mutation(&connection, &appointment.id, "event-1").expect("trusted");
+        assert!(services::google::reject_unrelated_event_mutation(&connection, &appointment.id, "other-event").is_err());
+        let cancelled = AppointmentSummary { status: "cancelled".into(), ..appointment };
+        let cancel_payload = services::google::build_calendar_event(&cancelled);
+        assert!(cancel_payload["summary"].as_str().expect("summary").starts_with("IPTAL - "));
+        let updated_id = services::google::upsert_calendar_event(&mut transport, &access, "primary", Some("event-1"), &cancel_payload).expect("update same");
+        assert_eq!(updated_id, "event-1");
+        assert!(transport.requests.iter().any(|request| request.method == "PATCH" && request.url.contains("/events/event-1")));
+    }
+
+    #[test]
+    fn supabase_real_auth_client_uses_public_config_and_secure_session_storage_with_mock_transport() {
+        let config = services::supabase::SupabaseConfig {
+            project_url: "https://example.supabase.co".into(),
+            publishable_key: "pub-key-with-enough-length".into(),
+        };
+        let mut transport = services::google::FakeHttpTransport::new(vec![
+            services::google::HttpResponse { status: 200, body: b"{}".to_vec() },
+            services::google::HttpResponse { status: 200, body: br#"{"access_token":"access","refresh_token":"refresh","expires_at":1800000000}"#.to_vec() },
+            services::google::HttpResponse { status: 200, body: br#"{"access_token":"access2","refresh_token":"refresh2"}"#.to_vec() },
+            services::google::HttpResponse { status: 200, body: br#"{"id":"user"}"#.to_vec() },
+        ]);
+        services::supabase::request_email_otp(&mut transport, &config, "owner@example.test").expect("otp request");
+        let session = services::supabase::verify_email_otp(&mut transport, &config, "owner@example.test", "123456").expect("verify");
+        assert_eq!(session.access_token, "access");
+        let refreshed = services::supabase::refresh_session(&mut transport, &config, &session.refresh_token).expect("refresh");
+        services::supabase::validate_authenticated_session(&mut transport, &config, &refreshed.access_token).expect("validate");
+        assert!(transport.requests.iter().any(|request| request.url.ends_with("/auth/v1/otp")));
+        assert!(transport.requests.iter().any(|request| request.url.contains("grant_type=refresh_token")));
+
+        let (_temp, connection) = open_temp();
+        let protector = services::secure_store::TestProtector;
+        services::secure_store::store_supabase_session(&connection, &protector, &session).expect("store");
+        let restored = services::secure_store::read_supabase_session(&connection, &protector).expect("read").expect("session");
+        assert_eq!(restored.refresh_token, "refresh");
+        let raw: Vec<u8> = connection.query_row("SELECT encrypted_value FROM secure_secrets WHERE secret_key='cloud_supabase_session'", [], |row| row.get(0)).expect("raw");
+        assert!(!String::from_utf8_lossy(&raw).contains("refresh"));
+    }
+
+    #[test]
+    fn hosted_cloud_client_processes_ordered_outbox_and_reconciles_status_without_whatsapp_send() {
+        let (_temp, mut connection) = open_temp();
+        let (mut customer, staff, service) = seed_core(&mut connection);
+        customer = update_customer_tx(
+            &connection,
+            &customer.id,
+            CustomerInput {
+                first_name: customer.first_name,
+                last_name: customer.last_name,
+                phone: "05551112233".into(),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: Some(true),
+                whatsapp_consent_confirmed: Some(true),
+            },
+        )
+        .expect("customer");
+        create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id,
+                staff_id: staff.id,
+                local_date: "2026-08-26".into(),
+                local_start_time: "10:00".into(),
+                service_ids: vec![service.id],
+                status: Some("confirmed".into()),
+                note: None,
+            },
+        )
+        .expect("appointment");
+        reconcile_all_reminders_mock(&connection).expect("project");
+        let reminder_id: String = connection.query_row("SELECT id FROM appointment_reminders LIMIT 1", [], |row| row.get(0)).expect("reminder");
+        upsert_cloud_outbox(&connection, &reminder_id, "cancel", None).expect("second revision");
+
+        let config = services::supabase::SupabaseConfig {
+            project_url: "https://example.supabase.co".into(),
+            publishable_key: "pub-key-with-enough-length".into(),
+        };
+        let session = services::supabase::SupabaseSession {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: None,
+        };
+        let mut transport = services::google::FakeHttpTransport::new(vec![
+            services::google::HttpResponse { status: 200, body: br#"{"data":{"revision":1,"status":"pending","remoteUpdatedAtUtc":"2026-08-25T00:00:00.000Z"}}"#.to_vec() },
+            services::google::HttpResponse { status: 200, body: br#"{"data":{"revision":2,"status":"cancelled","remoteUpdatedAtUtc":"2026-08-25T00:01:00.000Z"}}"#.to_vec() },
+            services::google::HttpResponse { status: 200, body: br#"{"data":{"revision":3,"status":"cancelled","remoteUpdatedAtUtc":"2026-08-25T00:02:00.000Z"}}"#.to_vec() },
+        ]);
+        let first = services::reminder_cloud::process_ordered_outbox(&connection, &mut transport, &config, &session, 10).expect("first sync");
+        assert_eq!(first.processed, 1);
+        let second = services::reminder_cloud::process_ordered_outbox(&connection, &mut transport, &config, &session, 10).expect("second sync");
+        assert_eq!(second.processed, 1);
+        let third = services::reminder_cloud::process_ordered_outbox(&connection, &mut transport, &config, &session, 10).expect("third sync");
+        assert_eq!(third.processed, 1);
+        assert!(transport.requests.iter().any(|request| request.url.ends_with("/functions/v1/reminder-upsert")));
+        assert!(transport.requests.iter().any(|request| request.url.ends_with("/functions/v1/reminder-cancel")));
+        let pending: i64 = connection.query_row("SELECT COUNT(*) FROM reminder_cloud_outbox WHERE sync_status='pending'", [], |row| row.get(0)).expect("pending");
+        assert_eq!(pending, 0);
+        services::reminder_cloud::reconcile_remote_status(&connection, &reminder_id, 3, "sent", "2026-08-25T00:02:00.000Z").expect("reconcile");
+        let local_status: String = connection.query_row("SELECT status FROM appointment_reminders WHERE id=?1", params![reminder_id], |row| row.get(0)).expect("status");
+        assert_eq!(local_status, "sent");
     }
 }
