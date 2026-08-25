@@ -3,13 +3,14 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 use thiserror::Error;
 
-const CORE_SCHEMA_VERSION: i64 = 7;
+const CORE_SCHEMA_VERSION: i64 = 13;
 const ISTANBUL_OFFSET_MINUTES: i64 = 180;
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -185,6 +186,49 @@ pub struct AppointmentInput {
     note: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseBackupSummary {
+    database_path: String,
+    backup_path: String,
+    integrity: String,
+    machine_bound_secrets_removed: bool,
+    created_at_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseCleanSummary {
+    database_path: String,
+    safety_backup_path: String,
+    integrity: String,
+    cleaned_at_utc: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmedInput {
+    confirmed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WhatsAppCandidate {
+    appointment_id: String,
+    customer_id: String,
+    customer_name: String,
+    phone: String,
+    start_at_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MockAuthSession {
+    email: String,
+    access_token_hint: String,
+    expires_at_utc: String,
+}
+
 fn app_data_root(app: &AppHandle) -> Result<PathBuf, AppError> {
     app.path()
         .app_data_dir()
@@ -341,6 +385,134 @@ fn migrate_core(connection: &Connection) -> Result<(), AppError> {
         );
         CREATE INDEX IF NOT EXISTS appointment_services_service_id_idx ON appointment_services(service_id);
 
+        CREATE TABLE IF NOT EXISTS appointment_reminders (
+          id TEXT PRIMARY KEY NOT NULL,
+          appointment_id TEXT NOT NULL,
+          channel TEXT NOT NULL DEFAULT 'whatsapp' CHECK (channel IN ('whatsapp')),
+          reminder_type TEXT NOT NULL DEFAULT 'appointment_24h' CHECK (reminder_type IN ('appointment_24h')),
+          scheduled_for_utc TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'cancelled', 'sent', 'failed', 'uncertain')),
+          attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+          last_attempt_at_utc TEXT,
+          sent_at_utc TEXT,
+          cancelled_at_utc TEXT,
+          failure_code TEXT,
+          failure_message TEXT,
+          claim_token TEXT,
+          claimed_at_utc TEXT,
+          payload_version INTEGER NOT NULL DEFAULT 1 CHECK (payload_version >= 1),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY (appointment_id) REFERENCES appointments(id) ON UPDATE RESTRICT ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS appointment_reminders_appointment_channel_type_unique_idx
+          ON appointment_reminders (appointment_id, channel, reminder_type);
+        CREATE INDEX IF NOT EXISTS appointment_reminders_due_idx
+          ON appointment_reminders (status, scheduled_for_utc);
+
+        CREATE TABLE IF NOT EXISTS whatsapp_settings (
+          id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
+          is_enabled INTEGER NOT NULL DEFAULT 0 CHECK (is_enabled IN (0, 1)),
+          phone_number_id TEXT,
+          template_name TEXT,
+          template_language_code TEXT NOT NULL DEFAULT 'tr' CHECK (length(trim(template_language_code)) > 0),
+          automatic_reminder_enabled INTEGER NOT NULL DEFAULT 0 CHECK (automatic_reminder_enabled IN (0, 1)),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        INSERT INTO whatsapp_settings (id, is_enabled, phone_number_id, template_name, template_language_code, automatic_reminder_enabled, created_at, updated_at)
+        VALUES (1, 0, NULL, NULL, 'tr', 0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        ON CONFLICT(id) DO NOTHING;
+
+        CREATE TABLE IF NOT EXISTS secure_secrets (
+          secret_key TEXT PRIMARY KEY NOT NULL CHECK (length(trim(secret_key)) > 0),
+          encrypted_value BLOB NOT NULL CHECK (length(encrypted_value) > 0),
+          encryption_provider TEXT NOT NULL CHECK (length(trim(encryption_provider)) > 0),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS cloud_reminder_settings (
+          id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
+          cloud_mode_enabled INTEGER NOT NULL DEFAULT 0 CHECK (cloud_mode_enabled IN (0, 1)),
+          project_url TEXT,
+          publishable_key TEXT,
+          created_at_utc TEXT NOT NULL,
+          updated_at_utc TEXT NOT NULL,
+          CHECK (project_url IS NULL OR (length(project_url) BETWEEN 20 AND 256)),
+          CHECK (publishable_key IS NULL OR (length(publishable_key) BETWEEN 20 AND 512))
+        );
+        INSERT INTO cloud_reminder_settings (id, cloud_mode_enabled, project_url, publishable_key, created_at_utc, updated_at_utc)
+        VALUES (1, 0, NULL, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        ON CONFLICT(id) DO NOTHING;
+
+        CREATE TABLE IF NOT EXISTS reminder_cloud_state (
+          reminder_id TEXT PRIMARY KEY NOT NULL REFERENCES appointment_reminders(id) ON DELETE CASCADE,
+          last_synced_revision INTEGER NOT NULL DEFAULT 0 CHECK (last_synced_revision >= 0),
+          next_revision INTEGER NOT NULL DEFAULT 1 CHECK (next_revision >= 1),
+          last_remote_revision INTEGER CHECK (last_remote_revision IS NULL OR last_remote_revision >= 1),
+          last_remote_status TEXT CHECK (last_remote_status IS NULL OR last_remote_status IN ('pending', 'processing', 'sent', 'failed', 'uncertain', 'cancelled')),
+          last_remote_updated_at_utc TEXT,
+          last_error_code TEXT,
+          created_at_utc TEXT NOT NULL,
+          updated_at_utc TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS reminder_cloud_outbox (
+          id TEXT PRIMARY KEY NOT NULL,
+          reminder_id TEXT NOT NULL REFERENCES appointment_reminders(id) ON DELETE CASCADE,
+          revision INTEGER NOT NULL CHECK (revision >= 1),
+          action TEXT NOT NULL CHECK (action IN ('upsert', 'cancel')),
+          client_mutation_id TEXT NOT NULL,
+          payload_json TEXT,
+          payload_hash TEXT NOT NULL CHECK (length(payload_hash) = 64),
+          sync_status TEXT NOT NULL CHECK (sync_status IN ('pending', 'in_flight', 'synced', 'blocked')),
+          last_attempt_at_utc TEXT,
+          last_error_code TEXT,
+          created_at_utc TEXT NOT NULL,
+          updated_at_utc TEXT NOT NULL,
+          UNIQUE (reminder_id, revision),
+          UNIQUE (client_mutation_id),
+          CHECK ((action = 'upsert' AND payload_json IS NOT NULL) OR (action = 'cancel' AND payload_json IS NULL))
+        );
+        CREATE INDEX IF NOT EXISTS reminder_cloud_outbox_pending_idx
+          ON reminder_cloud_outbox (sync_status, created_at_utc, reminder_id, revision);
+
+        CREATE TABLE IF NOT EXISTS google_calendar_settings (
+          id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
+          sync_enabled INTEGER NOT NULL DEFAULT 0 CHECK (sync_enabled IN (0, 1)),
+          client_id TEXT,
+          calendar_id TEXT NOT NULL DEFAULT 'primary' CHECK (length(trim(calendar_id)) > 0),
+          account_email TEXT,
+          created_at_utc TEXT NOT NULL,
+          updated_at_utc TEXT NOT NULL
+        );
+        INSERT INTO google_calendar_settings (id, sync_enabled, client_id, calendar_id, account_email, created_at_utc, updated_at_utc)
+        VALUES (1, 0, NULL, 'primary', NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        ON CONFLICT(id) DO NOTHING;
+
+        CREATE TABLE IF NOT EXISTS appointment_google_calendar_sync (
+          appointment_id TEXT PRIMARY KEY NOT NULL REFERENCES appointments(id) ON DELETE CASCADE,
+          google_event_id TEXT,
+          last_synced_updated_at_utc TEXT,
+          last_error_code TEXT,
+          created_at_utc TEXT NOT NULL,
+          updated_at_utc TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS google_calendar_outbox (
+          id TEXT PRIMARY KEY NOT NULL,
+          appointment_id TEXT NOT NULL REFERENCES appointments(id) ON DELETE CASCADE,
+          sync_status TEXT NOT NULL CHECK (sync_status IN ('pending', 'in_flight', 'synced', 'blocked')),
+          last_attempt_at_utc TEXT,
+          last_error_code TEXT,
+          created_at_utc TEXT NOT NULL,
+          updated_at_utc TEXT NOT NULL,
+          UNIQUE (appointment_id)
+        );
+        CREATE INDEX IF NOT EXISTS google_calendar_outbox_pending_idx
+          ON google_calendar_outbox (sync_status, created_at_utc, appointment_id);
+
         CREATE TABLE IF NOT EXISTS foundation_notes (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           title TEXT NOT NULL,
@@ -473,6 +645,25 @@ fn name_key(name: &str) -> String {
 
 fn bool_to_i64(value: bool) -> i64 {
     if value { 1 } else { 0 }
+}
+
+fn sql_path_literal(path: &Path) -> String {
+    path.display().to_string().replace('\'', "''")
+}
+
+fn timestamp_for_file() -> String {
+    Utc::now().format("%Y%m%d-%H%M%S%.3f").to_string()
+}
+
+fn pseudo_hash_64(value: &str) -> String {
+    let mut output = String::new();
+    for salt in 0..4_u8 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        salt.hash(&mut hasher);
+        value.hash(&mut hasher);
+        output.push_str(&format!("{:016x}", hasher.finish()));
+    }
+    output
 }
 
 fn validate_color(value: &str) -> Result<String, AppError> {
@@ -902,6 +1093,8 @@ fn create_appointment_tx(connection: &mut Connection, input: AppointmentInput) -
             params![id, snapshot.service_id, snapshot.service_name_snapshot, snapshot.duration_minutes_snapshot, snapshot.sort_order, now],
         )?;
     }
+    enqueue_google_sync_if_enabled(&tx, &id)?;
+    reconcile_reminder_for_appointment(&tx, &id)?;
     tx.commit()?;
     get_appointment(connection, &id)
 }
@@ -944,6 +1137,8 @@ fn update_appointment_tx(connection: &mut Connection, id: &str, input: Appointme
             )?;
         }
     }
+    enqueue_google_sync_if_enabled(&tx, id)?;
+    reconcile_reminder_for_appointment(&tx, id)?;
     tx.commit()?;
     get_appointment(connection, id)
 }
@@ -983,6 +1178,309 @@ fn list_appointment_services(connection: &Connection, appointment_id: &str) -> R
 fn get_appointment(connection: &Connection, id: &str) -> Result<AppointmentSummary, AppError> {
     let mut appointments = list_appointments_between(connection, None, None, None, None, Some(id), 1)?;
     appointments.pop().ok_or_else(|| AppError::NotFound("APPOINTMENT_NOT_FOUND".to_string()))
+}
+
+fn backup_destination(database_path: &Path, kind: &str) -> Result<PathBuf, AppError> {
+    let backup_dir = database_path
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join("backups"))
+        .unwrap_or_else(|| database_path.parent().unwrap_or_else(|| Path::new(".")).join("backups"));
+    fs::create_dir_all(&backup_dir)?;
+    Ok(backup_dir.join(format!("salon-{kind}-{}.db", timestamp_for_file())))
+}
+
+fn sanitize_machine_bound_state(database_path: &Path) -> Result<bool, AppError> {
+    let connection = Connection::open(database_path)?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    connection.execute("DELETE FROM secure_secrets", [])?;
+    connection.execute(
+        "UPDATE google_calendar_settings SET sync_enabled=0, account_email=NULL, updated_at_utc=?1 WHERE id=1",
+        params![now_iso()],
+    )?;
+    connection.execute(
+        "UPDATE cloud_reminder_settings SET cloud_mode_enabled=0, updated_at_utc=?1 WHERE id=1",
+        params![now_iso()],
+    )?;
+    connection.execute(
+        "UPDATE whatsapp_settings SET is_enabled=0, automatic_reminder_enabled=0, updated_at=?1 WHERE id=1",
+        params![now_iso()],
+    )?;
+    if !integrity_check(&connection)? {
+        return Err(AppError::Database("BACKUP_INTEGRITY_FAILED".to_string()));
+    }
+    Ok(true)
+}
+
+fn create_sanitized_backup(connection: &Connection, database_path: &Path, kind: &str) -> Result<DatabaseBackupSummary, AppError> {
+    if !integrity_check(connection)? {
+        return Err(AppError::Database("SOURCE_INTEGRITY_FAILED".to_string()));
+    }
+    let backup_path = backup_destination(database_path, kind)?;
+    let sql = format!("VACUUM INTO '{}';", sql_path_literal(&backup_path));
+    connection.execute_batch(&sql)?;
+    let removed = sanitize_machine_bound_state(&backup_path)?;
+    Ok(DatabaseBackupSummary {
+        database_path: database_path.display().to_string(),
+        backup_path: backup_path.display().to_string(),
+        integrity: "ok".to_string(),
+        machine_bound_secrets_removed: removed,
+        created_at_utc: now_iso(),
+    })
+}
+
+fn clean_database_in_place(connection: &mut Connection, database_path: &Path) -> Result<DatabaseCleanSummary, AppError> {
+    let safety = create_sanitized_backup(connection, database_path, "pre-clean")?;
+    let tx = connection.transaction()?;
+    for table in [
+        "reminder_cloud_outbox",
+        "reminder_cloud_state",
+        "appointment_reminders",
+        "google_calendar_outbox",
+        "appointment_google_calendar_sync",
+        "appointment_services",
+        "appointments",
+        "staff_services",
+        "services",
+        "service_categories",
+        "staff",
+        "customers",
+        "secure_secrets",
+    ] {
+        tx.execute(&format!("DELETE FROM {table}"), [])?;
+    }
+    tx.execute("UPDATE whatsapp_settings SET is_enabled=0, automatic_reminder_enabled=0, updated_at=?1 WHERE id=1", params![now_iso()])?;
+    tx.execute("UPDATE google_calendar_settings SET sync_enabled=0, account_email=NULL, updated_at_utc=?1 WHERE id=1", params![now_iso()])?;
+    tx.execute("UPDATE cloud_reminder_settings SET cloud_mode_enabled=0, updated_at_utc=?1 WHERE id=1", params![now_iso()])?;
+    tx.commit()?;
+    if !integrity_check(connection)? {
+        return Err(AppError::Database("CLEAN_INTEGRITY_FAILED".to_string()));
+    }
+    Ok(DatabaseCleanSummary {
+        database_path: database_path.display().to_string(),
+        safety_backup_path: safety.backup_path,
+        integrity: "ok".to_string(),
+        cleaned_at_utc: now_iso(),
+    })
+}
+
+#[cfg(test)]
+fn restore_database_file_for_tests(active_path: &Path, backup_path: &Path) -> Result<(), AppError> {
+    let backup = Connection::open(backup_path)?;
+    if !integrity_check(&backup)? {
+        return Err(AppError::Database("RESTORE_SOURCE_INTEGRITY_FAILED".to_string()));
+    }
+    drop(backup);
+    for suffix in ["", "-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{}", active_path.display(), suffix));
+        if sidecar.exists() {
+            fs::remove_file(sidecar)?;
+        }
+    }
+    fs::copy(backup_path, active_path)?;
+    Ok(())
+}
+
+fn enqueue_google_sync_if_enabled(connection: &Connection, appointment_id: &str) -> Result<(), AppError> {
+    let enabled: i64 = connection.query_row("SELECT sync_enabled FROM google_calendar_settings WHERE id=1", [], |row| row.get(0))?;
+    if enabled != 1 {
+        return Ok(());
+    }
+    let now = now_iso();
+    connection.execute(
+        "INSERT INTO appointment_google_calendar_sync (appointment_id, google_event_id, created_at_utc, updated_at_utc)
+         VALUES (?1, NULL, ?2, ?2)
+         ON CONFLICT(appointment_id) DO UPDATE SET updated_at_utc=excluded.updated_at_utc",
+        params![appointment_id, now],
+    )?;
+    connection.execute(
+        "INSERT INTO google_calendar_outbox (id, appointment_id, sync_status, created_at_utc, updated_at_utc)
+         VALUES (?1, ?2, 'pending', ?3, ?3)
+         ON CONFLICT(appointment_id) DO UPDATE SET sync_status='pending', last_error_code=NULL, updated_at_utc=excluded.updated_at_utc",
+        params![new_uuid(), appointment_id, now],
+    )?;
+    Ok(())
+}
+
+fn google_sync_pending_mock_tx(connection: &Connection) -> Result<u32, AppError> {
+    let mut statement = connection.prepare(
+        "SELECT appointment_id FROM google_calendar_outbox WHERE sync_status='pending' ORDER BY created_at_utc ASC",
+    )?;
+    let appointment_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let now = now_iso();
+    for appointment_id in &appointment_ids {
+        let event_id: Option<String> = connection
+            .query_row(
+                "SELECT google_event_id FROM appointment_google_calendar_sync WHERE appointment_id=?1",
+                params![appointment_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let event_id = event_id.unwrap_or_else(|| format!("gcal-{appointment_id}"));
+        connection.execute(
+            "UPDATE appointment_google_calendar_sync SET google_event_id=?1, last_synced_updated_at_utc=?2, last_error_code=NULL, updated_at_utc=?2 WHERE appointment_id=?3",
+            params![event_id, now, appointment_id],
+        )?;
+        connection.execute(
+            "UPDATE google_calendar_outbox SET sync_status='synced', last_attempt_at_utc=?1, last_error_code=NULL, updated_at_utc=?1 WHERE appointment_id=?2",
+            params![now, appointment_id],
+        )?;
+    }
+    Ok(appointment_ids.len() as u32)
+}
+
+fn upsert_cloud_outbox(connection: &Connection, reminder_id: &str, action: &str, payload_json: Option<String>) -> Result<(), AppError> {
+    let now = now_iso();
+    connection.execute(
+        "INSERT INTO reminder_cloud_state (reminder_id, last_synced_revision, next_revision, created_at_utc, updated_at_utc)
+         VALUES (?1, 0, 1, ?2, ?2)
+         ON CONFLICT(reminder_id) DO NOTHING",
+        params![reminder_id, now],
+    )?;
+    let revision: i64 = connection.query_row("SELECT next_revision FROM reminder_cloud_state WHERE reminder_id=?1", params![reminder_id], |row| row.get(0))?;
+    let mutation_id = format!("{reminder_id}:{revision}:{action}");
+    let payload_hash = pseudo_hash_64(&format!("{mutation_id}:{:?}", payload_json));
+    connection.execute(
+        "INSERT INTO reminder_cloud_outbox (id, reminder_id, revision, action, client_mutation_id, payload_json, payload_hash, sync_status, created_at_utc, updated_at_utc)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?8)",
+        params![new_uuid(), reminder_id, revision, action, mutation_id, payload_json, payload_hash, now],
+    )?;
+    connection.execute(
+        "UPDATE reminder_cloud_state SET next_revision=?1, updated_at_utc=?2 WHERE reminder_id=?3",
+        params![revision + 1, now, reminder_id],
+    )?;
+    Ok(())
+}
+
+fn reconcile_reminder_for_appointment(connection: &Connection, appointment_id: &str) -> Result<bool, AppError> {
+    let row = connection
+        .query_row(
+            "SELECT a.start_at_utc, a.status, c.is_active, c.phone, c.whatsapp_reminder_enabled, c.whatsapp_consent_confirmed
+             FROM appointments a INNER JOIN customers c ON c.id=a.customer_id WHERE a.id=?1",
+            params![appointment_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((start_at, status, active, phone, reminder_enabled, consent)) = row else {
+        return Ok(false);
+    };
+    let eligible = matches!(status.as_str(), "planned" | "confirmed")
+        && active == 1
+        && reminder_enabled == 1
+        && consent == 1
+        && normalize_phone(Some(&phone), true).is_ok();
+    let existing: Option<String> = connection
+        .query_row(
+            "SELECT id FROM appointment_reminders WHERE appointment_id=?1 AND channel='whatsapp' AND reminder_type='appointment_24h'",
+            params![appointment_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let now = now_iso();
+    if eligible {
+        let scheduled = chrono::DateTime::parse_from_rfc3339(&start_at)
+            .map_err(|_| AppError::Validation("appointment start_at invalid".to_string()))?
+            .with_timezone(&Utc)
+            - Duration::hours(24);
+        let scheduled = utc_iso(scheduled);
+        let reminder_id = existing.unwrap_or_else(new_uuid);
+        connection.execute(
+            "INSERT INTO appointment_reminders (id, appointment_id, scheduled_for_utc, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'pending', ?4, ?4)
+             ON CONFLICT(appointment_id, channel, reminder_type)
+             DO UPDATE SET scheduled_for_utc=excluded.scheduled_for_utc, status='pending', cancelled_at_utc=NULL, updated_at=excluded.updated_at",
+            params![reminder_id, appointment_id, scheduled, now],
+        )?;
+        upsert_cloud_outbox(connection, &reminder_id, "upsert", Some(format!(r#"{{"appointmentId":"{appointment_id}","scheduledForUtc":"{scheduled}"}}"#)))?;
+        Ok(true)
+    } else if let Some(reminder_id) = existing {
+        connection.execute(
+            "UPDATE appointment_reminders SET status='cancelled', cancelled_at_utc=?1, updated_at=?1 WHERE id=?2",
+            params![now, reminder_id],
+        )?;
+        upsert_cloud_outbox(connection, &reminder_id, "cancel", None)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn reconcile_all_reminders_mock(connection: &Connection) -> Result<u32, AppError> {
+    let mut statement = connection.prepare("SELECT id FROM appointments ORDER BY start_at_utc ASC")?;
+    let ids = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    let mut changed = 0_u32;
+    for id in ids {
+        if reconcile_reminder_for_appointment(connection, &id)? {
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
+fn list_whatsapp_candidates_tx(connection: &Connection) -> Result<Vec<WhatsAppCandidate>, AppError> {
+    let now = Utc::now();
+    let end = now + Duration::hours(24);
+    let now = utc_iso(now);
+    let end = utc_iso(end);
+    let mut statement = connection.prepare(
+        "SELECT a.id, c.id, c.first_name || ' ' || c.last_name, c.phone, a.start_at_utc
+         FROM appointments a INNER JOIN customers c ON c.id=a.customer_id
+         WHERE a.start_at_utc >= ?1 AND a.start_at_utc <= ?2
+           AND a.status IN ('planned','confirmed')
+           AND c.is_active=1 AND c.whatsapp_reminder_enabled=1 AND c.whatsapp_consent_confirmed=1
+         ORDER BY a.start_at_utc ASC",
+    )?;
+    let rows = statement.query_map(params![now, end], |row| {
+        Ok(WhatsAppCandidate {
+            appointment_id: row.get(0)?,
+            customer_id: row.get(1)?,
+            customer_name: row.get(2)?,
+            phone: row.get(3)?,
+            start_at_utc: row.get(4)?,
+        })
+    })?;
+    let mut seen_phones = HashSet::new();
+    let mut output = Vec::new();
+    for row in rows {
+        let candidate = row?;
+        if normalize_phone(Some(&candidate.phone), true).is_ok() && seen_phones.insert(candidate.phone.clone()) {
+            output.push(candidate);
+        }
+    }
+    Ok(output)
+}
+
+fn mock_auth_verify_otp_tx(connection: &Connection, email: &str, otp: &str) -> Result<MockAuthSession, AppError> {
+    let email = normalize_text(email, "email", 5, 254)?;
+    if !email.contains('@') || otp != "123456" {
+        return Err(AppError::Validation("AUTH_OTP_INVALID".to_string()));
+    }
+    let expires = utc_iso(Utc::now() + Duration::hours(1));
+    let secret = format!("mock-session:{email}:{expires}");
+    let now = now_iso();
+    connection.execute(
+        "INSERT INTO secure_secrets (secret_key, encrypted_value, encryption_provider, created_at, updated_at)
+         VALUES ('supabase_mock_session', ?1, 'tauri_secure_storage_mock_v1', ?2, ?2)
+         ON CONFLICT(secret_key) DO UPDATE SET encrypted_value=excluded.encrypted_value, updated_at=excluded.updated_at",
+        params![secret.as_bytes(), now],
+    )?;
+    Ok(MockAuthSession {
+        email,
+        access_token_hint: "mock-session-present".to_string(),
+        expires_at_utc: expires,
+    })
 }
 
 fn list_appointments_between(
@@ -1219,6 +1717,52 @@ fn appointment_list_by_date(local_date: String, staff_id: Option<String>, limit:
     )
 }
 
+#[tauri::command]
+fn database_create_backup(state: tauri::State<'_, AppState>) -> Result<DatabaseBackupSummary, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    create_sanitized_backup(&connection, &state.database_path, "manual")
+}
+
+#[tauri::command]
+fn database_clean_start(input: ConfirmedInput, state: tauri::State<'_, AppState>) -> Result<DatabaseCleanSummary, AppError> {
+    if !input.confirmed {
+        return Err(AppError::Validation("CLEAN_REQUIRES_CONFIRMATION".to_string()));
+    }
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    clean_database_in_place(&mut connection, &state.database_path)
+}
+
+#[tauri::command]
+fn google_sync_pending_mock(state: tauri::State<'_, AppState>) -> Result<u32, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    google_sync_pending_mock_tx(&connection)
+}
+
+#[tauri::command]
+fn reminder_reconcile_all_mock(state: tauri::State<'_, AppState>) -> Result<u32, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    reconcile_all_reminders_mock(&connection)
+}
+
+#[tauri::command]
+fn whatsapp_list_candidates(state: tauri::State<'_, AppState>) -> Result<Vec<WhatsAppCandidate>, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    list_whatsapp_candidates_tx(&connection)
+}
+
+#[tauri::command]
+fn auth_mock_verify_otp(email: String, otp: String, state: tauri::State<'_, AppState>) -> Result<MockAuthSession, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    mock_auth_verify_otp_tx(&connection, &email, &otp)
+}
+
+#[tauri::command]
+fn auth_logout(state: tauri::State<'_, AppState>) -> Result<bool, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    connection.execute("DELETE FROM secure_secrets WHERE secret_key='supabase_mock_session'", [])?;
+    Ok(true)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -1249,7 +1793,14 @@ pub fn run() {
             service_list,
             appointment_create,
             appointment_update,
-            appointment_list_by_date
+            appointment_list_by_date,
+            database_create_backup,
+            database_clean_start,
+            google_sync_pending_mock,
+            reminder_reconcile_all_mock,
+            whatsapp_list_candidates,
+            auth_mock_verify_otp,
+            auth_logout
         ])
         .run(tauri::generate_context!())
         .expect("error while running BeautySaloon");
@@ -1320,6 +1871,15 @@ mod tests {
             "staff_services",
             "appointments",
             "appointment_services",
+            "appointment_reminders",
+            "whatsapp_settings",
+            "secure_secrets",
+            "cloud_reminder_settings",
+            "reminder_cloud_state",
+            "reminder_cloud_outbox",
+            "google_calendar_settings",
+            "appointment_google_calendar_sync",
+            "google_calendar_outbox",
         ] {
             let count: i64 = connection
                 .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", params![table], |row| row.get(0))
@@ -1540,5 +2100,184 @@ mod tests {
         assert!(logs_dir.is_dir());
         assert!(exports_dir.is_dir());
         assert!(settings_dir.is_dir());
+    }
+
+    fn future_local_slot(hours_from_now: i64) -> (String, String) {
+        let local = Utc::now() + Duration::minutes(ISTANBUL_OFFSET_MINUTES) + Duration::hours(hours_from_now);
+        let minute = (chrono::Timelike::minute(&local) / 5) * 5;
+        (
+            local.date_naive().format("%Y-%m-%d").to_string(),
+            format!("{:02}:{:02}", chrono::Timelike::hour(&local), minute),
+        )
+    }
+
+    #[test]
+    fn backup_clean_restore_and_corrupt_guard_sanitize_machine_bound_state() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("database").join("salon-foundation.db");
+        fs::create_dir_all(db_path.parent().expect("db parent")).expect("db dir");
+        let mut connection = open_database(&db_path).expect("open");
+        let (customer, _staff, _service) = seed_core(&mut connection);
+        connection
+            .execute(
+                "INSERT INTO secure_secrets (secret_key, encrypted_value, encryption_provider, created_at, updated_at)
+                 VALUES ('google_calendar_refresh_token', x'0102', 'electron_safe_storage_v1', ?1, ?1)",
+                params![now_iso()],
+            )
+            .expect("secret");
+        connection
+            .execute("UPDATE google_calendar_settings SET sync_enabled=1, account_email='owner@example.test' WHERE id=1", [])
+            .expect("google on");
+
+        let backup = create_sanitized_backup(&connection, &db_path, "manual").expect("backup");
+        let backup_connection = Connection::open(&backup.backup_path).expect("backup open");
+        let secret_count: i64 = backup_connection.query_row("SELECT COUNT(*) FROM secure_secrets", [], |row| row.get(0)).expect("secret count");
+        let google_enabled: i64 = backup_connection.query_row("SELECT sync_enabled FROM google_calendar_settings WHERE id=1", [], |row| row.get(0)).expect("google");
+        assert_eq!(secret_count, 0);
+        assert_eq!(google_enabled, 0);
+
+        clean_database_in_place(&mut connection, &db_path).expect("clean");
+        let customer_count: i64 = connection.query_row("SELECT COUNT(*) FROM customers", [], |row| row.get(0)).expect("customers");
+        assert_eq!(customer_count, 0);
+        drop(connection);
+
+        restore_database_file_for_tests(&db_path, Path::new(&backup.backup_path)).expect("restore");
+        let reopened = open_database(&db_path).expect("reopen restored");
+        assert!(get_customer(&reopened, &customer.id).expect("customer").is_some());
+        assert!(integrity_check(&reopened).expect("integrity"));
+
+        let corrupt_path = temp.path().join("corrupt.db");
+        fs::write(&corrupt_path, b"not sqlite").expect("corrupt write");
+        assert!(restore_database_file_for_tests(&db_path, &corrupt_path).is_err());
+    }
+
+    #[test]
+    fn google_calendar_one_way_outbox_reuses_event_and_does_not_block_local_save() {
+        let (_temp, mut connection) = open_temp();
+        let (customer, staff, service) = seed_core(&mut connection);
+        connection.execute("UPDATE google_calendar_settings SET sync_enabled=1 WHERE id=1", []).expect("enable");
+
+        let appointment = create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id.clone(),
+                staff_id: staff.id.clone(),
+                local_date: "2026-08-25".into(),
+                local_start_time: "10:00".into(),
+                service_ids: vec![service.id.clone()],
+                status: Some("planned".into()),
+                note: None,
+            },
+        )
+        .expect("create");
+        let pending: i64 = connection.query_row("SELECT COUNT(*) FROM google_calendar_outbox WHERE sync_status='pending'", [], |row| row.get(0)).expect("pending");
+        assert_eq!(pending, 1);
+        assert_eq!(google_sync_pending_mock_tx(&connection).expect("sync"), 1);
+        let event_id: String = connection
+            .query_row("SELECT google_event_id FROM appointment_google_calendar_sync WHERE appointment_id=?1", params![appointment.id], |row| row.get(0))
+            .expect("event");
+
+        update_appointment_tx(
+            &mut connection,
+            &appointment.id,
+            AppointmentInput {
+                customer_id: customer.id,
+                staff_id: staff.id,
+                local_date: "2026-08-25".into(),
+                local_start_time: "10:00".into(),
+                service_ids: vec![service.id],
+                status: Some("cancelled".into()),
+                note: Some("iptal".into()),
+            },
+        )
+        .expect("cancel");
+        assert_eq!(google_sync_pending_mock_tx(&connection).expect("resync"), 1);
+        let event_after_cancel: String = connection
+            .query_row("SELECT google_event_id FROM appointment_google_calendar_sync WHERE appointment_id=?1", params![appointment.id], |row| row.get(0))
+            .expect("event reused");
+        assert_eq!(event_id, event_after_cancel);
+        let appointments: i64 = connection.query_row("SELECT COUNT(*) FROM appointments", [], |row| row.get(0)).expect("appointments");
+        assert_eq!(appointments, 1);
+    }
+
+    #[test]
+    fn reminders_cloud_projection_whatsapp_candidates_and_restart_persistence() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("core.db");
+        let mut connection = open_database(&db_path).expect("open");
+        let (mut customer, staff, service) = seed_core(&mut connection);
+        customer = update_customer_tx(
+            &connection,
+            &customer.id,
+            CustomerInput {
+                first_name: customer.first_name.clone(),
+                last_name: customer.last_name.clone(),
+                phone: "05551112233".into(),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: Some(true),
+                whatsapp_consent_confirmed: Some(true),
+            },
+        )
+        .expect("consent");
+        let (local_date, local_time) = future_local_slot(2);
+        let appointment = create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id.clone(),
+                staff_id: staff.id.clone(),
+                local_date,
+                local_start_time: local_time,
+                service_ids: vec![service.id.clone()],
+                status: Some("confirmed".into()),
+                note: None,
+            },
+        )
+        .expect("appointment");
+        assert_eq!(reconcile_all_reminders_mock(&connection).expect("reconcile"), 1);
+        let outbox_count: i64 = connection.query_row("SELECT COUNT(*) FROM reminder_cloud_outbox WHERE sync_status='pending'", [], |row| row.get(0)).expect("outbox");
+        assert!(outbox_count >= 1);
+        let candidates = list_whatsapp_candidates_tx(&connection).expect("candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].appointment_id, appointment.id);
+
+        update_appointment_tx(
+            &mut connection,
+            &appointment.id,
+            AppointmentInput {
+                customer_id: customer.id,
+                staff_id: staff.id,
+                local_date: "2026-08-24".into(),
+                local_start_time: "13:00".into(),
+                service_ids: vec![service.id],
+                status: Some("cancelled".into()),
+                note: None,
+            },
+        )
+        .expect("cancel");
+        let status: String = connection
+            .query_row("SELECT status FROM appointment_reminders WHERE appointment_id=?1", params![appointment.id], |row| row.get(0))
+            .expect("reminder status");
+        assert_eq!(status, "cancelled");
+        drop(connection);
+
+        let reopened = open_database(&db_path).expect("reopen");
+        let persisted: i64 = reopened.query_row("SELECT COUNT(*) FROM reminder_cloud_outbox", [], |row| row.get(0)).expect("persisted");
+        assert!(persisted >= 2);
+        assert!(integrity_check(&reopened).expect("integrity"));
+    }
+
+    #[test]
+    fn mock_auth_session_uses_secure_secret_boundary_and_logout_clears_it() {
+        let (_temp, connection) = open_temp();
+        let session = mock_auth_verify_otp_tx(&connection, "owner@example.test", "123456").expect("otp");
+        assert_eq!(session.access_token_hint, "mock-session-present");
+        let secret_count: i64 = connection.query_row("SELECT COUNT(*) FROM secure_secrets WHERE secret_key='supabase_mock_session'", [], |row| row.get(0)).expect("secret");
+        assert_eq!(secret_count, 1);
+        let settings_count: i64 = connection.query_row("SELECT COUNT(*) FROM cloud_reminder_settings WHERE publishable_key IS NOT NULL", [], |row| row.get(0)).expect("settings");
+        assert_eq!(settings_count, 0);
+        connection.execute("DELETE FROM secure_secrets WHERE secret_key='supabase_mock_session'", []).expect("logout");
+        let after: i64 = connection.query_row("SELECT COUNT(*) FROM secure_secrets WHERE secret_key='supabase_mock_session'", [], |row| row.get(0)).expect("after");
+        assert_eq!(after, 0);
     }
 }

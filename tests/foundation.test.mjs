@@ -24,7 +24,14 @@ test("Tauri Rust boundary exposes only named core data commands", async () => {
     "service_list",
     "appointment_create",
     "appointment_update",
-    "appointment_list_by_date"
+    "appointment_list_by_date",
+    "database_create_backup",
+    "database_clean_start",
+    "google_sync_pending_mock",
+    "reminder_reconcile_all_mock",
+    "whatsapp_list_candidates",
+    "auth_mock_verify_otp",
+    "auth_logout"
   ]) {
     assert.match(source, new RegExp(command));
   }
