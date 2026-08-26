@@ -7,3 +7,5 @@ src-tauri/target
 *.log
 runtime-*.png
 *.tmp
+src-tauri/live-services.local.json
+src-tauri/live-services.local.*.json

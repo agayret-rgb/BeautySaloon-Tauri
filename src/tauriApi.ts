@@ -21,6 +21,7 @@ export interface AppointmentSummary {
   customerPhone: string;
   staffName: string;
   serviceNames: string[];
+  updatedAt: string;
 }
 
 export interface CustomerInput {
@@ -76,6 +77,17 @@ export interface CloudConnectionStatus {
   sessionPresent: boolean;
 }
 
+export interface GoogleConnectResult {
+  connected: boolean;
+  calendarId: string;
+}
+
+export interface CloudSyncStatus {
+  processed: number;
+  blocked: number;
+  unauthorized: boolean;
+}
+
 export async function getAppHealth(): Promise<AppHealth> {
   return invoke<AppHealth>("app_health");
 }
@@ -86,6 +98,18 @@ export async function listAppointmentsByDate(localDate: string): Promise<Appoint
 
 export async function getGoogleCalendarStatus(): Promise<GoogleConnectionStatus> {
   return invoke<GoogleConnectionStatus>("google_calendar_status");
+}
+
+export async function connectGoogleCalendar(): Promise<GoogleConnectResult> {
+  return invoke<GoogleConnectResult>("google_calendar_connect");
+}
+
+export async function disconnectGoogleCalendar(): Promise<boolean> {
+  return invoke<boolean>("google_calendar_disconnect");
+}
+
+export async function syncGoogleCalendar(): Promise<number> {
+  return invoke<number>("google_calendar_sync");
 }
 
 export async function getCloudConnectionStatus(): Promise<CloudConnectionStatus> {
@@ -102,6 +126,10 @@ export async function verifyCloudOtp(email: string, otp: string): Promise<CloudC
 
 export async function disconnectCloud(): Promise<boolean> {
   return invoke<boolean>("cloud_disconnect");
+}
+
+export async function processCloudOutbox(): Promise<CloudSyncStatus> {
+  return invoke<CloudSyncStatus>("cloud_process_outbox");
 }
 
 export const coreDataCommands = [
@@ -123,8 +151,15 @@ export const coreDataCommands = [
   "appointment_update",
   "appointment_list_by_date",
   "google_calendar_status",
+  "google_calendar_connect",
+  "google_calendar_disconnect",
+  "google_calendar_sync",
   "cloud_connection_status",
+  "cloud_status",
   "cloud_request_otp",
+  "otp_request",
   "cloud_verify_otp",
-  "cloud_disconnect"
+  "otp_verify",
+  "cloud_disconnect",
+  "cloud_process_outbox"
 ] as const;

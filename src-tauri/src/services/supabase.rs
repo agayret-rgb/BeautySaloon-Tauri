@@ -32,7 +32,11 @@ pub fn validate_public_config(config: &SupabaseConfig) -> Result<(), AppError> {
     Ok(())
 }
 
-pub fn request_email_otp(transport: &mut dyn HttpTransport, config: &SupabaseConfig, email: &str) -> Result<(), AppError> {
+pub fn request_email_otp(
+    transport: &mut dyn HttpTransport,
+    config: &SupabaseConfig,
+    email: &str,
+) -> Result<(), AppError> {
     validate_public_config(config)?;
     let url = format!("{}/auth/v1/otp", config.project_url.trim_end_matches('/'));
     let body = json!({ "email": email, "create_user": false }).to_string();
@@ -48,9 +52,17 @@ pub fn request_email_otp(transport: &mut dyn HttpTransport, config: &SupabaseCon
     Ok(())
 }
 
-pub fn verify_email_otp(transport: &mut dyn HttpTransport, config: &SupabaseConfig, email: &str, token: &str) -> Result<SupabaseSession, AppError> {
+pub fn verify_email_otp(
+    transport: &mut dyn HttpTransport,
+    config: &SupabaseConfig,
+    email: &str,
+    token: &str,
+) -> Result<SupabaseSession, AppError> {
     validate_public_config(config)?;
-    let url = format!("{}/auth/v1/verify", config.project_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/auth/v1/verify",
+        config.project_url.trim_end_matches('/')
+    );
     let body = json!({ "email": email, "token": token, "type": "email" }).to_string();
     let response = transport.send(HttpRequest {
         method: "POST".to_string(),
@@ -64,9 +76,16 @@ pub fn verify_email_otp(transport: &mut dyn HttpTransport, config: &SupabaseConf
     parse_session(&response.body)
 }
 
-pub fn refresh_session(transport: &mut dyn HttpTransport, config: &SupabaseConfig, refresh_token: &str) -> Result<SupabaseSession, AppError> {
+pub fn refresh_session(
+    transport: &mut dyn HttpTransport,
+    config: &SupabaseConfig,
+    refresh_token: &str,
+) -> Result<SupabaseSession, AppError> {
     validate_public_config(config)?;
-    let url = format!("{}/auth/v1/token?grant_type=refresh_token", config.project_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/auth/v1/token?grant_type=refresh_token",
+        config.project_url.trim_end_matches('/')
+    );
     let body = json!({ "refresh_token": refresh_token }).to_string();
     let response = transport.send(HttpRequest {
         method: "POST".to_string(),
@@ -80,7 +99,11 @@ pub fn refresh_session(transport: &mut dyn HttpTransport, config: &SupabaseConfi
     parse_session(&response.body)
 }
 
-pub fn validate_authenticated_session(transport: &mut dyn HttpTransport, config: &SupabaseConfig, access_token: &str) -> Result<(), AppError> {
+pub fn validate_authenticated_session(
+    transport: &mut dyn HttpTransport,
+    config: &SupabaseConfig,
+    access_token: &str,
+) -> Result<(), AppError> {
     let url = format!("{}/auth/v1/user", config.project_url.trim_end_matches('/'));
     let response = transport.send(HttpRequest {
         method: "GET".to_string(),
@@ -99,7 +122,10 @@ pub fn auth_headers(config: &SupabaseConfig, bearer: Option<&str>) -> Vec<(Strin
     let mut headers = vec![
         ("apikey".to_string(), config.publishable_key.clone()),
         ("Content-Type".to_string(), "application/json".to_string()),
-        ("x-client-info".to_string(), "beautysaloon-tauri".to_string()),
+        (
+            "x-client-info".to_string(),
+            "beautysaloon-tauri".to_string(),
+        ),
     ];
     if let Some(token) = bearer {
         headers.push(("Authorization".to_string(), format!("Bearer {token}")));
@@ -108,7 +134,8 @@ pub fn auth_headers(config: &SupabaseConfig, bearer: Option<&str>) -> Vec<(Strin
 }
 
 fn parse_session(body: &[u8]) -> Result<SupabaseSession, AppError> {
-    let data: Value = serde_json::from_slice(body).map_err(|_| AppError::Database("SUPABASE_SESSION_RESPONSE_INVALID".to_string()))?;
+    let data: Value = serde_json::from_slice(body)
+        .map_err(|_| AppError::Database("SUPABASE_SESSION_RESPONSE_INVALID".to_string()))?;
     Ok(SupabaseSession {
         access_token: data
             .get("access_token")
@@ -135,4 +162,3 @@ fn classify_supabase_status(status: u16) -> AppError {
         _ => AppError::Database("SUPABASE_OPERATION_FAILED".to_string()),
     }
 }
-

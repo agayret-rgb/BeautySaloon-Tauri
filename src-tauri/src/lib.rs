@@ -4,9 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration as StdDuration, Instant};
 use tauri::{AppHandle, Manager};
 use thiserror::Error;
 
@@ -47,6 +51,20 @@ impl Serialize for AppError {
 pub struct AppState {
     database_path: PathBuf,
     sqlite: Mutex<Connection>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveServicesConfig {
+    google: Option<services::google::GoogleOAuthConfig>,
+    supabase: Option<services::supabase::SupabaseConfig>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleConnectResult {
+    connected: bool,
+    calendar_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -174,6 +192,7 @@ pub struct AppointmentSummary {
     staff_name: String,
     service_names: Vec<String>,
     services: Vec<AppointmentServiceSnapshot>,
+    updated_at: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -244,7 +263,13 @@ fn data_paths(root: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, PathBu
     let exports_dir = root.join("exports");
     let settings_dir = root.join("settings");
 
-    for dir in [&database_dir, &backups_dir, &logs_dir, &exports_dir, &settings_dir] {
+    for dir in [
+        &database_dir,
+        &backups_dir,
+        &logs_dir,
+        &exports_dir,
+        &settings_dir,
+    ] {
         fs::create_dir_all(dir)?;
     }
 
@@ -570,7 +595,9 @@ fn integrity_check(connection: &Connection) -> Result<bool, AppError> {
 
 fn read_schema_version(connection: &Connection) -> Result<i64, AppError> {
     connection
-        .query_row("SELECT MAX(schema_version) FROM app_meta", [], |row| row.get(0))
+        .query_row("SELECT MAX(schema_version) FROM app_meta", [], |row| {
+            row.get(0)
+        })
         .map_err(Into::into)
 }
 
@@ -619,11 +646,19 @@ fn optional_text(value: Option<String>, max: usize) -> Result<Option<String>, Ap
 
 fn normalize_phone(value: Option<&str>, required: bool) -> Result<Option<String>, AppError> {
     let Some(raw) = value else {
-        return if required { Err(AppError::Validation("phone required".to_string())) } else { Ok(None) };
+        return if required {
+            Err(AppError::Validation("phone required".to_string()))
+        } else {
+            Ok(None)
+        };
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return if required { Err(AppError::Validation("phone required".to_string())) } else { Ok(None) };
+        return if required {
+            Err(AppError::Validation("phone required".to_string()))
+        } else {
+            Ok(None)
+        };
     }
     if trimmed.chars().any(|c| c.is_ascii_alphabetic()) {
         return Err(AppError::Validation("phone invalid".to_string()));
@@ -642,11 +677,18 @@ fn normalize_phone(value: Option<&str>, required: bool) -> Result<Option<String>
 }
 
 fn name_key(name: &str) -> String {
-    name.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn bool_to_i64(value: bool) -> i64 {
-    if value { 1 } else { 0 }
+    if value {
+        1
+    } else {
+        0
+    }
 }
 
 fn sql_path_literal(path: &Path) -> String {
@@ -670,7 +712,9 @@ fn pseudo_hash_64(value: &str) -> String {
 
 fn validate_color(value: &str) -> Result<String, AppError> {
     match value {
-        "sage" | "teal" | "blue" | "purple" | "rose" | "coral" | "amber" | "slate" => Ok(value.to_string()),
+        "sage" | "teal" | "blue" | "purple" | "rose" | "coral" | "amber" | "slate" => {
+            Ok(value.to_string())
+        }
         _ => Err(AppError::Validation("color_key invalid".to_string())),
     }
 }
@@ -683,8 +727,10 @@ fn validate_status(value: &str) -> Result<String, AppError> {
 }
 
 fn local_to_utc(local_date: &str, local_time: &str) -> Result<chrono::DateTime<Utc>, AppError> {
-    let date = NaiveDate::parse_from_str(local_date, "%Y-%m-%d").map_err(|_| AppError::Validation("localDate invalid".to_string()))?;
-    let time = NaiveTime::parse_from_str(local_time, "%H:%M").map_err(|_| AppError::Validation("localStartTime invalid".to_string()))?;
+    let date = NaiveDate::parse_from_str(local_date, "%Y-%m-%d")
+        .map_err(|_| AppError::Validation("localDate invalid".to_string()))?;
+    let time = NaiveTime::parse_from_str(local_time, "%H:%M")
+        .map_err(|_| AppError::Validation("localStartTime invalid".to_string()))?;
     if time.minute() % 5 != 0 {
         return Err(AppError::Validation("localStartTime step".to_string()));
     }
@@ -699,11 +745,17 @@ fn utc_iso(dt: chrono::DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-fn ensure_same_istanbul_day(start: chrono::DateTime<Utc>, end: chrono::DateTime<Utc>) -> Result<(), AppError> {
+fn ensure_same_istanbul_day(
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+) -> Result<(), AppError> {
     let start_day = (start + Duration::minutes(ISTANBUL_OFFSET_MINUTES)).date_naive();
-    let end_day = (end - Duration::milliseconds(1) + Duration::minutes(ISTANBUL_OFFSET_MINUTES)).date_naive();
+    let end_day =
+        (end - Duration::milliseconds(1) + Duration::minutes(ISTANBUL_OFFSET_MINUTES)).date_naive();
     if start_day != end_day {
-        return Err(AppError::Validation("APPOINTMENT_CROSSES_MIDNIGHT".to_string()));
+        return Err(AppError::Validation(
+            "APPOINTMENT_CROSSES_MIDNIGHT".to_string(),
+        ));
     }
     Ok(())
 }
@@ -774,14 +826,22 @@ fn service_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceItem> {
 
 fn get_customer(connection: &Connection, id: &str) -> Result<Option<Customer>, AppError> {
     connection
-        .query_row("SELECT * FROM customers WHERE id = ?1", params![id], customer_from_row)
+        .query_row(
+            "SELECT * FROM customers WHERE id = ?1",
+            params![id],
+            customer_from_row,
+        )
         .optional()
         .map_err(Into::into)
 }
 
 fn get_staff(connection: &Connection, id: &str) -> Result<Option<Staff>, AppError> {
     connection
-        .query_row("SELECT * FROM staff WHERE id = ?1", params![id], staff_from_row)
+        .query_row(
+            "SELECT * FROM staff WHERE id = ?1",
+            params![id],
+            staff_from_row,
+        )
         .optional()
         .map_err(Into::into)
 }
@@ -797,9 +857,15 @@ fn get_service(connection: &Connection, id: &str) -> Result<Option<ServiceItem>,
         .map_err(Into::into)
 }
 
-fn next_sort_order(connection: &Connection, table: &str, where_sql: Option<(&str, &str)>) -> Result<i64, AppError> {
+fn next_sort_order(
+    connection: &Connection,
+    table: &str,
+    where_sql: Option<(&str, &str)>,
+) -> Result<i64, AppError> {
     let sql = match where_sql {
-        Some((column, _)) => format!("SELECT COALESCE(MAX(sort_order), 0) + 10 FROM {table} WHERE {column} = ?1"),
+        Some((column, _)) => {
+            format!("SELECT COALESCE(MAX(sort_order), 0) + 10 FROM {table} WHERE {column} = ?1")
+        }
         None => format!("SELECT COALESCE(MAX(sort_order), 0) + 10 FROM {table}"),
     };
     let value = match where_sql {
@@ -837,8 +903,13 @@ fn create_customer_tx(connection: &Connection, input: CustomerInput) -> Result<C
     get_customer(connection, &id)?.ok_or_else(|| AppError::Database("customer insert".to_string()))
 }
 
-fn update_customer_tx(connection: &Connection, id: &str, input: CustomerInput) -> Result<Customer, AppError> {
-    get_customer(connection, id)?.ok_or_else(|| AppError::NotFound("CUSTOMER_NOT_FOUND".to_string()))?;
+fn update_customer_tx(
+    connection: &Connection,
+    id: &str,
+    input: CustomerInput,
+) -> Result<Customer, AppError> {
+    get_customer(connection, id)?
+        .ok_or_else(|| AppError::NotFound("CUSTOMER_NOT_FOUND".to_string()))?;
     let first_name = normalize_text(&input.first_name, "firstName", 2, 100)?;
     let last_name = normalize_text(&input.last_name, "lastName", 2, 100)?;
     let phone = normalize_phone(Some(&input.phone), true)?.expect("required phone");
@@ -870,7 +941,11 @@ fn create_staff_tx(connection: &Connection, input: StaffInput) -> Result<Staff, 
     get_staff(connection, &id)?.ok_or_else(|| AppError::Database("staff insert".to_string()))
 }
 
-fn update_staff_tx(connection: &Connection, id: &str, input: StaffInput) -> Result<Staff, AppError> {
+fn update_staff_tx(
+    connection: &Connection,
+    id: &str,
+    input: StaffInput,
+) -> Result<Staff, AppError> {
     get_staff(connection, id)?.ok_or_else(|| AppError::NotFound("STAFF_NOT_FOUND".to_string()))?;
     let first_name = normalize_text(&input.first_name, "firstName", 2, 100)?;
     let last_name = optional_text(input.last_name, 100)?;
@@ -884,7 +959,10 @@ fn update_staff_tx(connection: &Connection, id: &str, input: StaffInput) -> Resu
     get_staff(connection, id)?.ok_or_else(|| AppError::Database("staff update".to_string()))
 }
 
-fn create_category_tx(connection: &Connection, input: CategoryInput) -> Result<ServiceCategory, AppError> {
+fn create_category_tx(
+    connection: &Connection,
+    input: CategoryInput,
+) -> Result<ServiceCategory, AppError> {
     let name = normalize_text(&input.name, "name", 2, 120)?;
     let key = name_key(&name);
     let id = new_uuid();
@@ -914,14 +992,24 @@ fn get_category(connection: &Connection, id: &str) -> Result<ServiceCategory, Ap
         .map_err(Into::into)
 }
 
-fn create_service_tx(connection: &Connection, input: ServiceInput) -> Result<ServiceItem, AppError> {
-    get_category(connection, &input.category_id).map_err(|_| AppError::NotFound("CATEGORY_NOT_FOUND".to_string()))?;
+fn create_service_tx(
+    connection: &Connection,
+    input: ServiceInput,
+) -> Result<ServiceItem, AppError> {
+    get_category(connection, &input.category_id)
+        .map_err(|_| AppError::NotFound("CATEGORY_NOT_FOUND".to_string()))?;
     let name = normalize_text(&input.name, "name", 2, 160)?;
-    let duration = input.duration_minutes.ok_or_else(|| AppError::Validation("duration required".to_string()))?;
+    let duration = input
+        .duration_minutes
+        .ok_or_else(|| AppError::Validation("duration required".to_string()))?;
     validate_duration(duration)?;
     let id = new_uuid();
     let now = now_iso();
-    let sort_order = next_sort_order(connection, "services", Some(("category_id", &input.category_id)))?;
+    let sort_order = next_sort_order(
+        connection,
+        "services",
+        Some(("category_id", &input.category_id)),
+    )?;
     connection.execute(
         "INSERT INTO services (id, category_id, name, name_key, duration_minutes, sort_order, is_active, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8)",
         params![id, input.category_id, name.clone(), name_key(&name), duration, sort_order, bool_to_i64(input.is_active.unwrap_or(true)), now],
@@ -936,9 +1024,15 @@ fn validate_duration(duration: i64) -> Result<(), AppError> {
     Ok(())
 }
 
-fn update_service_tx(connection: &Connection, id: &str, input: ServiceInput) -> Result<ServiceItem, AppError> {
-    get_service(connection, id)?.ok_or_else(|| AppError::NotFound("SERVICE_NOT_FOUND".to_string()))?;
-    get_category(connection, &input.category_id).map_err(|_| AppError::NotFound("CATEGORY_NOT_FOUND".to_string()))?;
+fn update_service_tx(
+    connection: &Connection,
+    id: &str,
+    input: ServiceInput,
+) -> Result<ServiceItem, AppError> {
+    get_service(connection, id)?
+        .ok_or_else(|| AppError::NotFound("SERVICE_NOT_FOUND".to_string()))?;
+    get_category(connection, &input.category_id)
+        .map_err(|_| AppError::NotFound("CATEGORY_NOT_FOUND".to_string()))?;
     let name = normalize_text(&input.name, "name", 2, 160)?;
     if let Some(duration) = input.duration_minutes {
         validate_duration(duration)?;
@@ -960,17 +1054,28 @@ fn list_service_items(connection: &Connection) -> Result<Vec<ServiceItem>, AppEr
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
-fn set_staff_services_tx(connection: &mut Connection, staff_id: &str, service_ids: Vec<String>) -> Result<Vec<String>, AppError> {
-    get_staff(connection, staff_id)?.ok_or_else(|| AppError::NotFound("STAFF_NOT_FOUND".to_string()))?;
+fn set_staff_services_tx(
+    connection: &mut Connection,
+    staff_id: &str,
+    service_ids: Vec<String>,
+) -> Result<Vec<String>, AppError> {
+    get_staff(connection, staff_id)?
+        .ok_or_else(|| AppError::NotFound("STAFF_NOT_FOUND".to_string()))?;
     let tx = connection.transaction()?;
     let unique = unique_preserve_order(service_ids);
     for service_id in &unique {
-        let service = get_service(&tx, service_id)?.ok_or_else(|| AppError::NotFound("SERVICE_NOT_FOUND".to_string()))?;
-        if service.availability_status == "inactive" || service.availability_status == "category_inactive" {
+        let service = get_service(&tx, service_id)?
+            .ok_or_else(|| AppError::NotFound("SERVICE_NOT_FOUND".to_string()))?;
+        if service.availability_status == "inactive"
+            || service.availability_status == "category_inactive"
+        {
             return Err(AppError::Validation("SERVICE_NOT_ASSIGNABLE".to_string()));
         }
     }
-    tx.execute("DELETE FROM staff_services WHERE staff_id = ?1", params![staff_id])?;
+    tx.execute(
+        "DELETE FROM staff_services WHERE staff_id = ?1",
+        params![staff_id],
+    )?;
     let now = now_iso();
     for service_id in &unique {
         tx.execute(
@@ -1001,9 +1106,15 @@ fn appointment_snapshots(
         return Err(AppError::Validation("serviceIds invalid".to_string()));
     }
     if let Some(existing) = existing {
-        let existing_ids: Vec<String> = existing.iter().map(|item| item.service_id.clone()).collect();
+        let existing_ids: Vec<String> = existing
+            .iter()
+            .map(|item| item.service_id.clone())
+            .collect();
         if existing_ids == service_ids {
-            let total = existing.iter().map(|item| item.duration_minutes_snapshot).sum();
+            let total = existing
+                .iter()
+                .map(|item| item.duration_minutes_snapshot)
+                .sum();
             return Ok((existing, total, true));
         }
     }
@@ -1016,13 +1127,18 @@ fn appointment_snapshots(
     let mut snapshots = Vec::new();
     for (index, service_id) in service_ids.iter().enumerate() {
         if !assigned.contains(service_id) {
-            return Err(AppError::Validation("SERVICE_NOT_ASSIGNED_TO_STAFF".to_string()));
+            return Err(AppError::Validation(
+                "SERVICE_NOT_ASSIGNED_TO_STAFF".to_string(),
+            ));
         }
-        let service = get_service(connection, service_id)?.ok_or_else(|| AppError::NotFound("SERVICE_NOT_FOUND".to_string()))?;
+        let service = get_service(connection, service_id)?
+            .ok_or_else(|| AppError::NotFound("SERVICE_NOT_FOUND".to_string()))?;
         if service.availability_status != "ready" {
             return Err(AppError::Validation("SERVICE_NOT_READY".to_string()));
         }
-        let duration = service.duration_minutes.ok_or_else(|| AppError::Validation("SERVICE_NOT_READY".to_string()))?;
+        let duration = service
+            .duration_minutes
+            .ok_or_else(|| AppError::Validation("SERVICE_NOT_READY".to_string()))?;
         snapshots.push(AppointmentServiceSnapshot {
             service_id: service.id,
             service_name_snapshot: service.name,
@@ -1030,26 +1146,42 @@ fn appointment_snapshots(
             sort_order: ((index + 1) * 10) as i64,
         });
     }
-    let total: i64 = snapshots.iter().map(|item| item.duration_minutes_snapshot).sum();
+    let total: i64 = snapshots
+        .iter()
+        .map(|item| item.duration_minutes_snapshot)
+        .sum();
     if !(5..=720).contains(&total) {
         return Err(AppError::Validation("duration total".to_string()));
     }
     Ok((snapshots, total, false))
 }
 
-fn assert_appointment_references(connection: &Connection, customer_id: &str, staff_id: &str, current: Option<(&str, &str)>) -> Result<(), AppError> {
-    let customer = get_customer(connection, customer_id)?.ok_or_else(|| AppError::NotFound("CUSTOMER_NOT_FOUND".to_string()))?;
+fn assert_appointment_references(
+    connection: &Connection,
+    customer_id: &str,
+    staff_id: &str,
+    current: Option<(&str, &str)>,
+) -> Result<(), AppError> {
+    let customer = get_customer(connection, customer_id)?
+        .ok_or_else(|| AppError::NotFound("CUSTOMER_NOT_FOUND".to_string()))?;
     if !customer.is_active && current.map(|(cid, _)| cid != customer_id).unwrap_or(true) {
         return Err(AppError::Validation("CUSTOMER_INACTIVE".to_string()));
     }
-    let staff = get_staff(connection, staff_id)?.ok_or_else(|| AppError::NotFound("STAFF_NOT_FOUND".to_string()))?;
+    let staff = get_staff(connection, staff_id)?
+        .ok_or_else(|| AppError::NotFound("STAFF_NOT_FOUND".to_string()))?;
     if !staff.is_active && current.map(|(_, sid)| sid != staff_id).unwrap_or(true) {
         return Err(AppError::Validation("STAFF_INACTIVE".to_string()));
     }
     Ok(())
 }
 
-fn assert_no_conflict(connection: &Connection, staff_id: &str, start_at: &str, end_at: &str, exclude_id: Option<&str>) -> Result<(), AppError> {
+fn assert_no_conflict(
+    connection: &Connection,
+    staff_id: &str,
+    start_at: &str,
+    end_at: &str,
+    exclude_id: Option<&str>,
+) -> Result<(), AppError> {
     let count: i64 = connection.query_row(
         "SELECT COUNT(*) FROM appointments
          WHERE staff_id=?1 AND status IN ('planned','confirmed','completed')
@@ -1064,19 +1196,25 @@ fn assert_no_conflict(connection: &Connection, staff_id: &str, start_at: &str, e
     Ok(())
 }
 
-fn create_appointment_tx(connection: &mut Connection, input: AppointmentInput) -> Result<AppointmentSummary, AppError> {
+fn create_appointment_tx(
+    connection: &mut Connection,
+    input: AppointmentInput,
+) -> Result<AppointmentSummary, AppError> {
     let status = validate_status(input.status.as_deref().unwrap_or("planned"))?;
     let note = optional_text(input.note, 2000)?;
     let tx = connection.transaction()?;
     assert_appointment_references(&tx, &input.customer_id, &input.staff_id, None)?;
-    let (snapshots, total_duration, _) = appointment_snapshots(&tx, &input.staff_id, input.service_ids, None)?;
+    let (snapshots, total_duration, _) =
+        appointment_snapshots(&tx, &input.staff_id, input.service_ids, None)?;
     let start = local_to_utc(&input.local_date, &input.local_start_time)?;
     let end = start + Duration::minutes(total_duration);
     ensure_same_istanbul_day(start, end)?;
     let start_iso = utc_iso(start);
     let end_iso = utc_iso(end);
     if status == "no_show" && start > Utc::now() {
-        return Err(AppError::Validation("APPOINTMENT_NO_SHOW_TOO_EARLY".to_string()));
+        return Err(AppError::Validation(
+            "APPOINTMENT_NO_SHOW_TOO_EARLY".to_string(),
+        ));
     }
     if matches!(status.as_str(), "planned" | "confirmed" | "completed") {
         assert_no_conflict(&tx, &input.staff_id, &start_iso, &end_iso, None)?;
@@ -1101,25 +1239,38 @@ fn create_appointment_tx(connection: &mut Connection, input: AppointmentInput) -
     get_appointment(connection, &id)
 }
 
-fn update_appointment_tx(connection: &mut Connection, id: &str, input: AppointmentInput) -> Result<AppointmentSummary, AppError> {
+fn update_appointment_tx(
+    connection: &mut Connection,
+    id: &str,
+    input: AppointmentInput,
+) -> Result<AppointmentSummary, AppError> {
     let status = validate_status(input.status.as_deref().unwrap_or("planned"))?;
     let note = optional_text(input.note, 2000)?;
-    let current = get_raw_appointment(connection, id)?.ok_or_else(|| AppError::NotFound("APPOINTMENT_NOT_FOUND".to_string()))?;
+    let current = get_raw_appointment(connection, id)?
+        .ok_or_else(|| AppError::NotFound("APPOINTMENT_NOT_FOUND".to_string()))?;
     let tx = connection.transaction()?;
-    assert_appointment_references(&tx, &input.customer_id, &input.staff_id, Some((&current.customer_id, &current.staff_id)))?;
+    assert_appointment_references(
+        &tx,
+        &input.customer_id,
+        &input.staff_id,
+        Some((&current.customer_id, &current.staff_id)),
+    )?;
     let existing = if current.staff_id == input.staff_id {
         Some(list_appointment_services(&tx, id)?)
     } else {
         None
     };
-    let (snapshots, total_duration, used_existing) = appointment_snapshots(&tx, &input.staff_id, input.service_ids, existing)?;
+    let (snapshots, total_duration, used_existing) =
+        appointment_snapshots(&tx, &input.staff_id, input.service_ids, existing)?;
     let start = local_to_utc(&input.local_date, &input.local_start_time)?;
     let end = start + Duration::minutes(total_duration);
     ensure_same_istanbul_day(start, end)?;
     let start_iso = utc_iso(start);
     let end_iso = utc_iso(end);
     if status == "no_show" && start > Utc::now() {
-        return Err(AppError::Validation("APPOINTMENT_NO_SHOW_TOO_EARLY".to_string()));
+        return Err(AppError::Validation(
+            "APPOINTMENT_NO_SHOW_TOO_EARLY".to_string(),
+        ));
     }
     if matches!(status.as_str(), "planned" | "confirmed" | "completed") {
         assert_no_conflict(&tx, &input.staff_id, &start_iso, &end_iso, Some(id))?;
@@ -1129,7 +1280,10 @@ fn update_appointment_tx(connection: &mut Connection, id: &str, input: Appointme
         params![input.customer_id, input.staff_id, start_iso, end_iso, total_duration, status, note, now_iso(), id],
     )?;
     if !used_existing {
-        tx.execute("DELETE FROM appointment_services WHERE appointment_id=?1", params![id])?;
+        tx.execute(
+            "DELETE FROM appointment_services WHERE appointment_id=?1",
+            params![id],
+        )?;
         let now = now_iso();
         for snapshot in &snapshots {
             tx.execute(
@@ -1151,18 +1305,29 @@ struct RawAppointment {
     staff_id: String,
 }
 
-fn get_raw_appointment(connection: &Connection, id: &str) -> Result<Option<RawAppointment>, AppError> {
+fn get_raw_appointment(
+    connection: &Connection,
+    id: &str,
+) -> Result<Option<RawAppointment>, AppError> {
     connection
         .query_row(
             "SELECT customer_id, staff_id FROM appointments WHERE id=?1",
             params![id],
-            |row| Ok(RawAppointment { customer_id: row.get(0)?, staff_id: row.get(1)? }),
+            |row| {
+                Ok(RawAppointment {
+                    customer_id: row.get(0)?,
+                    staff_id: row.get(1)?,
+                })
+            },
         )
         .optional()
         .map_err(Into::into)
 }
 
-fn list_appointment_services(connection: &Connection, appointment_id: &str) -> Result<Vec<AppointmentServiceSnapshot>, AppError> {
+fn list_appointment_services(
+    connection: &Connection,
+    appointment_id: &str,
+) -> Result<Vec<AppointmentServiceSnapshot>, AppError> {
     let mut statement = connection.prepare(
         "SELECT service_id, service_name_snapshot, duration_minutes_snapshot, sort_order FROM appointment_services WHERE appointment_id=?1 ORDER BY sort_order ASC",
     )?;
@@ -1178,8 +1343,11 @@ fn list_appointment_services(connection: &Connection, appointment_id: &str) -> R
 }
 
 fn get_appointment(connection: &Connection, id: &str) -> Result<AppointmentSummary, AppError> {
-    let mut appointments = list_appointments_between(connection, None, None, None, None, Some(id), 1)?;
-    appointments.pop().ok_or_else(|| AppError::NotFound("APPOINTMENT_NOT_FOUND".to_string()))
+    let mut appointments =
+        list_appointments_between(connection, None, None, None, None, Some(id), 1)?;
+    appointments
+        .pop()
+        .ok_or_else(|| AppError::NotFound("APPOINTMENT_NOT_FOUND".to_string()))
 }
 
 fn backup_destination(database_path: &Path, kind: &str) -> Result<PathBuf, AppError> {
@@ -1187,7 +1355,12 @@ fn backup_destination(database_path: &Path, kind: &str) -> Result<PathBuf, AppEr
         .parent()
         .and_then(Path::parent)
         .map(|root| root.join("backups"))
-        .unwrap_or_else(|| database_path.parent().unwrap_or_else(|| Path::new(".")).join("backups"));
+        .unwrap_or_else(|| {
+            database_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("backups")
+        });
     fs::create_dir_all(&backup_dir)?;
     Ok(backup_dir.join(format!("salon-{kind}-{}.db", timestamp_for_file())))
 }
@@ -1214,7 +1387,11 @@ fn sanitize_machine_bound_state(database_path: &Path) -> Result<bool, AppError> 
     Ok(true)
 }
 
-fn create_sanitized_backup(connection: &Connection, database_path: &Path, kind: &str) -> Result<DatabaseBackupSummary, AppError> {
+fn create_sanitized_backup(
+    connection: &Connection,
+    database_path: &Path,
+    kind: &str,
+) -> Result<DatabaseBackupSummary, AppError> {
     if !integrity_check(connection)? {
         return Err(AppError::Database("SOURCE_INTEGRITY_FAILED".to_string()));
     }
@@ -1231,7 +1408,10 @@ fn create_sanitized_backup(connection: &Connection, database_path: &Path, kind: 
     })
 }
 
-fn clean_database_in_place(connection: &mut Connection, database_path: &Path) -> Result<DatabaseCleanSummary, AppError> {
+fn clean_database_in_place(
+    connection: &mut Connection,
+    database_path: &Path,
+) -> Result<DatabaseCleanSummary, AppError> {
     let safety = create_sanitized_backup(connection, database_path, "pre-clean")?;
     let tx = connection.transaction()?;
     for table in [
@@ -1253,7 +1433,10 @@ fn clean_database_in_place(connection: &mut Connection, database_path: &Path) ->
     }
     tx.execute("UPDATE whatsapp_settings SET is_enabled=0, automatic_reminder_enabled=0, updated_at=?1 WHERE id=1", params![now_iso()])?;
     tx.execute("UPDATE google_calendar_settings SET sync_enabled=0, account_email=NULL, updated_at_utc=?1 WHERE id=1", params![now_iso()])?;
-    tx.execute("UPDATE cloud_reminder_settings SET cloud_mode_enabled=0, updated_at_utc=?1 WHERE id=1", params![now_iso()])?;
+    tx.execute(
+        "UPDATE cloud_reminder_settings SET cloud_mode_enabled=0, updated_at_utc=?1 WHERE id=1",
+        params![now_iso()],
+    )?;
     tx.commit()?;
     if !integrity_check(connection)? {
         return Err(AppError::Database("CLEAN_INTEGRITY_FAILED".to_string()));
@@ -1270,7 +1453,9 @@ fn clean_database_in_place(connection: &mut Connection, database_path: &Path) ->
 fn restore_database_file_for_tests(active_path: &Path, backup_path: &Path) -> Result<(), AppError> {
     let backup = Connection::open(backup_path)?;
     if !integrity_check(&backup)? {
-        return Err(AppError::Database("RESTORE_SOURCE_INTEGRITY_FAILED".to_string()));
+        return Err(AppError::Database(
+            "RESTORE_SOURCE_INTEGRITY_FAILED".to_string(),
+        ));
     }
     drop(backup);
     for suffix in ["", "-wal", "-shm"] {
@@ -1283,8 +1468,15 @@ fn restore_database_file_for_tests(active_path: &Path, backup_path: &Path) -> Re
     Ok(())
 }
 
-fn enqueue_google_sync_if_enabled(connection: &Connection, appointment_id: &str) -> Result<(), AppError> {
-    let enabled: i64 = connection.query_row("SELECT sync_enabled FROM google_calendar_settings WHERE id=1", [], |row| row.get(0))?;
+fn enqueue_google_sync_if_enabled(
+    connection: &Connection,
+    appointment_id: &str,
+) -> Result<(), AppError> {
+    let enabled: i64 = connection.query_row(
+        "SELECT sync_enabled FROM google_calendar_settings WHERE id=1",
+        [],
+        |row| row.get(0),
+    )?;
     if enabled != 1 {
         return Ok(());
     }
@@ -1334,7 +1526,12 @@ fn google_sync_pending_mock_tx(connection: &Connection) -> Result<u32, AppError>
     Ok(appointment_ids.len() as u32)
 }
 
-fn upsert_cloud_outbox(connection: &Connection, reminder_id: &str, action: &str, payload_json: Option<String>) -> Result<(), AppError> {
+fn upsert_cloud_outbox(
+    connection: &Connection,
+    reminder_id: &str,
+    action: &str,
+    payload_json: Option<String>,
+) -> Result<(), AppError> {
     let now = now_iso();
     connection.execute(
         "INSERT INTO reminder_cloud_state (reminder_id, last_synced_revision, next_revision, created_at_utc, updated_at_utc)
@@ -1342,7 +1539,11 @@ fn upsert_cloud_outbox(connection: &Connection, reminder_id: &str, action: &str,
          ON CONFLICT(reminder_id) DO NOTHING",
         params![reminder_id, now],
     )?;
-    let revision: i64 = connection.query_row("SELECT next_revision FROM reminder_cloud_state WHERE reminder_id=?1", params![reminder_id], |row| row.get(0))?;
+    let revision: i64 = connection.query_row(
+        "SELECT next_revision FROM reminder_cloud_state WHERE reminder_id=?1",
+        params![reminder_id],
+        |row| row.get(0),
+    )?;
     let mutation_id = format!("{reminder_id}:{revision}:{action}");
     let payload_hash = pseudo_hash_64(&format!("{mutation_id}:{:?}", payload_json));
     connection.execute(
@@ -1357,7 +1558,10 @@ fn upsert_cloud_outbox(connection: &Connection, reminder_id: &str, action: &str,
     Ok(())
 }
 
-fn reconcile_reminder_for_appointment(connection: &Connection, appointment_id: &str) -> Result<bool, AppError> {
+fn reconcile_reminder_for_appointment(
+    connection: &Connection,
+    appointment_id: &str,
+) -> Result<bool, AppError> {
     let row = connection
         .query_row(
             "SELECT a.start_at_utc, a.status, c.is_active, c.phone, c.whatsapp_reminder_enabled, c.whatsapp_consent_confirmed
@@ -1405,7 +1609,14 @@ fn reconcile_reminder_for_appointment(connection: &Connection, appointment_id: &
              DO UPDATE SET scheduled_for_utc=excluded.scheduled_for_utc, status='pending', cancelled_at_utc=NULL, updated_at=excluded.updated_at",
             params![reminder_id, appointment_id, scheduled, now],
         )?;
-        upsert_cloud_outbox(connection, &reminder_id, "upsert", Some(format!(r#"{{"appointmentId":"{appointment_id}","scheduledForUtc":"{scheduled}"}}"#)))?;
+        upsert_cloud_outbox(
+            connection,
+            &reminder_id,
+            "upsert",
+            Some(format!(
+                r#"{{"appointmentId":"{appointment_id}","scheduledForUtc":"{scheduled}"}}"#
+            )),
+        )?;
         Ok(true)
     } else if let Some(reminder_id) = existing {
         connection.execute(
@@ -1420,8 +1631,11 @@ fn reconcile_reminder_for_appointment(connection: &Connection, appointment_id: &
 }
 
 fn reconcile_all_reminders_mock(connection: &Connection) -> Result<u32, AppError> {
-    let mut statement = connection.prepare("SELECT id FROM appointments ORDER BY start_at_utc ASC")?;
-    let ids = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    let mut statement =
+        connection.prepare("SELECT id FROM appointments ORDER BY start_at_utc ASC")?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
     let mut changed = 0_u32;
     for id in ids {
         if reconcile_reminder_for_appointment(connection, &id)? {
@@ -1431,7 +1645,9 @@ fn reconcile_all_reminders_mock(connection: &Connection) -> Result<u32, AppError
     Ok(changed)
 }
 
-fn list_whatsapp_candidates_tx(connection: &Connection) -> Result<Vec<WhatsAppCandidate>, AppError> {
+fn list_whatsapp_candidates_tx(
+    connection: &Connection,
+) -> Result<Vec<WhatsAppCandidate>, AppError> {
     let now = Utc::now();
     let end = now + Duration::hours(24);
     let now = utc_iso(now);
@@ -1457,14 +1673,20 @@ fn list_whatsapp_candidates_tx(connection: &Connection) -> Result<Vec<WhatsAppCa
     let mut output = Vec::new();
     for row in rows {
         let candidate = row?;
-        if normalize_phone(Some(&candidate.phone), true).is_ok() && seen_phones.insert(candidate.phone.clone()) {
+        if normalize_phone(Some(&candidate.phone), true).is_ok()
+            && seen_phones.insert(candidate.phone.clone())
+        {
             output.push(candidate);
         }
     }
     Ok(output)
 }
 
-fn mock_auth_verify_otp_tx(connection: &Connection, email: &str, otp: &str) -> Result<MockAuthSession, AppError> {
+fn mock_auth_verify_otp_tx(
+    connection: &Connection,
+    email: &str,
+    otp: &str,
+) -> Result<MockAuthSession, AppError> {
     let email = normalize_text(email, "email", 5, 254)?;
     if !email.contains('@') || otp != "123456" {
         return Err(AppError::Validation("AUTH_OTP_INVALID".to_string()));
@@ -1525,7 +1747,10 @@ fn list_appointments_between(
     }
     sql.push_str(" ORDER BY a.start_at_utc ASC LIMIT :limit");
     params_map.insert(":limit", limit.to_string());
-    let named: Vec<(&str, &dyn rusqlite::ToSql)> = params_map.iter().map(|(key, value)| (*key, value as &dyn rusqlite::ToSql)).collect();
+    let named: Vec<(&str, &dyn rusqlite::ToSql)> = params_map
+        .iter()
+        .map(|(key, value)| (*key, value as &dyn rusqlite::ToSql))
+        .collect();
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map(&named[..], |row| {
         Ok((
@@ -1540,13 +1765,30 @@ fn list_appointments_between(
             row.get::<_, String>("customer_name")?,
             row.get::<_, String>("customer_phone")?,
             row.get::<_, String>("staff_name")?,
+            row.get::<_, String>("updated_at")?,
         ))
     })?;
     let mut output = Vec::new();
     for row in rows {
-        let (id, customer_id, staff_id, start_at_utc, end_at_utc, total_duration_minutes, status, note, customer_name, customer_phone, staff_name) = row?;
+        let (
+            id,
+            customer_id,
+            staff_id,
+            start_at_utc,
+            end_at_utc,
+            total_duration_minutes,
+            status,
+            note,
+            customer_name,
+            customer_phone,
+            staff_name,
+            updated_at,
+        ) = row?;
         let services = list_appointment_services(connection, &id)?;
-        let service_names = services.iter().map(|item| item.service_name_snapshot.clone()).collect();
+        let service_names = services
+            .iter()
+            .map(|item| item.service_name_snapshot.clone())
+            .collect();
         output.push(AppointmentSummary {
             id,
             customer_id,
@@ -1561,6 +1803,7 @@ fn list_appointments_between(
             staff_name,
             service_names,
             services,
+            updated_at,
         });
     }
     Ok(output)
@@ -1576,31 +1819,55 @@ fn app_health(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<AppHe
         app_version: app.package_info().version.to_string(),
         schema_version,
         database_path: state.database_path.display().to_string(),
-        message: if ok { "SQLite core data layer hazir.".to_string() } else { "SQLite integrity check basarisiz.".to_string() },
+        message: if ok {
+            "SQLite core data layer hazir.".to_string()
+        } else {
+            "SQLite integrity check basarisiz.".to_string()
+        },
     })
 }
 
 #[tauri::command]
-fn customer_create(input: CustomerInput, state: tauri::State<'_, AppState>) -> Result<Customer, AppError> {
+fn customer_create(
+    input: CustomerInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<Customer, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     create_customer_tx(&connection, input)
 }
 
 #[tauri::command]
-fn customer_update(id: String, input: CustomerInput, state: tauri::State<'_, AppState>) -> Result<Customer, AppError> {
+fn customer_update(
+    id: String,
+    input: CustomerInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<Customer, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     update_customer_tx(&connection, &id, input)
 }
 
 #[tauri::command]
-fn customer_set_active(id: String, is_active: bool, state: tauri::State<'_, AppState>) -> Result<Customer, AppError> {
+fn customer_set_active(
+    id: String,
+    is_active: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<Customer, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    connection.execute("UPDATE customers SET is_active=?1, updated_at=?2 WHERE id=?3", params![bool_to_i64(is_active), now_iso(), id])?;
-    get_customer(&connection, &id)?.ok_or_else(|| AppError::NotFound("CUSTOMER_NOT_FOUND".to_string()))
+    connection.execute(
+        "UPDATE customers SET is_active=?1, updated_at=?2 WHERE id=?3",
+        params![bool_to_i64(is_active), now_iso(), id],
+    )?;
+    get_customer(&connection, &id)?
+        .ok_or_else(|| AppError::NotFound("CUSTOMER_NOT_FOUND".to_string()))
 }
 
 #[tauri::command]
-fn customer_search(search: Option<String>, status: Option<String>, limit: Option<i64>, state: tauri::State<'_, AppState>) -> Result<Vec<Customer>, AppError> {
+fn customer_search(
+    search: Option<String>,
+    status: Option<String>,
+    limit: Option<i64>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<Customer>, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     let limit = limit.unwrap_or(50).clamp(1, 200);
     let status_sql = match status.as_deref().unwrap_or("active") {
@@ -1616,8 +1883,19 @@ fn customer_search(search: Option<String>, status: Option<String>, limit: Option
          ORDER BY last_name COLLATE NOCASE ASC, first_name COLLATE NOCASE ASC LIMIT :limit"
     ))?;
     let like = format!("%{query}%");
-    let phone = format!("%{}%", phone_query.trim_start_matches("90").trim_start_matches('0'));
-    let rows = statement.query_map(&[(":query", &query as &dyn rusqlite::ToSql), (":like", &like), (":phone", &phone), (":limit", &limit)], customer_from_row)?;
+    let phone = format!(
+        "%{}%",
+        phone_query.trim_start_matches("90").trim_start_matches('0')
+    );
+    let rows = statement.query_map(
+        &[
+            (":query", &query as &dyn rusqlite::ToSql),
+            (":like", &like),
+            (":phone", &phone),
+            (":limit", &limit),
+        ],
+        customer_from_row,
+    )?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
@@ -1628,20 +1906,35 @@ fn staff_create(input: StaffInput, state: tauri::State<'_, AppState>) -> Result<
 }
 
 #[tauri::command]
-fn staff_update(id: String, input: StaffInput, state: tauri::State<'_, AppState>) -> Result<Staff, AppError> {
+fn staff_update(
+    id: String,
+    input: StaffInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<Staff, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     update_staff_tx(&connection, &id, input)
 }
 
 #[tauri::command]
-fn staff_set_active(id: String, is_active: bool, state: tauri::State<'_, AppState>) -> Result<Staff, AppError> {
+fn staff_set_active(
+    id: String,
+    is_active: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<Staff, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    connection.execute("UPDATE staff SET is_active=?1, updated_at=?2 WHERE id=?3", params![bool_to_i64(is_active), now_iso(), id])?;
+    connection.execute(
+        "UPDATE staff SET is_active=?1, updated_at=?2 WHERE id=?3",
+        params![bool_to_i64(is_active), now_iso(), id],
+    )?;
     get_staff(&connection, &id)?.ok_or_else(|| AppError::NotFound("STAFF_NOT_FOUND".to_string()))
 }
 
 #[tauri::command]
-fn staff_list(status: Option<String>, limit: Option<i64>, state: tauri::State<'_, AppState>) -> Result<Vec<Staff>, AppError> {
+fn staff_list(
+    status: Option<String>,
+    limit: Option<i64>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<Staff>, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     let limit = limit.unwrap_or(50).clamp(1, 200);
     let status_sql = match status.as_deref().unwrap_or("active") {
@@ -1655,34 +1948,56 @@ fn staff_list(status: Option<String>, limit: Option<i64>, state: tauri::State<'_
 }
 
 #[tauri::command]
-fn staff_set_services(staff_id: String, service_ids: Vec<String>, state: tauri::State<'_, AppState>) -> Result<Vec<String>, AppError> {
+fn staff_set_services(
+    staff_id: String,
+    service_ids: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<String>, AppError> {
     let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     set_staff_services_tx(&mut connection, &staff_id, service_ids)
 }
 
 #[tauri::command]
-fn service_category_create(input: CategoryInput, state: tauri::State<'_, AppState>) -> Result<ServiceCategory, AppError> {
+fn service_category_create(
+    input: CategoryInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<ServiceCategory, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     create_category_tx(&connection, input)
 }
 
 #[tauri::command]
-fn service_create(input: ServiceInput, state: tauri::State<'_, AppState>) -> Result<ServiceItem, AppError> {
+fn service_create(
+    input: ServiceInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<ServiceItem, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     create_service_tx(&connection, input)
 }
 
 #[tauri::command]
-fn service_update(id: String, input: ServiceInput, state: tauri::State<'_, AppState>) -> Result<ServiceItem, AppError> {
+fn service_update(
+    id: String,
+    input: ServiceInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<ServiceItem, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     update_service_tx(&connection, &id, input)
 }
 
 #[tauri::command]
-fn service_set_active(id: String, is_active: bool, state: tauri::State<'_, AppState>) -> Result<ServiceItem, AppError> {
+fn service_set_active(
+    id: String,
+    is_active: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<ServiceItem, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    connection.execute("UPDATE services SET is_active=?1, updated_at=?2 WHERE id=?3", params![bool_to_i64(is_active), now_iso(), id])?;
-    get_service(&connection, &id)?.ok_or_else(|| AppError::NotFound("SERVICE_NOT_FOUND".to_string()))
+    connection.execute(
+        "UPDATE services SET is_active=?1, updated_at=?2 WHERE id=?3",
+        params![bool_to_i64(is_active), now_iso(), id],
+    )?;
+    get_service(&connection, &id)?
+        .ok_or_else(|| AppError::NotFound("SERVICE_NOT_FOUND".to_string()))
 }
 
 #[tauri::command]
@@ -1692,19 +2007,31 @@ fn service_list(state: tauri::State<'_, AppState>) -> Result<Vec<ServiceItem>, A
 }
 
 #[tauri::command]
-fn appointment_create(input: AppointmentInput, state: tauri::State<'_, AppState>) -> Result<AppointmentSummary, AppError> {
+fn appointment_create(
+    input: AppointmentInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<AppointmentSummary, AppError> {
     let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     create_appointment_tx(&mut connection, input)
 }
 
 #[tauri::command]
-fn appointment_update(id: String, input: AppointmentInput, state: tauri::State<'_, AppState>) -> Result<AppointmentSummary, AppError> {
+fn appointment_update(
+    id: String,
+    input: AppointmentInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<AppointmentSummary, AppError> {
     let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     update_appointment_tx(&mut connection, &id, input)
 }
 
 #[tauri::command]
-fn appointment_list_by_date(local_date: String, staff_id: Option<String>, limit: Option<i64>, state: tauri::State<'_, AppState>) -> Result<Vec<AppointmentSummary>, AppError> {
+fn appointment_list_by_date(
+    local_date: String,
+    staff_id: Option<String>,
+    limit: Option<i64>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<AppointmentSummary>, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     let start = local_to_utc(&local_date, "00:00")?;
     let end = start + Duration::days(1);
@@ -1720,15 +2047,22 @@ fn appointment_list_by_date(local_date: String, staff_id: Option<String>, limit:
 }
 
 #[tauri::command]
-fn database_create_backup(state: tauri::State<'_, AppState>) -> Result<DatabaseBackupSummary, AppError> {
+fn database_create_backup(
+    state: tauri::State<'_, AppState>,
+) -> Result<DatabaseBackupSummary, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     create_sanitized_backup(&connection, &state.database_path, "manual")
 }
 
 #[tauri::command]
-fn database_clean_start(input: ConfirmedInput, state: tauri::State<'_, AppState>) -> Result<DatabaseCleanSummary, AppError> {
+fn database_clean_start(
+    input: ConfirmedInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<DatabaseCleanSummary, AppError> {
     if !input.confirmed {
-        return Err(AppError::Validation("CLEAN_REQUIRES_CONFIRMATION".to_string()));
+        return Err(AppError::Validation(
+            "CLEAN_REQUIRES_CONFIRMATION".to_string(),
+        ));
     }
     let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     clean_database_in_place(&mut connection, &state.database_path)
@@ -1747,13 +2081,19 @@ fn reminder_reconcile_all_mock(state: tauri::State<'_, AppState>) -> Result<u32,
 }
 
 #[tauri::command]
-fn whatsapp_list_candidates(state: tauri::State<'_, AppState>) -> Result<Vec<WhatsAppCandidate>, AppError> {
+fn whatsapp_list_candidates(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<WhatsAppCandidate>, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     list_whatsapp_candidates_tx(&connection)
 }
 
 #[tauri::command]
-fn auth_mock_verify_otp(email: String, otp: String, state: tauri::State<'_, AppState>) -> Result<MockAuthSession, AppError> {
+fn auth_mock_verify_otp(
+    email: String,
+    otp: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<MockAuthSession, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     mock_auth_verify_otp_tx(&connection, &email, &otp)
 }
@@ -1761,44 +2101,436 @@ fn auth_mock_verify_otp(email: String, otp: String, state: tauri::State<'_, AppS
 #[tauri::command]
 fn auth_logout(state: tauri::State<'_, AppState>) -> Result<bool, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    connection.execute("DELETE FROM secure_secrets WHERE secret_key='supabase_mock_session'", [])?;
+    connection.execute(
+        "DELETE FROM secure_secrets WHERE secret_key='supabase_mock_session'",
+        [],
+    )?;
+    Ok(true)
+}
+
+fn load_live_services_config() -> Result<LiveServicesConfig, AppError> {
+    let mut config = read_live_services_config_file()?.unwrap_or_default();
+
+    let google_client_id = std::env::var("BEAUTYSALOON_GOOGLE_CLIENT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let google_client_secret = std::env::var("BEAUTYSALOON_GOOGLE_CLIENT_SECRET")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if let (Some(client_id), Some(client_secret)) = (google_client_id, google_client_secret) {
+        config.google = Some(services::google::GoogleOAuthConfig {
+            client_id,
+            client_secret,
+            calendar_id: std::env::var("BEAUTYSALOON_GOOGLE_CALENDAR_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+        });
+    }
+
+    let project_url = std::env::var("BEAUTYSALOON_SUPABASE_PROJECT_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let publishable_key = std::env::var("BEAUTYSALOON_SUPABASE_PUBLISHABLE_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if let (Some(project_url), Some(publishable_key)) = (project_url, publishable_key) {
+        config.supabase = Some(services::supabase::SupabaseConfig {
+            project_url,
+            publishable_key,
+        });
+    }
+
+    Ok(config)
+}
+
+fn read_live_services_config_file() -> Result<Option<LiveServicesConfig>, AppError> {
+    for path in live_services_config_candidates()? {
+        if path.exists() {
+            let text = fs::read_to_string(path)?;
+            return parse_live_services_config(&text).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn live_services_config_candidates() -> Result<Vec<PathBuf>, AppError> {
+    let mut candidates = Vec::new();
+    let mut add_candidates = |base: &Path| {
+        candidates.push(base.join("src-tauri").join("live-services.local.json"));
+        candidates.push(base.join("live-services.local.json"));
+    };
+    let cwd = std::env::current_dir()?;
+    for ancestor in cwd.ancestors() {
+        add_candidates(ancestor);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            for ancestor in parent.ancestors() {
+                add_candidates(ancestor);
+            }
+        }
+    }
+    candidates.dedup();
+    Ok(candidates)
+}
+
+fn parse_live_services_config(text: &str) -> Result<LiveServicesConfig, AppError> {
+    serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .map_err(|_| AppError::Validation("LIVE_SERVICE_CONFIG_INVALID".to_string()))
+}
+
+fn google_config() -> Result<services::google::GoogleOAuthConfig, AppError> {
+    load_live_services_config()?
+        .google
+        .ok_or_else(|| AppError::Validation("GOOGLE_CONFIG_MISSING".to_string()))
+}
+
+fn supabase_config() -> Result<services::supabase::SupabaseConfig, AppError> {
+    let config = load_live_services_config()?
+        .supabase
+        .ok_or_else(|| AppError::Validation("CLOUD_CONFIG_MISSING".to_string()))?;
+    services::supabase::validate_public_config(&config)?;
+    Ok(config)
+}
+
+#[tauri::command]
+fn google_calendar_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<services::google::GoogleConnectionStatus, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    let protector = services::secure_store::WindowsDpapiProtector;
+    let mut status = services::google::google_connection_status(
+        &connection,
+        services::secure_store::secure_storage_available(&protector),
+    )?;
+    status.configured = load_live_services_config()?.google.is_some();
+    Ok(status)
+}
+
+static GOOGLE_CONNECT_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Debug)]
+pub(crate) struct ConnectInProgressGuard;
+
+impl Drop for ConnectInProgressGuard {
+    fn drop(&mut self) {
+        GOOGLE_CONNECT_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub(crate) fn try_acquire_google_connect_guard() -> Result<ConnectInProgressGuard, AppError> {
+    if GOOGLE_CONNECT_IN_PROGRESS
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return Err(AppError::Conflict(
+            "GOOGLE_AUTH_ALREADY_IN_PROGRESS".to_string(),
+        ));
+    }
+    Ok(ConnectInProgressGuard)
+}
+
+#[tauri::command]
+async fn google_calendar_connect(
+    state: tauri::State<'_, AppState>,
+) -> Result<GoogleConnectResult, AppError> {
+    let _guard = try_acquire_google_connect_guard()?;
+    let config = google_config()?;
+    let database_path = state.database_path.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = _guard;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let redirect_uri = format!(
+            "http://127.0.0.1:{}/oauth2callback",
+            listener.local_addr()?.port()
+        );
+        let state_token = new_uuid();
+        let auth_url =
+            services::google::build_google_auth_url(&config.client_id, &redirect_uri, &state_token)?;
+        open_system_browser(&auth_url)?;
+        let callback_url =
+            wait_for_oauth_callback(&listener, &redirect_uri, StdDuration::from_secs(120))?;
+        let code = services::google::parse_oauth_callback(&callback_url, &state_token)?;
+        let mut transport = services::google::ReqwestHttpTransport;
+        let token_set =
+            services::google::exchange_auth_code(&mut transport, &config, &redirect_uri, &code)?;
+        let calendar_id = config
+            .calendar_id
+            .clone()
+            .unwrap_or_else(|| "primary".to_string());
+        let connection = open_database(&database_path)?;
+        let protector = services::secure_store::WindowsDpapiProtector;
+        services::secure_store::upsert_secret(
+            &connection,
+            &protector,
+            "google_calendar_refresh_token",
+            &token_set.refresh_token,
+        )?;
+        connection.execute(
+            "UPDATE google_calendar_settings SET sync_enabled=1, client_id=?1, calendar_id=?2, updated_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=1",
+            params![config.client_id, calendar_id],
+        )?;
+        Ok(GoogleConnectResult {
+            connected: true,
+            calendar_id,
+        })
+    })
+    .await
+    .map_err(|error| AppError::Database(format!("TASK_JOIN_ERROR: {error}")))?
+}
+
+#[tauri::command]
+fn google_calendar_disconnect(state: tauri::State<'_, AppState>) -> Result<bool, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    services::secure_store::delete_secret(&connection, "google_calendar_refresh_token")?;
+    connection.execute(
+        "UPDATE google_calendar_settings SET sync_enabled=0, account_email=NULL, updated_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=1",
+        [],
+    )?;
     Ok(true)
 }
 
 #[tauri::command]
-fn google_calendar_status(state: tauri::State<'_, AppState>) -> Result<services::google::GoogleConnectionStatus, AppError> {
+fn google_calendar_sync(state: tauri::State<'_, AppState>) -> Result<u32, AppError> {
+    let config = google_config()?;
+    let calendar_id = config
+        .calendar_id
+        .clone()
+        .unwrap_or_else(|| "primary".to_string());
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     let protector = services::secure_store::WindowsDpapiProtector;
-    services::google::google_connection_status(&connection, services::secure_store::secure_storage_available(&protector))
+    let refresh_token = services::secure_store::read_secret(
+        &connection,
+        &protector,
+        "google_calendar_refresh_token",
+    )?
+    .ok_or_else(|| AppError::Validation("GOOGLE_CALENDAR_NOT_CONNECTED".to_string()))?;
+    let mut transport = services::google::ReqwestHttpTransport;
+    let access_token =
+        services::google::refresh_access_token(&mut transport, &config, &refresh_token)?;
+    process_google_outbox(&connection, &mut transport, &access_token, &calendar_id, 25)
+}
+
+fn process_google_outbox(
+    connection: &Connection,
+    transport: &mut dyn services::google::HttpTransport,
+    access_token: &str,
+    calendar_id: &str,
+    limit: i64,
+) -> Result<u32, AppError> {
+    let mut statement = connection.prepare(
+        "SELECT appointment_id FROM google_calendar_outbox
+         WHERE sync_status='pending'
+         ORDER BY created_at_utc ASC, appointment_id ASC
+         LIMIT ?1",
+    )?;
+    let appointment_ids = statement
+        .query_map(params![limit], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut processed = 0;
+    for appointment_id in appointment_ids {
+        connection.execute(
+            "UPDATE google_calendar_outbox SET sync_status='in_flight', last_attempt_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'), last_error_code=NULL WHERE appointment_id=?1 AND sync_status='pending'",
+            params![appointment_id],
+        )?;
+        let appointment = list_appointments_between(
+            connection,
+            None,
+            None,
+            None,
+            None,
+            Some(&appointment_id),
+            1,
+        )?
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::NotFound("APPOINTMENT_NOT_FOUND".to_string()))?;
+        let google_event_id: Option<String> = connection
+            .query_row(
+                "SELECT google_event_id FROM appointment_google_calendar_sync WHERE appointment_id=?1",
+                params![appointment_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(event_id) = google_event_id.as_deref() {
+            services::google::reject_unrelated_event_mutation(
+                connection,
+                &appointment_id,
+                event_id,
+            )?;
+        }
+        let event = services::google::build_calendar_event(&appointment);
+        match services::google::upsert_calendar_event(
+            transport,
+            access_token,
+            calendar_id,
+            google_event_id.as_deref(),
+            &event,
+        ) {
+            Ok(event_id) => {
+                services::google::mark_google_outbox_synced(
+                    connection,
+                    &appointment_id,
+                    &event_id,
+                    &appointment.updated_at,
+                )?;
+                processed += 1;
+            }
+            Err(error) => {
+                let code = error.to_string();
+                connection.execute(
+                    "UPDATE google_calendar_outbox SET sync_status='pending', last_error_code=?1, updated_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE appointment_id=?2",
+                    params![code, appointment_id],
+                )?;
+                break;
+            }
+        }
+    }
+    Ok(processed)
+}
+
+fn open_system_browser(url: &str) -> Result<(), AppError> {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err(AppError::Validation("INVALID_AUTH_URL_SCHEME".to_string()));
+    }
+    #[cfg(windows)]
+    {
+        let status = Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", url])
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let status = Command::new("xdg-open").arg(url).status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    Err(AppError::Database("GOOGLE_BROWSER_OPEN_FAILED".to_string()))
+}
+
+fn wait_for_oauth_callback(
+    listener: &TcpListener,
+    redirect_uri: &str,
+    timeout: StdDuration,
+) -> Result<String, AppError> {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(StdDuration::from_secs(5)));
+                let _ = stream.set_write_timeout(Some(StdDuration::from_secs(5)));
+
+                let mut buffer = [0_u8; 8192];
+                let mut total_read = 0;
+                while total_read < buffer.len() {
+                    match stream.read(&mut buffer[total_read..]) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            total_read += n;
+                            if buffer[..total_read].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                if total_read == 0 {
+                    continue;
+                }
+
+                let request = String::from_utf8_lossy(&buffer[..total_read]);
+                let first_line = request.lines().next().unwrap_or("");
+                let path = first_line.split_whitespace().nth(1).unwrap_or("");
+
+                if !path.starts_with("/oauth2callback") {
+                    let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    continue;
+                }
+
+                let callback_url = format!(
+                    "{}{}",
+                    redirect_uri.trim_end_matches("/oauth2callback"),
+                    path
+                );
+                let body = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>BeautySaloon</title><style>body{font-family:system-ui,-apple-system,sans-serif;text-align:center;padding:50px;background:#faf8f5;color:#2c2523}h2{color:#386641}p{color:#6c584c}</style></head><body><h2>Google Takvim Baglantisi Basarili</h2><p>Bu sekmeyi kapatip BeautySaloon uygulamasina donebilirsiniz.</p></body></html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.as_bytes().len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                std::thread::sleep(StdDuration::from_millis(50));
+                return Ok(callback_url);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(StdDuration::from_millis(100));
+            }
+            Err(_) => {
+                std::thread::sleep(StdDuration::from_millis(100));
+            }
+        }
+    }
+    Err(AppError::Validation("GOOGLE_OAUTH_TIMEOUT".to_string()))
 }
 
 #[tauri::command]
-fn cloud_connection_status(state: tauri::State<'_, AppState>) -> Result<services::supabase::SupabaseConnectionStatus, AppError> {
+fn cloud_connection_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<services::supabase::SupabaseConnectionStatus, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    let (project_url, publishable_key): (Option<String>, Option<String>) = connection.query_row(
-        "SELECT project_url, publishable_key FROM cloud_reminder_settings WHERE id=1",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
     Ok(services::supabase::SupabaseConnectionStatus {
-        configured: project_url.is_some() && publishable_key.is_some(),
+        configured: load_live_services_config()?.supabase.is_some(),
         session_present: services::reminder_cloud::has_session_secret(&connection)?,
     })
 }
 
 #[tauri::command]
+fn cloud_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<services::supabase::SupabaseConnectionStatus, AppError> {
+    cloud_connection_status(state)
+}
+
+#[tauri::command]
 fn cloud_request_otp(email: String, state: tauri::State<'_, AppState>) -> Result<bool, AppError> {
-    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    let config = read_supabase_config(&connection)?.ok_or_else(|| AppError::Validation("CLOUD_NOT_CONFIGURED".to_string()))?;
+    drop(state);
+    let config = supabase_config()?;
     let mut transport = services::google::ReqwestHttpTransport;
     services::supabase::request_email_otp(&mut transport, &config, &email)?;
     Ok(true)
 }
 
 #[tauri::command]
-fn cloud_verify_otp(email: String, otp: String, state: tauri::State<'_, AppState>) -> Result<services::supabase::SupabaseConnectionStatus, AppError> {
+fn otp_request(email: String, state: tauri::State<'_, AppState>) -> Result<bool, AppError> {
+    cloud_request_otp(email, state)
+}
+
+#[tauri::command]
+fn cloud_verify_otp(
+    email: String,
+    otp: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<services::supabase::SupabaseConnectionStatus, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    let config = read_supabase_config(&connection)?.ok_or_else(|| AppError::Validation("CLOUD_NOT_CONFIGURED".to_string()))?;
+    let config = supabase_config()?;
     let mut transport = services::google::ReqwestHttpTransport;
     let session = services::supabase::verify_email_otp(&mut transport, &config, &email, &otp)?;
     let protector = services::secure_store::WindowsDpapiProtector;
@@ -1810,26 +2542,38 @@ fn cloud_verify_otp(email: String, otp: String, state: tauri::State<'_, AppState
 }
 
 #[tauri::command]
+fn otp_verify(
+    email: String,
+    otp: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<services::supabase::SupabaseConnectionStatus, AppError> {
+    cloud_verify_otp(email, otp, state)
+}
+
+#[tauri::command]
 fn cloud_disconnect(state: tauri::State<'_, AppState>) -> Result<bool, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     services::secure_store::delete_secret(&connection, "cloud_supabase_session")?;
     Ok(true)
 }
 
-fn read_supabase_config(connection: &Connection) -> Result<Option<services::supabase::SupabaseConfig>, AppError> {
-    let row: Option<(Option<String>, Option<String>)> = connection
-        .query_row(
-            "SELECT project_url, publishable_key FROM cloud_reminder_settings WHERE id=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    Ok(row.and_then(|(project_url, publishable_key)| {
-        Some(services::supabase::SupabaseConfig {
-            project_url: project_url?,
-            publishable_key: publishable_key?,
-        })
-    }))
+#[tauri::command]
+fn cloud_process_outbox(
+    state: tauri::State<'_, AppState>,
+) -> Result<services::reminder_cloud::CloudSyncStatus, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    let config = supabase_config()?;
+    let protector = services::secure_store::WindowsDpapiProtector;
+    let session = services::secure_store::read_supabase_session(&connection, &protector)?
+        .ok_or_else(|| AppError::Validation("CLOUD_SESSION_MISSING".to_string()))?;
+    let mut transport = services::google::ReqwestHttpTransport;
+    services::reminder_cloud::process_ordered_outbox(
+        &connection,
+        &mut transport,
+        &config,
+        &session,
+        25,
+    )
 }
 
 pub fn run() {
@@ -1842,6 +2586,10 @@ pub fn run() {
                 database_path,
                 sqlite: Mutex::new(sqlite),
             });
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1871,10 +2619,17 @@ pub fn run() {
             auth_mock_verify_otp,
             auth_logout,
             google_calendar_status,
+            google_calendar_connect,
+            google_calendar_disconnect,
+            google_calendar_sync,
             cloud_connection_status,
+            cloud_status,
             cloud_request_otp,
+            otp_request,
             cloud_verify_otp,
-            cloud_disconnect
+            otp_verify,
+            cloud_disconnect,
+            cloud_process_outbox
         ])
         .run(tauri::generate_context!())
         .expect("error while running BeautySaloon");
@@ -1917,7 +2672,14 @@ mod tests {
             },
         )
         .expect("staff");
-        let category = create_category_tx(connection, CategoryInput { name: "Cilt Bakimi".into(), is_active: Some(true) }).expect("category");
+        let category = create_category_tx(
+            connection,
+            CategoryInput {
+                name: "Cilt Bakimi".into(),
+                is_active: Some(true),
+            },
+        )
+        .expect("category");
         let service = create_service_tx(
             connection,
             ServiceInput {
@@ -1935,7 +2697,10 @@ mod tests {
     #[test]
     fn empty_db_bootstrap_matches_v1_core_schema() {
         let (_temp, connection) = open_temp();
-        assert_eq!(read_schema_version(&connection).expect("schema"), CORE_SCHEMA_VERSION);
+        assert_eq!(
+            read_schema_version(&connection).expect("schema"),
+            CORE_SCHEMA_VERSION
+        );
         for table in [
             "app_meta",
             "customers",
@@ -1956,7 +2721,11 @@ mod tests {
             "google_calendar_outbox",
         ] {
             let count: i64 = connection
-                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", params![table], |row| row.get(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |row| row.get(0),
+                )
                 .expect("table");
             assert_eq!(count, 1, "{table}");
         }
@@ -1986,9 +2755,16 @@ mod tests {
         }
 
         let connection = open_database(&db_path).expect("open upgraded");
-        assert_eq!(read_schema_version(&connection).expect("schema"), CORE_SCHEMA_VERSION);
+        assert_eq!(
+            read_schema_version(&connection).expect("schema"),
+            CORE_SCHEMA_VERSION
+        );
         let initialized_at: String = connection
-            .query_row("SELECT initialized_at FROM app_meta WHERE id = 1", [], |row| row.get(0))
+            .query_row(
+                "SELECT initialized_at FROM app_meta WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
             .expect("initialized_at");
         assert_eq!(initialized_at, "2026-08-24T00:00:00.000Z");
     }
@@ -2017,13 +2793,22 @@ mod tests {
         .expect("update customer");
         assert_eq!(updated.first_name, "Ayse Nur");
 
-        let inactive = customer_set_active_for_test(&connection, &customer.id, false).expect("inactive");
+        let inactive =
+            customer_set_active_for_test(&connection, &customer.id, false).expect("inactive");
         assert!(!inactive.is_active);
     }
 
-    fn customer_set_active_for_test(connection: &Connection, id: &str, is_active: bool) -> Result<Customer, AppError> {
-        connection.execute("UPDATE customers SET is_active=?1, updated_at=?2 WHERE id=?3", params![bool_to_i64(is_active), now_iso(), id])?;
-        get_customer(connection, id)?.ok_or_else(|| AppError::NotFound("CUSTOMER_NOT_FOUND".to_string()))
+    fn customer_set_active_for_test(
+        connection: &Connection,
+        id: &str,
+        is_active: bool,
+    ) -> Result<Customer, AppError> {
+        connection.execute(
+            "UPDATE customers SET is_active=?1, updated_at=?2 WHERE id=?3",
+            params![bool_to_i64(is_active), now_iso(), id],
+        )?;
+        get_customer(connection, id)?
+            .ok_or_else(|| AppError::NotFound("CUSTOMER_NOT_FOUND".to_string()))
     }
 
     #[test]
@@ -2046,7 +2831,10 @@ mod tests {
         )
         .expect("appointment");
         assert_eq!(appointment.total_duration_minutes, 30);
-        assert_eq!(appointment.services[0].service_name_snapshot, "Klasik Bakim");
+        assert_eq!(
+            appointment.services[0].service_name_snapshot,
+            "Klasik Bakim"
+        );
 
         let conflict = create_appointment_tx(
             &mut connection,
@@ -2080,7 +2868,12 @@ mod tests {
 
         drop(connection);
         let reopened = open_database(&db_path).expect("reopen");
-        assert_eq!(get_appointment(&reopened, &appointment.id).expect("read").status, "cancelled");
+        assert_eq!(
+            get_appointment(&reopened, &appointment.id)
+                .expect("read")
+                .status,
+            "cancelled"
+        );
         assert!(integrity_check(&reopened).expect("integrity"));
     }
 
@@ -2102,20 +2895,41 @@ mod tests {
         )
         .expect("appointment");
 
-        assert_eq!(customer_search_for_test(&connection, "555", "all").expect("customers").len(), 1);
+        assert_eq!(
+            customer_search_for_test(&connection, "555", "all")
+                .expect("customers")
+                .len(),
+            1
+        );
         assert_eq!(staff_list_for_test(&connection).expect("staff").len(), 1);
         assert_eq!(list_service_items(&connection).expect("services").len(), 1);
         assert_eq!(
-            list_appointments_between(&connection, Some("2026-08-24T00:00:00.000Z"), Some("2026-08-25T00:00:00.000Z"), None, None, None, 10)
-                .expect("appointments")
-                .len(),
+            list_appointments_between(
+                &connection,
+                Some("2026-08-24T00:00:00.000Z"),
+                Some("2026-08-25T00:00:00.000Z"),
+                None,
+                None,
+                None,
+                10
+            )
+            .expect("appointments")
+            .len(),
             1
         );
         assert!(!appointment.services.is_empty());
     }
 
-    fn customer_search_for_test(connection: &Connection, search: &str, status: &str) -> Result<Vec<Customer>, AppError> {
-        let status_sql = if status == "all" { "1 = 1" } else { "is_active = 1" };
+    fn customer_search_for_test(
+        connection: &Connection,
+        search: &str,
+        status: &str,
+    ) -> Result<Vec<Customer>, AppError> {
+        let status_sql = if status == "all" {
+            "1 = 1"
+        } else {
+            "is_active = 1"
+        };
         let like = format!("%{}%", search.to_lowercase());
         let mut statement = connection.prepare(&format!(
             "SELECT * FROM customers WHERE {status_sql} AND (lower(first_name) LIKE ?1 OR lower(last_name) LIKE ?1 OR phone LIKE ?1)"
@@ -2134,7 +2948,9 @@ mod tests {
     fn transaction_rollback_and_scale_sanity() {
         let (_temp, mut connection) = open_temp();
         let (_customer, staff, _service) = seed_core(&mut connection);
-        let before: i64 = connection.query_row("SELECT COUNT(*) FROM appointments", [], |row| row.get(0)).expect("count");
+        let before: i64 = connection
+            .query_row("SELECT COUNT(*) FROM appointments", [], |row| row.get(0))
+            .expect("count");
         let bad = create_appointment_tx(
             &mut connection,
             AppointmentInput {
@@ -2148,7 +2964,9 @@ mod tests {
             },
         );
         assert!(bad.is_err());
-        let after: i64 = connection.query_row("SELECT COUNT(*) FROM appointments", [], |row| row.get(0)).expect("count");
+        let after: i64 = connection
+            .query_row("SELECT COUNT(*) FROM appointments", [], |row| row.get(0))
+            .expect("count");
         assert_eq!(before, after);
 
         let tx = connection.transaction().expect("tx");
@@ -2168,8 +2986,12 @@ mod tests {
     #[test]
     fn creates_expected_data_directories() {
         let temp = tempdir().expect("tempdir");
-        let (database_path, backups_dir, logs_dir, exports_dir, settings_dir) = data_paths(temp.path()).expect("paths");
-        assert_eq!(database_path.file_name().and_then(|name| name.to_str()), Some("salon-foundation.db"));
+        let (database_path, backups_dir, logs_dir, exports_dir, settings_dir) =
+            data_paths(temp.path()).expect("paths");
+        assert_eq!(
+            database_path.file_name().and_then(|name| name.to_str()),
+            Some("salon-foundation.db")
+        );
         assert!(backups_dir.is_dir());
         assert!(logs_dir.is_dir());
         assert!(exports_dir.is_dir());
@@ -2177,7 +2999,9 @@ mod tests {
     }
 
     fn future_local_slot(hours_from_now: i64) -> (String, String) {
-        let local = Utc::now() + Duration::minutes(ISTANBUL_OFFSET_MINUTES) + Duration::hours(hours_from_now);
+        let local = Utc::now()
+            + Duration::minutes(ISTANBUL_OFFSET_MINUTES)
+            + Duration::hours(hours_from_now);
         let minute = (chrono::Timelike::minute(&local) / 5) * 5;
         (
             local.date_naive().format("%Y-%m-%d").to_string(),
@@ -2205,19 +3029,31 @@ mod tests {
 
         let backup = create_sanitized_backup(&connection, &db_path, "manual").expect("backup");
         let backup_connection = Connection::open(&backup.backup_path).expect("backup open");
-        let secret_count: i64 = backup_connection.query_row("SELECT COUNT(*) FROM secure_secrets", [], |row| row.get(0)).expect("secret count");
-        let google_enabled: i64 = backup_connection.query_row("SELECT sync_enabled FROM google_calendar_settings WHERE id=1", [], |row| row.get(0)).expect("google");
+        let secret_count: i64 = backup_connection
+            .query_row("SELECT COUNT(*) FROM secure_secrets", [], |row| row.get(0))
+            .expect("secret count");
+        let google_enabled: i64 = backup_connection
+            .query_row(
+                "SELECT sync_enabled FROM google_calendar_settings WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("google");
         assert_eq!(secret_count, 0);
         assert_eq!(google_enabled, 0);
 
         clean_database_in_place(&mut connection, &db_path).expect("clean");
-        let customer_count: i64 = connection.query_row("SELECT COUNT(*) FROM customers", [], |row| row.get(0)).expect("customers");
+        let customer_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM customers", [], |row| row.get(0))
+            .expect("customers");
         assert_eq!(customer_count, 0);
         drop(connection);
 
         restore_database_file_for_tests(&db_path, Path::new(&backup.backup_path)).expect("restore");
         let reopened = open_database(&db_path).expect("reopen restored");
-        assert!(get_customer(&reopened, &customer.id).expect("customer").is_some());
+        assert!(get_customer(&reopened, &customer.id)
+            .expect("customer")
+            .is_some());
         assert!(integrity_check(&reopened).expect("integrity"));
 
         let corrupt_path = temp.path().join("corrupt.db");
@@ -2229,7 +3065,12 @@ mod tests {
     fn google_calendar_one_way_outbox_reuses_event_and_does_not_block_local_save() {
         let (_temp, mut connection) = open_temp();
         let (customer, staff, service) = seed_core(&mut connection);
-        connection.execute("UPDATE google_calendar_settings SET sync_enabled=1 WHERE id=1", []).expect("enable");
+        connection
+            .execute(
+                "UPDATE google_calendar_settings SET sync_enabled=1 WHERE id=1",
+                [],
+            )
+            .expect("enable");
 
         let appointment = create_appointment_tx(
             &mut connection,
@@ -2244,7 +3085,13 @@ mod tests {
             },
         )
         .expect("create");
-        let pending: i64 = connection.query_row("SELECT COUNT(*) FROM google_calendar_outbox WHERE sync_status='pending'", [], |row| row.get(0)).expect("pending");
+        let pending: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM google_calendar_outbox WHERE sync_status='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pending");
         assert_eq!(pending, 1);
         assert_eq!(google_sync_pending_mock_tx(&connection).expect("sync"), 1);
         let event_id: String = connection
@@ -2270,7 +3117,9 @@ mod tests {
             .query_row("SELECT google_event_id FROM appointment_google_calendar_sync WHERE appointment_id=?1", params![appointment.id], |row| row.get(0))
             .expect("event reused");
         assert_eq!(event_id, event_after_cancel);
-        let appointments: i64 = connection.query_row("SELECT COUNT(*) FROM appointments", [], |row| row.get(0)).expect("appointments");
+        let appointments: i64 = connection
+            .query_row("SELECT COUNT(*) FROM appointments", [], |row| row.get(0))
+            .expect("appointments");
         assert_eq!(appointments, 1);
     }
 
@@ -2308,8 +3157,17 @@ mod tests {
             },
         )
         .expect("appointment");
-        assert_eq!(reconcile_all_reminders_mock(&connection).expect("reconcile"), 1);
-        let outbox_count: i64 = connection.query_row("SELECT COUNT(*) FROM reminder_cloud_outbox WHERE sync_status='pending'", [], |row| row.get(0)).expect("outbox");
+        assert_eq!(
+            reconcile_all_reminders_mock(&connection).expect("reconcile"),
+            1
+        );
+        let outbox_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_cloud_outbox WHERE sync_status='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("outbox");
         assert!(outbox_count >= 1);
         let candidates = list_whatsapp_candidates_tx(&connection).expect("candidates");
         assert_eq!(candidates.len(), 1);
@@ -2330,13 +3188,21 @@ mod tests {
         )
         .expect("cancel");
         let status: String = connection
-            .query_row("SELECT status FROM appointment_reminders WHERE appointment_id=?1", params![appointment.id], |row| row.get(0))
+            .query_row(
+                "SELECT status FROM appointment_reminders WHERE appointment_id=?1",
+                params![appointment.id],
+                |row| row.get(0),
+            )
             .expect("reminder status");
         assert_eq!(status, "cancelled");
         drop(connection);
 
         let reopened = open_database(&db_path).expect("reopen");
-        let persisted: i64 = reopened.query_row("SELECT COUNT(*) FROM reminder_cloud_outbox", [], |row| row.get(0)).expect("persisted");
+        let persisted: i64 = reopened
+            .query_row("SELECT COUNT(*) FROM reminder_cloud_outbox", [], |row| {
+                row.get(0)
+            })
+            .expect("persisted");
         assert!(persisted >= 2);
         assert!(integrity_check(&reopened).expect("integrity"));
     }
@@ -2344,26 +3210,65 @@ mod tests {
     #[test]
     fn mock_auth_session_uses_secure_secret_boundary_and_logout_clears_it() {
         let (_temp, connection) = open_temp();
-        let session = mock_auth_verify_otp_tx(&connection, "owner@example.test", "123456").expect("otp");
+        let session =
+            mock_auth_verify_otp_tx(&connection, "owner@example.test", "123456").expect("otp");
         assert_eq!(session.access_token_hint, "mock-session-present");
-        let secret_count: i64 = connection.query_row("SELECT COUNT(*) FROM secure_secrets WHERE secret_key='supabase_mock_session'", [], |row| row.get(0)).expect("secret");
+        let secret_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM secure_secrets WHERE secret_key='supabase_mock_session'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("secret");
         assert_eq!(secret_count, 1);
-        let settings_count: i64 = connection.query_row("SELECT COUNT(*) FROM cloud_reminder_settings WHERE publishable_key IS NOT NULL", [], |row| row.get(0)).expect("settings");
+        let settings_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM cloud_reminder_settings WHERE publishable_key IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("settings");
         assert_eq!(settings_count, 0);
-        connection.execute("DELETE FROM secure_secrets WHERE secret_key='supabase_mock_session'", []).expect("logout");
-        let after: i64 = connection.query_row("SELECT COUNT(*) FROM secure_secrets WHERE secret_key='supabase_mock_session'", [], |row| row.get(0)).expect("after");
+        connection
+            .execute(
+                "DELETE FROM secure_secrets WHERE secret_key='supabase_mock_session'",
+                [],
+            )
+            .expect("logout");
+        let after: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM secure_secrets WHERE secret_key='supabase_mock_session'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("after");
         assert_eq!(after, 0);
     }
 
     #[test]
     fn google_real_client_boundaries_validate_oauth_state_refresh_and_same_event_updates() {
-        let auth_url = services::google::build_google_auth_url("client-id", "http://127.0.0.1:4444/oauth2callback", "state-1").expect("auth url");
-        assert!(auth_url.contains("scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcalendar.events"));
+        let auth_url = services::google::build_google_auth_url(
+            "client-id",
+            "http://127.0.0.1:4444/oauth2callback",
+            "state-1",
+        )
+        .expect("auth url");
+        assert!(
+            auth_url.contains("scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcalendar.events")
+        );
         assert_eq!(
-            services::google::parse_oauth_callback("http://127.0.0.1:4444/oauth2callback?state=state-1&code=abc", "state-1").expect("code"),
+            services::google::parse_oauth_callback(
+                "http://127.0.0.1:4444/oauth2callback?state=state-1&code=abc",
+                "state-1"
+            )
+            .expect("code"),
             "abc"
         );
-        assert!(services::google::parse_oauth_callback("http://127.0.0.1:4444/oauth2callback?state=bad&code=abc", "state-1").is_err());
+        assert!(services::google::parse_oauth_callback(
+            "http://127.0.0.1:4444/oauth2callback?state=bad&code=abc",
+            "state-1"
+        )
+        .is_err());
 
         let config = services::google::GoogleOAuthConfig {
             client_id: "client-id".into(),
@@ -2371,14 +3276,34 @@ mod tests {
             calendar_id: Some("primary".into()),
         };
         let mut transport = services::google::FakeHttpTransport::new(vec![
-            services::google::HttpResponse { status: 200, body: br#"{"refresh_token":"refresh-1","access_token":"access-1"}"#.to_vec() },
-            services::google::HttpResponse { status: 200, body: br#"{"access_token":"access-2"}"#.to_vec() },
-            services::google::HttpResponse { status: 200, body: br#"{"id":"event-1"}"#.to_vec() },
-            services::google::HttpResponse { status: 200, body: br#"{"id":"event-1"}"#.to_vec() },
+            services::google::HttpResponse {
+                status: 200,
+                body: br#"{"refresh_token":"refresh-1","access_token":"access-1"}"#.to_vec(),
+            },
+            services::google::HttpResponse {
+                status: 200,
+                body: br#"{"access_token":"access-2"}"#.to_vec(),
+            },
+            services::google::HttpResponse {
+                status: 200,
+                body: br#"{"id":"event-1"}"#.to_vec(),
+            },
+            services::google::HttpResponse {
+                status: 200,
+                body: br#"{"id":"event-1"}"#.to_vec(),
+            },
         ]);
-        let tokens = services::google::exchange_auth_code(&mut transport, &config, "http://127.0.0.1:4444/oauth2callback", "abc").expect("exchange");
+        let tokens = services::google::exchange_auth_code(
+            &mut transport,
+            &config,
+            "http://127.0.0.1:4444/oauth2callback",
+            "abc",
+        )
+        .expect("exchange");
         assert_eq!(tokens.refresh_token, "refresh-1");
-        let access = services::google::refresh_access_token(&mut transport, &config, &tokens.refresh_token).expect("refresh");
+        let access =
+            services::google::refresh_access_token(&mut transport, &config, &tokens.refresh_token)
+                .expect("refresh");
         assert_eq!(access, "access-2");
 
         let (_temp, mut connection) = open_temp();
@@ -2398,20 +3323,56 @@ mod tests {
         .expect("appointment");
         connection.execute("INSERT INTO appointment_google_calendar_sync (appointment_id, google_event_id, created_at_utc, updated_at_utc) VALUES (?1, NULL, ?2, ?2) ON CONFLICT DO NOTHING", params![appointment.id, now_iso()]).expect("sync row");
         let payload = services::google::build_calendar_event(&appointment);
-        let created_id = services::google::upsert_calendar_event(&mut transport, &access, "primary", None, &payload).expect("create");
-        services::google::mark_google_outbox_synced(&connection, &appointment.id, &created_id, &appointment.start_at_utc).expect("mark");
-        services::google::reject_unrelated_event_mutation(&connection, &appointment.id, "event-1").expect("trusted");
-        assert!(services::google::reject_unrelated_event_mutation(&connection, &appointment.id, "other-event").is_err());
-        let cancelled = AppointmentSummary { status: "cancelled".into(), ..appointment };
+        let created_id = services::google::upsert_calendar_event(
+            &mut transport,
+            &access,
+            "primary",
+            None,
+            &payload,
+        )
+        .expect("create");
+        services::google::mark_google_outbox_synced(
+            &connection,
+            &appointment.id,
+            &created_id,
+            &appointment.start_at_utc,
+        )
+        .expect("mark");
+        services::google::reject_unrelated_event_mutation(&connection, &appointment.id, "event-1")
+            .expect("trusted");
+        assert!(services::google::reject_unrelated_event_mutation(
+            &connection,
+            &appointment.id,
+            "other-event"
+        )
+        .is_err());
+        let cancelled = AppointmentSummary {
+            status: "cancelled".into(),
+            ..appointment
+        };
         let cancel_payload = services::google::build_calendar_event(&cancelled);
-        assert!(cancel_payload["summary"].as_str().expect("summary").starts_with("IPTAL - "));
-        let updated_id = services::google::upsert_calendar_event(&mut transport, &access, "primary", Some("event-1"), &cancel_payload).expect("update same");
+        assert!(cancel_payload["summary"]
+            .as_str()
+            .expect("summary")
+            .starts_with("IPTAL - "));
+        let updated_id = services::google::upsert_calendar_event(
+            &mut transport,
+            &access,
+            "primary",
+            Some("event-1"),
+            &cancel_payload,
+        )
+        .expect("update same");
         assert_eq!(updated_id, "event-1");
-        assert!(transport.requests.iter().any(|request| request.method == "PATCH" && request.url.contains("/events/event-1")));
+        assert!(transport
+            .requests
+            .iter()
+            .any(|request| request.method == "PATCH" && request.url.contains("/events/event-1")));
     }
 
     #[test]
-    fn supabase_real_auth_client_uses_public_config_and_secure_session_storage_with_mock_transport() {
+    fn supabase_real_auth_client_uses_public_config_and_secure_session_storage_with_mock_transport()
+    {
         let config = services::supabase::SupabaseConfig {
             project_url: "https://example.supabase.co".into(),
             publishable_key: "pub-key-with-enough-length".into(),
@@ -2422,18 +3383,41 @@ mod tests {
             services::google::HttpResponse { status: 200, body: br#"{"access_token":"access2","refresh_token":"refresh2"}"#.to_vec() },
             services::google::HttpResponse { status: 200, body: br#"{"id":"user"}"#.to_vec() },
         ]);
-        services::supabase::request_email_otp(&mut transport, &config, "owner@example.test").expect("otp request");
-        let session = services::supabase::verify_email_otp(&mut transport, &config, "owner@example.test", "123456").expect("verify");
+        services::supabase::request_email_otp(&mut transport, &config, "owner@example.test")
+            .expect("otp request");
+        let session = services::supabase::verify_email_otp(
+            &mut transport,
+            &config,
+            "owner@example.test",
+            "123456",
+        )
+        .expect("verify");
         assert_eq!(session.access_token, "access");
-        let refreshed = services::supabase::refresh_session(&mut transport, &config, &session.refresh_token).expect("refresh");
-        services::supabase::validate_authenticated_session(&mut transport, &config, &refreshed.access_token).expect("validate");
-        assert!(transport.requests.iter().any(|request| request.url.ends_with("/auth/v1/otp")));
-        assert!(transport.requests.iter().any(|request| request.url.contains("grant_type=refresh_token")));
+        let refreshed =
+            services::supabase::refresh_session(&mut transport, &config, &session.refresh_token)
+                .expect("refresh");
+        services::supabase::validate_authenticated_session(
+            &mut transport,
+            &config,
+            &refreshed.access_token,
+        )
+        .expect("validate");
+        assert!(transport
+            .requests
+            .iter()
+            .any(|request| request.url.ends_with("/auth/v1/otp")));
+        assert!(transport
+            .requests
+            .iter()
+            .any(|request| request.url.contains("grant_type=refresh_token")));
 
         let (_temp, connection) = open_temp();
         let protector = services::secure_store::TestProtector;
-        services::secure_store::store_supabase_session(&connection, &protector, &session).expect("store");
-        let restored = services::secure_store::read_supabase_session(&connection, &protector).expect("read").expect("session");
+        services::secure_store::store_supabase_session(&connection, &protector, &session)
+            .expect("store");
+        let restored = services::secure_store::read_supabase_session(&connection, &protector)
+            .expect("read")
+            .expect("session");
         assert_eq!(restored.refresh_token, "refresh");
         let raw: Vec<u8> = connection.query_row("SELECT encrypted_value FROM secure_secrets WHERE secret_key='cloud_supabase_session'", [], |row| row.get(0)).expect("raw");
         assert!(!String::from_utf8_lossy(&raw).contains("refresh"));
@@ -2471,7 +3455,11 @@ mod tests {
         )
         .expect("appointment");
         reconcile_all_reminders_mock(&connection).expect("project");
-        let reminder_id: String = connection.query_row("SELECT id FROM appointment_reminders LIMIT 1", [], |row| row.get(0)).expect("reminder");
+        let reminder_id: String = connection
+            .query_row("SELECT id FROM appointment_reminders LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .expect("reminder");
         upsert_cloud_outbox(&connection, &reminder_id, "cancel", None).expect("second revision");
 
         let config = services::supabase::SupabaseConfig {
@@ -2488,18 +3476,242 @@ mod tests {
             services::google::HttpResponse { status: 200, body: br#"{"data":{"revision":2,"status":"cancelled","remoteUpdatedAtUtc":"2026-08-25T00:01:00.000Z"}}"#.to_vec() },
             services::google::HttpResponse { status: 200, body: br#"{"data":{"revision":3,"status":"cancelled","remoteUpdatedAtUtc":"2026-08-25T00:02:00.000Z"}}"#.to_vec() },
         ]);
-        let first = services::reminder_cloud::process_ordered_outbox(&connection, &mut transport, &config, &session, 10).expect("first sync");
+        let first = services::reminder_cloud::process_ordered_outbox(
+            &connection,
+            &mut transport,
+            &config,
+            &session,
+            10,
+        )
+        .expect("first sync");
         assert_eq!(first.processed, 1);
-        let second = services::reminder_cloud::process_ordered_outbox(&connection, &mut transport, &config, &session, 10).expect("second sync");
+        let second = services::reminder_cloud::process_ordered_outbox(
+            &connection,
+            &mut transport,
+            &config,
+            &session,
+            10,
+        )
+        .expect("second sync");
         assert_eq!(second.processed, 1);
-        let third = services::reminder_cloud::process_ordered_outbox(&connection, &mut transport, &config, &session, 10).expect("third sync");
+        let third = services::reminder_cloud::process_ordered_outbox(
+            &connection,
+            &mut transport,
+            &config,
+            &session,
+            10,
+        )
+        .expect("third sync");
         assert_eq!(third.processed, 1);
-        assert!(transport.requests.iter().any(|request| request.url.ends_with("/functions/v1/reminder-upsert")));
-        assert!(transport.requests.iter().any(|request| request.url.ends_with("/functions/v1/reminder-cancel")));
-        let pending: i64 = connection.query_row("SELECT COUNT(*) FROM reminder_cloud_outbox WHERE sync_status='pending'", [], |row| row.get(0)).expect("pending");
+        assert!(transport
+            .requests
+            .iter()
+            .any(|request| request.url.ends_with("/functions/v1/reminder-upsert")));
+        assert!(transport
+            .requests
+            .iter()
+            .any(|request| request.url.ends_with("/functions/v1/reminder-cancel")));
+        let pending: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_cloud_outbox WHERE sync_status='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pending");
         assert_eq!(pending, 0);
-        services::reminder_cloud::reconcile_remote_status(&connection, &reminder_id, 3, "sent", "2026-08-25T00:02:00.000Z").expect("reconcile");
-        let local_status: String = connection.query_row("SELECT status FROM appointment_reminders WHERE id=?1", params![reminder_id], |row| row.get(0)).expect("status");
+        services::reminder_cloud::reconcile_remote_status(
+            &connection,
+            &reminder_id,
+            3,
+            "sent",
+            "2026-08-25T00:02:00.000Z",
+        )
+        .expect("reconcile");
+        let local_status: String = connection
+            .query_row(
+                "SELECT status FROM appointment_reminders WHERE id=?1",
+                params![reminder_id],
+                |row| row.get(0),
+            )
+            .expect("status");
         assert_eq!(local_status, "sent");
     }
+
+    #[test]
+    fn live_services_config_file_loads_only_local_command_configuration() {
+        let config = parse_live_services_config(
+            r#"{
+              "google": {
+                "clientId": "desktop-client-id",
+                "clientSecret": "desktop-client-secret",
+                "calendarId": "primary"
+              },
+              "supabase": {
+                "projectUrl": "https://example.supabase.co",
+                "publishableKey": "publishable-key-with-enough-length"
+              }
+            }"#,
+        )
+        .expect("config");
+        assert_eq!(
+            config.google.expect("google").calendar_id.as_deref(),
+            Some("primary")
+        );
+        services::supabase::validate_public_config(&config.supabase.expect("supabase"))
+            .expect("public config");
+        assert!(parse_live_services_config("{not-json").is_err());
+    }
+
+    #[test]
+    fn google_outbox_command_helper_updates_only_trusted_mapped_events() {
+        let (_temp, mut connection) = open_temp();
+        let (customer, staff, service) = seed_core(&mut connection);
+        let appointment = create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id,
+                staff_id: staff.id,
+                local_date: "2026-08-27".into(),
+                local_start_time: "11:00".into(),
+                service_ids: vec![service.id],
+                status: Some("planned".into()),
+                note: None,
+            },
+        )
+        .expect("appointment");
+        connection.execute(
+            "INSERT INTO appointment_google_calendar_sync (appointment_id, google_event_id, created_at_utc, updated_at_utc)
+             VALUES (?1, 'event-42', ?2, ?2)",
+            params![appointment.id, now_iso()],
+        )
+        .expect("mapping");
+        connection.execute(
+            "INSERT INTO google_calendar_outbox (id, appointment_id, sync_status, created_at_utc, updated_at_utc)
+             VALUES (?1, ?2, 'pending', ?3, ?3)",
+            params![new_uuid(), appointment.id, now_iso()],
+        )
+        .expect("outbox");
+        let mut transport =
+            services::google::FakeHttpTransport::new(vec![services::google::HttpResponse {
+                status: 200,
+                body: br#"{"id":"event-42"}"#.to_vec(),
+            }]);
+        let processed = process_google_outbox(&connection, &mut transport, "access", "primary", 10)
+            .expect("process");
+        assert_eq!(processed, 1);
+        assert!(transport
+            .requests
+            .iter()
+            .any(|request| request.method == "PATCH" && request.url.contains("/events/event-42")));
+        let status: String = connection
+            .query_row(
+                "SELECT sync_status FROM google_calendar_outbox WHERE appointment_id=?1",
+                params![appointment.id],
+                |row| row.get(0),
+            )
+            .expect("status");
+        assert_eq!(status, "synced");
+    }
+
+    #[test]
+    fn oauth_callback_listener_ignores_favicon_and_accepts_callback() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("port").port();
+        let redirect_uri = format!("http://127.0.0.1:{port}/oauth2callback");
+
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(StdDuration::from_millis(50));
+            // First send a favicon noise request
+            if let Ok(mut stream) = std::net::TcpStream::connect(format!("127.0.0.1:{port}")) {
+                let _ = stream.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n");
+                let _ = stream.flush();
+            }
+            std::thread::sleep(StdDuration::from_millis(50));
+            // Next send the real OAuth callback
+            if let Ok(mut stream) = std::net::TcpStream::connect(format!("127.0.0.1:{port}")) {
+                let _ = stream.write_all(
+                    b"GET /oauth2callback?code=mock_auth_code_123&state=mock_state_456 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                );
+                let _ = stream.flush();
+                let mut resp = [0_u8; 512];
+                let _ = stream.read(&mut resp);
+            }
+        });
+
+        let callback_url = wait_for_oauth_callback(&listener, &redirect_uri, StdDuration::from_secs(5))
+            .expect("callback url");
+        handle.join().expect("thread join");
+
+        let code = services::google::parse_oauth_callback(&callback_url, "mock_state_456")
+            .expect("parsed code");
+        assert_eq!(code, "mock_auth_code_123");
+    }
+
+    #[test]
+    fn browser_launcher_validates_url_scheme() {
+        assert!(open_system_browser("file:///C:/secrets.txt").is_err());
+        assert!(open_system_browser("javascript:alert(1)").is_err());
+        assert!(open_system_browser("ftp://example.com").is_err());
+    }
+
+    #[test]
+    fn duplicate_connect_prevented_by_guard() {
+        let guard1 = try_acquire_google_connect_guard().expect("first acquire");
+        let guard2_err = try_acquire_google_connect_guard().expect_err("second acquire should fail");
+        assert!(matches!(guard2_err, AppError::Conflict(_)));
+        drop(guard1);
+        let guard3 = try_acquire_google_connect_guard().expect("third acquire after drop");
+        drop(guard3);
+    }
+
+    #[test]
+    fn oauth_callback_timeout_returns_safe_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("port").port();
+        let redirect_uri = format!("http://127.0.0.1:{port}/oauth2callback");
+
+        let result = wait_for_oauth_callback(&listener, &redirect_uri, StdDuration::from_millis(50));
+        assert!(matches!(result, Err(AppError::Validation(msg)) if msg == "GOOGLE_OAUTH_TIMEOUT"));
+    }
+
+    #[test]
+    fn listener_waiting_does_not_block_other_commands_or_db() {
+        let (_temp, mut connection) = open_temp();
+        let (customer, staff, service) = seed_core(&mut connection);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("port").port();
+        let redirect_uri = format!("http://127.0.0.1:{port}/oauth2callback");
+
+        let wait_handle = std::thread::spawn(move || {
+            wait_for_oauth_callback(&listener, &redirect_uri, StdDuration::from_millis(200))
+        });
+
+        let appointment = create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id.clone(),
+                staff_id: staff.id.clone(),
+                local_date: "2026-08-25".into(),
+                local_start_time: "10:00".into(),
+                service_ids: vec![service.id.clone()],
+                status: Some("planned".into()),
+                note: None,
+            },
+        )
+        .expect("concurrent appointment create");
+
+        let list = list_appointments_between(&connection, None, None, None, None, Some(&appointment.id), 10)
+            .expect("concurrent list");
+        assert_eq!(list.len(), 1);
+
+        let wait_result = wait_handle.join().expect("thread join");
+        assert!(wait_result.is_err());
+    }
 }
+
+
+

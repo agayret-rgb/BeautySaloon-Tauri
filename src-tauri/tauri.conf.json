@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "BeautySaloon",
         "width": 1160,
         "height": 760,

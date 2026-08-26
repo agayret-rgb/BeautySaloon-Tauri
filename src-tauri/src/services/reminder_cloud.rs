@@ -19,18 +19,25 @@ pub fn invoke_function(
     function_name: &str,
     body: Value,
 ) -> Result<Value, AppError> {
-    let url = format!("{}/functions/v1/{function_name}", config.project_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/functions/v1/{function_name}",
+        config.project_url.trim_end_matches('/')
+    );
     let response = transport.send(HttpRequest {
         method: "POST".to_string(),
         url,
         headers: auth_headers(config, Some(&session.access_token)),
-        body: serde_json::to_vec(&body).map_err(|_| AppError::Database("CLOUD_REQUEST_SERIALIZE_FAILED".to_string()))?,
+        body: serde_json::to_vec(&body)
+            .map_err(|_| AppError::Database("CLOUD_REQUEST_SERIALIZE_FAILED".to_string()))?,
     })?;
     match response.status {
-        200..=299 => serde_json::from_slice(&response.body).map_err(|_| AppError::Database("CLOUD_RESPONSE_INVALID".to_string())),
+        200..=299 => serde_json::from_slice(&response.body)
+            .map_err(|_| AppError::Database("CLOUD_RESPONSE_INVALID".to_string())),
         401 | 403 => Err(AppError::Validation("CLOUD_AUTH_INVALID".to_string())),
         429 => Err(AppError::Database("CLOUD_RATE_LIMITED".to_string())),
-        500..=599 => Err(AppError::Database("CLOUD_TEMPORARILY_UNAVAILABLE".to_string())),
+        500..=599 => Err(AppError::Database(
+            "CLOUD_TEMPORARILY_UNAVAILABLE".to_string(),
+        )),
         _ => Err(AppError::Database("CLOUD_OPERATION_FAILED".to_string())),
     }
 }
@@ -80,16 +87,37 @@ pub fn process_ordered_outbox(
         let body = if action == "cancel" {
             json!({ "apiVersion": 1, "reminderId": reminder_id, "revision": revision, "clientMutationId": mutation_id })
         } else {
-            serde_json::from_str(payload_json.as_deref().ok_or_else(|| AppError::Database("CLOUD_PAYLOAD_MISSING".to_string()))?)
-                .map_err(|_| AppError::Database("CLOUD_PAYLOAD_INVALID".to_string()))?
+            serde_json::from_str(
+                payload_json
+                    .as_deref()
+                    .ok_or_else(|| AppError::Database("CLOUD_PAYLOAD_MISSING".to_string()))?,
+            )
+            .map_err(|_| AppError::Database("CLOUD_PAYLOAD_INVALID".to_string()))?
         };
-        let function_name = if action == "cancel" { "reminder-cancel" } else { "reminder-upsert" };
+        let function_name = if action == "cancel" {
+            "reminder-cancel"
+        } else {
+            "reminder-upsert"
+        };
         match invoke_function(transport, config, session, function_name, body) {
             Ok(response) => {
                 let data = response.get("data").unwrap_or(&response);
-                let remote_revision = data.get("revision").and_then(Value::as_i64).unwrap_or(revision);
-                let remote_status = data.get("status").and_then(Value::as_str).unwrap_or(if action == "cancel" { "cancelled" } else { "pending" });
-                let remote_updated = data.get("remoteUpdatedAtUtc").and_then(Value::as_str).unwrap_or("");
+                let remote_revision = data
+                    .get("revision")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(revision);
+                let remote_status =
+                    data.get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or(if action == "cancel" {
+                            "cancelled"
+                        } else {
+                            "pending"
+                        });
+                let remote_updated = data
+                    .get("remoteUpdatedAtUtc")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 connection.execute("UPDATE reminder_cloud_outbox SET sync_status='synced', last_error_code=NULL, updated_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1", params![id])?;
                 connection.execute(
                     "UPDATE reminder_cloud_state
@@ -120,7 +148,13 @@ pub fn process_ordered_outbox(
     Ok(status)
 }
 
-pub fn reconcile_remote_status(connection: &Connection, reminder_id: &str, revision: i64, remote_status: &str, remote_updated_at: &str) -> Result<(), AppError> {
+pub fn reconcile_remote_status(
+    connection: &Connection,
+    reminder_id: &str,
+    revision: i64,
+    remote_status: &str,
+    remote_updated_at: &str,
+) -> Result<(), AppError> {
     connection.execute(
         "UPDATE reminder_cloud_state
          SET last_remote_revision=?1, last_remote_status=?2, last_remote_updated_at_utc=?3, last_error_code=NULL, updated_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -152,4 +186,3 @@ pub fn has_session_secret(connection: &Connection) -> Result<bool, AppError> {
         .unwrap_or(0);
     Ok(count > 0)
 }
-

@@ -105,8 +105,13 @@ pub struct GoogleTokenSet {
     pub access_token: Option<String>,
 }
 
-pub fn build_google_auth_url(client_id: &str, redirect_uri: &str, state: &str) -> Result<String, AppError> {
-    let mut url = Url::parse(GOOGLE_AUTH_ENDPOINT).map_err(|_| AppError::Validation("GOOGLE_AUTH_URL_INVALID".to_string()))?;
+pub fn build_google_auth_url(
+    client_id: &str,
+    redirect_uri: &str,
+    state: &str,
+) -> Result<String, AppError> {
+    let mut url = Url::parse(GOOGLE_AUTH_ENDPOINT)
+        .map_err(|_| AppError::Validation("GOOGLE_AUTH_URL_INVALID".to_string()))?;
     url.query_pairs_mut()
         .append_pair("client_id", client_id)
         .append_pair("redirect_uri", redirect_uri)
@@ -119,14 +124,25 @@ pub fn build_google_auth_url(client_id: &str, redirect_uri: &str, state: &str) -
 }
 
 pub fn parse_oauth_callback(callback_url: &str, expected_state: &str) -> Result<String, AppError> {
-    let url = Url::parse(callback_url).map_err(|_| AppError::Validation("GOOGLE_CALLBACK_INVALID".to_string()))?;
+    let url = Url::parse(callback_url)
+        .map_err(|_| AppError::Validation("GOOGLE_CALLBACK_INVALID".to_string()))?;
     if url.path() != "/oauth2callback" {
-        return Err(AppError::Validation("GOOGLE_CALLBACK_PATH_INVALID".to_string()));
+        return Err(AppError::Validation(
+            "GOOGLE_CALLBACK_PATH_INVALID".to_string(),
+        ));
     }
-    let state = url.query_pairs().find(|(key, _)| key == "state").map(|(_, value)| value.to_string());
-    let code = url.query_pairs().find(|(key, _)| key == "code").map(|(_, value)| value.to_string());
+    let state = url
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .map(|(_, value)| value.to_string());
+    let code = url
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.to_string());
     if state.as_deref() != Some(expected_state) {
-        return Err(AppError::Validation("GOOGLE_OAUTH_STATE_INVALID".to_string()));
+        return Err(AppError::Validation(
+            "GOOGLE_OAUTH_STATE_INVALID".to_string(),
+        ));
     }
     code.filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::Validation("GOOGLE_OAUTH_CODE_MISSING".to_string()))
@@ -148,13 +164,19 @@ pub fn exchange_auth_code(
     let response = transport.send(HttpRequest {
         method: "POST".to_string(),
         url: GOOGLE_TOKEN_ENDPOINT.to_string(),
-        headers: vec![("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string())],
+        headers: vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )],
         body: body.into_bytes(),
     })?;
     if response.status != 200 {
-        return Err(AppError::Database("GOOGLE_CALENDAR_AUTH_REQUIRED".to_string()));
+        return Err(AppError::Database(
+            "GOOGLE_CALENDAR_AUTH_REQUIRED".to_string(),
+        ));
     }
-    let data: Value = serde_json::from_slice(&response.body).map_err(|_| AppError::Database("GOOGLE_TOKEN_RESPONSE_INVALID".to_string()))?;
+    let data: Value = serde_json::from_slice(&response.body)
+        .map_err(|_| AppError::Database("GOOGLE_TOKEN_RESPONSE_INVALID".to_string()))?;
     let refresh_token = data
         .get("refresh_token")
         .and_then(Value::as_str)
@@ -162,11 +184,18 @@ pub fn exchange_auth_code(
         .ok_or_else(|| AppError::Database("GOOGLE_REFRESH_TOKEN_MISSING".to_string()))?;
     Ok(GoogleTokenSet {
         refresh_token: refresh_token.to_string(),
-        access_token: data.get("access_token").and_then(Value::as_str).map(str::to_string),
+        access_token: data
+            .get("access_token")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
-pub fn refresh_access_token(transport: &mut dyn HttpTransport, config: &GoogleOAuthConfig, refresh_token: &str) -> Result<String, AppError> {
+pub fn refresh_access_token(
+    transport: &mut dyn HttpTransport,
+    config: &GoogleOAuthConfig,
+    refresh_token: &str,
+) -> Result<String, AppError> {
     let body = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("client_id", &config.client_id)
         .append_pair("client_secret", &config.client_secret)
@@ -176,13 +205,19 @@ pub fn refresh_access_token(transport: &mut dyn HttpTransport, config: &GoogleOA
     let response = transport.send(HttpRequest {
         method: "POST".to_string(),
         url: GOOGLE_TOKEN_ENDPOINT.to_string(),
-        headers: vec![("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string())],
+        headers: vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )],
         body: body.into_bytes(),
     })?;
     if response.status != 200 {
-        return Err(AppError::Database("GOOGLE_CALENDAR_AUTH_REQUIRED".to_string()));
+        return Err(AppError::Database(
+            "GOOGLE_CALENDAR_AUTH_REQUIRED".to_string(),
+        ));
     }
-    let data: Value = serde_json::from_slice(&response.body).map_err(|_| AppError::Database("GOOGLE_TOKEN_RESPONSE_INVALID".to_string()))?;
+    let data: Value = serde_json::from_slice(&response.body)
+        .map_err(|_| AppError::Database("GOOGLE_TOKEN_RESPONSE_INVALID".to_string()))?;
     data.get("access_token")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
@@ -217,27 +252,40 @@ pub fn upsert_calendar_event(
     let (method, url) = if let Some(event_id) = google_event_id {
         (
             "PATCH",
-            format!("{GOOGLE_CALENDAR_API_BASE}/calendars/{calendar}/events/{}", urlencoding(event_id)),
+            format!(
+                "{GOOGLE_CALENDAR_API_BASE}/calendars/{calendar}/events/{}",
+                urlencoding(event_id)
+            ),
         )
     } else {
-        ("POST", format!("{GOOGLE_CALENDAR_API_BASE}/calendars/{calendar}/events"))
+        (
+            "POST",
+            format!("{GOOGLE_CALENDAR_API_BASE}/calendars/{calendar}/events"),
+        )
     };
     let response = transport.send(HttpRequest {
         method: method.to_string(),
         url,
         headers: vec![
-            ("Authorization".to_string(), format!("Bearer {access_token}")),
+            (
+                "Authorization".to_string(),
+                format!("Bearer {access_token}"),
+            ),
             ("Content-Type".to_string(), "application/json".to_string()),
         ],
-        body: serde_json::to_vec(event).map_err(|_| AppError::Database("GOOGLE_EVENT_SERIALIZE_FAILED".to_string()))?,
+        body: serde_json::to_vec(event)
+            .map_err(|_| AppError::Database("GOOGLE_EVENT_SERIALIZE_FAILED".to_string()))?,
     })?;
     if response.status == 401 {
-        return Err(AppError::Database("GOOGLE_CALENDAR_AUTH_REQUIRED".to_string()));
+        return Err(AppError::Database(
+            "GOOGLE_CALENDAR_AUTH_REQUIRED".to_string(),
+        ));
     }
     if !(200..300).contains(&response.status) {
         return Err(AppError::Database("GOOGLE_CALENDAR_API_ERROR".to_string()));
     }
-    let data: Value = serde_json::from_slice(&response.body).map_err(|_| AppError::Database("GOOGLE_EVENT_RESPONSE_INVALID".to_string()))?;
+    let data: Value = serde_json::from_slice(&response.body)
+        .map_err(|_| AppError::Database("GOOGLE_EVENT_RESPONSE_INVALID".to_string()))?;
     data.get("id")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
@@ -245,7 +293,11 @@ pub fn upsert_calendar_event(
         .ok_or_else(|| AppError::Database("GOOGLE_EVENT_ID_MISSING".to_string()))
 }
 
-pub fn reject_unrelated_event_mutation(connection: &Connection, appointment_id: &str, google_event_id: &str) -> Result<(), AppError> {
+pub fn reject_unrelated_event_mutation(
+    connection: &Connection,
+    appointment_id: &str,
+    google_event_id: &str,
+) -> Result<(), AppError> {
     let mapped: Option<String> = connection
         .query_row(
             "SELECT google_event_id FROM appointment_google_calendar_sync WHERE appointment_id=?1",
@@ -256,11 +308,16 @@ pub fn reject_unrelated_event_mutation(connection: &Connection, appointment_id: 
         .flatten();
     match mapped {
         Some(mapped) if mapped == google_event_id => Ok(()),
-        _ => Err(AppError::Validation("GOOGLE_UNRELATED_EVENT_REJECTED".to_string())),
+        _ => Err(AppError::Validation(
+            "GOOGLE_UNRELATED_EVENT_REJECTED".to_string(),
+        )),
     }
 }
 
-pub fn google_connection_status(connection: &Connection, secure_storage_available: bool) -> Result<GoogleConnectionStatus, AppError> {
+pub fn google_connection_status(
+    connection: &Connection,
+    secure_storage_available: bool,
+) -> Result<GoogleConnectionStatus, AppError> {
     let (client_id, sync_enabled): (Option<String>, i64) = connection.query_row(
         "SELECT client_id, sync_enabled FROM google_calendar_settings WHERE id=1",
         [],
@@ -293,7 +350,12 @@ fn urlencoding(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
-pub fn mark_google_outbox_synced(connection: &Connection, appointment_id: &str, event_id: &str, appointment_updated_at: &str) -> Result<(), AppError> {
+pub fn mark_google_outbox_synced(
+    connection: &Connection,
+    appointment_id: &str,
+    event_id: &str,
+    appointment_updated_at: &str,
+) -> Result<(), AppError> {
     let now = utc_iso(chrono::Utc::now());
     connection.execute(
         "UPDATE google_calendar_outbox SET sync_status='synced', last_error_code=NULL, updated_at_utc=?1 WHERE appointment_id=?2",
@@ -305,4 +367,3 @@ pub fn mark_google_outbox_synced(connection: &Connection, appointment_id: &str, 
     )?;
     Ok(())
 }
-

@@ -10,6 +10,8 @@ test("React shell keeps the required navigation and appointment action", async (
   }
   assert.match(source, /\+ Yeni Randevu/);
   assert.match(source, /listAppointmentsByDate/);
+  assert.match(source, /connectGoogleCalendar/);
+  assert.match(source, /requestCloudOtp/);
 });
 
 test("Tauri Rust boundary exposes only named core data commands", async () => {
@@ -33,10 +35,17 @@ test("Tauri Rust boundary exposes only named core data commands", async () => {
     "auth_mock_verify_otp",
     "auth_logout",
     "google_calendar_status",
+    "google_calendar_connect",
+    "google_calendar_disconnect",
+    "google_calendar_sync",
     "cloud_connection_status",
+    "cloud_status",
     "cloud_request_otp",
+    "otp_request",
     "cloud_verify_otp",
-    "cloud_disconnect"
+    "otp_verify",
+    "cloud_disconnect",
+    "cloud_process_outbox"
   ]) {
     assert.match(source, new RegExp(command));
   }
@@ -48,12 +57,29 @@ test("Tauri Rust boundary exposes only named core data commands", async () => {
 
 test("Frontend API exposes typed service commands without raw secrets or arbitrary transport", async () => {
   const source = await readFile(new URL("../src/tauriApi.ts", import.meta.url), "utf8");
-  for (const name of ["getGoogleCalendarStatus", "getCloudConnectionStatus", "requestCloudOtp", "verifyCloudOtp", "disconnectCloud"]) {
+  for (const name of [
+    "getGoogleCalendarStatus",
+    "connectGoogleCalendar",
+    "disconnectGoogleCalendar",
+    "syncGoogleCalendar",
+    "getCloudConnectionStatus",
+    "requestCloudOtp",
+    "verifyCloudOtp",
+    "disconnectCloud",
+    "processCloudOutbox"
+  ]) {
     assert.match(source, new RegExp(`export async function ${name}`));
   }
+  const appSource = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
   assert.doesNotMatch(source, /accessToken/);
   assert.doesNotMatch(source, /refreshToken/);
   assert.doesNotMatch(source, /clientSecret/);
+  assert.doesNotMatch(source, /publishableKey/);
   assert.doesNotMatch(source, /fetch\(/);
   assert.doesNotMatch(source, /httpRequest/);
+  assert.doesNotMatch(appSource, /accessToken/);
+  assert.doesNotMatch(appSource, /refreshToken/);
+  assert.doesNotMatch(appSource, /clientSecret/);
+  assert.doesNotMatch(appSource, /publishableKey/);
+  assert.doesNotMatch(appSource, /fetch\(/);
 });
