@@ -7,12 +7,18 @@ use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration as StdDuration, Instant};
 use tauri::{AppHandle, Manager};
 use thiserror::Error;
+use url::Url;
+#[cfg(windows)]
+use windows_sys::Win32::UI::Shell::ShellExecuteW;
+#[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 mod services;
 
@@ -2240,8 +2246,10 @@ pub(crate) fn try_acquire_google_connect_guard() -> Result<ConnectInProgressGuar
 async fn google_calendar_connect(
     state: tauri::State<'_, AppState>,
 ) -> Result<GoogleConnectResult, AppError> {
+    eprintln!("GOOGLE_CONNECT_INVOKE_ENTERED");
     let _guard = try_acquire_google_connect_guard()?;
     let config = google_config()?;
+    eprintln!("GOOGLE_CONNECT_CONFIG_OK");
     let database_path = state.database_path.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -2252,9 +2260,11 @@ async fn google_calendar_connect(
             "http://127.0.0.1:{}/oauth2callback",
             listener.local_addr()?.port()
         );
+        eprintln!("GOOGLE_CONNECT_LISTENER_BOUND");
         let state_token = new_uuid();
         let auth_url =
             services::google::build_google_auth_url(&config.client_id, &redirect_uri, &state_token)?;
+        validate_oauth_redirect_uri(&auth_url, &redirect_uri)?;
         open_system_browser(&auth_url)?;
         let callback_url =
             wait_for_oauth_callback(&listener, &redirect_uri, StdDuration::from_secs(120))?;
@@ -2337,10 +2347,36 @@ fn process_google_outbox(
         .collect::<Result<Vec<_>, _>>()?;
     let mut processed = 0;
     for appointment_id in appointment_ids {
-        connection.execute(
-            "UPDATE google_calendar_outbox SET sync_status='in_flight', last_attempt_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'), last_error_code=NULL WHERE appointment_id=?1 AND sync_status='pending'",
-            params![appointment_id],
-        )?;
+        match process_google_outbox_item(
+            connection,
+            transport,
+            access_token,
+            calendar_id,
+            &appointment_id,
+        ) {
+            Ok(true) => processed += 1,
+            Ok(false) => {}
+            Err(_) => break,
+        }
+    }
+    Ok(processed)
+}
+
+fn process_google_outbox_item(
+    connection: &Connection,
+    transport: &mut dyn services::google::HttpTransport,
+    access_token: &str,
+    calendar_id: &str,
+    appointment_id: &str,
+) -> Result<bool, AppError> {
+    let marked = connection.execute(
+        "UPDATE google_calendar_outbox SET sync_status='in_flight', last_attempt_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'), last_error_code=NULL WHERE appointment_id=?1 AND sync_status='pending'",
+        params![appointment_id],
+    )?;
+    if marked != 1 {
+        return Ok(false);
+    }
+    let result = (|| {
         let appointment = list_appointments_between(
             connection,
             None,
@@ -2383,19 +2419,19 @@ fn process_google_outbox(
                     &event_id,
                     &appointment.updated_at,
                 )?;
-                processed += 1;
+                Ok(true)
             }
-            Err(error) => {
-                let code = error.to_string();
-                connection.execute(
-                    "UPDATE google_calendar_outbox SET sync_status='pending', last_error_code=?1, updated_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE appointment_id=?2",
-                    params![code, appointment_id],
-                )?;
-                break;
-            }
+            Err(error) => Err(error),
         }
+    })();
+    if let Err(error) = result {
+        connection.execute(
+            "UPDATE google_calendar_outbox SET sync_status='pending', last_error_code=?1, updated_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE appointment_id=?2",
+            params![error.to_string(), appointment_id],
+        )?;
+        return Err(error);
     }
-    Ok(processed)
+    result
 }
 
 fn open_system_browser(url: &str) -> Result<(), AppError> {
@@ -2404,21 +2440,63 @@ fn open_system_browser(url: &str) -> Result<(), AppError> {
     }
     #[cfg(windows)]
     {
-        let status = Command::new("rundll32.exe")
-            .args(["url.dll,FileProtocolHandler", url])
-            .status()?;
-        if status.success() {
-            return Ok(());
+        let operation = wide_null("open");
+        let target = wide_null(url);
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if !shell_execute_succeeded(result as isize) {
+            eprintln!("GOOGLE_CONNECT_BROWSER_LAUNCH_FAILED");
+            return Err(AppError::Database(
+                "GOOGLE_BROWSER_LAUNCH_FAILED".to_string(),
+            ));
         }
+        eprintln!("GOOGLE_CONNECT_BROWSER_LAUNCH_OK");
+        Ok(())
     }
     #[cfg(not(windows))]
     {
         let status = Command::new("xdg-open").arg(url).status()?;
         if status.success() {
-            return Ok(());
+            Ok(())
+        } else {
+            Err(AppError::Database("GOOGLE_BROWSER_OPEN_FAILED".to_string()))
         }
     }
-    Err(AppError::Database("GOOGLE_BROWSER_OPEN_FAILED".to_string()))
+}
+
+#[cfg(windows)]
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn shell_execute_succeeded(result: isize) -> bool {
+    result > 32
+}
+
+fn validate_oauth_redirect_uri(auth_url: &str, redirect_uri: &str) -> Result<(), AppError> {
+    let url = Url::parse(auth_url)
+        .map_err(|_| AppError::Validation("GOOGLE_AUTH_URL_INVALID".to_string()))?;
+    let actual_redirect_uri = url
+        .query_pairs()
+        .find(|(key, _)| key == "redirect_uri")
+        .map(|(_, value)| value.into_owned())
+        .ok_or_else(|| AppError::Validation("GOOGLE_REDIRECT_URI_MISSING".to_string()))?;
+
+    if actual_redirect_uri == redirect_uri {
+        Ok(())
+    } else {
+        Err(AppError::Validation(
+            "GOOGLE_REDIRECT_URI_MISMATCH".to_string(),
+        ))
+    }
 }
 
 fn wait_for_oauth_callback(
@@ -2458,7 +2536,8 @@ fn wait_for_oauth_callback(
                 let path = first_line.split_whitespace().nth(1).unwrap_or("");
 
                 if !path.starts_with("/oauth2callback") {
-                    let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let response =
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = stream.write_all(response.as_bytes());
                     let _ = stream.flush();
                     continue;
@@ -2638,6 +2717,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::google::HttpTransport;
     use tempfile::tempdir;
 
     fn open_temp() -> (tempfile::TempDir, Connection) {
@@ -3256,6 +3336,11 @@ mod tests {
         assert!(
             auth_url.contains("scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcalendar.events")
         );
+        validate_oauth_redirect_uri(&auth_url, "http://127.0.0.1:4444/oauth2callback")
+            .expect("redirect uri matches listener");
+        assert!(
+            validate_oauth_redirect_uri(&auth_url, "http://127.0.0.1:5555/oauth2callback").is_err()
+        );
         assert_eq!(
             services::google::parse_oauth_callback(
                 "http://127.0.0.1:4444/oauth2callback?state=state-1&code=abc",
@@ -3639,8 +3724,9 @@ mod tests {
             }
         });
 
-        let callback_url = wait_for_oauth_callback(&listener, &redirect_uri, StdDuration::from_secs(5))
-            .expect("callback url");
+        let callback_url =
+            wait_for_oauth_callback(&listener, &redirect_uri, StdDuration::from_secs(5))
+                .expect("callback url");
         handle.join().expect("thread join");
 
         let code = services::google::parse_oauth_callback(&callback_url, "mock_state_456")
@@ -3656,9 +3742,388 @@ mod tests {
     }
 
     #[test]
+    fn shell_execute_result_requires_a_success_handle() {
+        assert!(!shell_execute_succeeded(0));
+        assert!(!shell_execute_succeeded(32));
+        assert!(shell_execute_succeeded(33));
+    }
+
+    #[test]
+    #[ignore = "requires explicit live Google Calendar acceptance authorization"]
+    fn live_google_calendar_acceptance() {
+        assert_eq!(
+            std::env::var("BEAUTYSALOON_ALLOW_LIVE_GOOGLE_ACCEPTANCE").as_deref(),
+            Ok("1"),
+            "live acceptance requires an explicit environment gate"
+        );
+
+        let app_data = std::env::var_os("APPDATA").expect("APPDATA");
+        let database_path = PathBuf::from(app_data)
+            .join("com.beautysaloon.desktop")
+            .join("database")
+            .join("salon-foundation.db");
+        let mut connection = open_database(&database_path).expect("open live database");
+        let protector = services::secure_store::WindowsDpapiProtector;
+        let connected = services::google::google_connection_status(
+            &connection,
+            services::secure_store::secure_storage_available(&protector),
+        )
+        .expect("connection status");
+        assert!(connected.connected, "Google connection must be persisted");
+
+        let config = google_config().expect("local Google config");
+        let calendar_id = config
+            .calendar_id
+            .clone()
+            .unwrap_or_else(|| "primary".to_string());
+        let refresh_token = services::secure_store::read_secret(
+            &connection,
+            &protector,
+            "google_calendar_refresh_token",
+        )
+        .expect("read refresh token")
+        .expect("persisted refresh token");
+        let mut transport = services::google::ReqwestHttpTransport;
+        let access_token =
+            services::google::refresh_access_token(&mut transport, &config, &refresh_token)
+                .expect("refresh access token");
+
+        let suffix = (Utc::now().timestamp_millis() as u64) % 10_000_000;
+        let customer = create_customer_tx(
+            &connection,
+            CustomerInput {
+                first_name: "Test".into(),
+                last_name: "Google Sync".into(),
+                phone: format!("555{:07}", suffix % 10_000_000),
+                email: None,
+                notes: Some("SENTETIK GOOGLE LIVE ACCEPTANCE".into()),
+                whatsapp_reminder_enabled: Some(false),
+                whatsapp_consent_confirmed: Some(false),
+            },
+        )
+        .expect("create synthetic customer");
+        let staff = create_staff_tx(
+            &connection,
+            StaffInput {
+                first_name: "Test".into(),
+                last_name: Some("Google Sync".into()),
+                phone: None,
+                specialty_note: Some("SENTETIK GOOGLE LIVE ACCEPTANCE".into()),
+                color_key: "sage".into(),
+                is_active: Some(true),
+            },
+        )
+        .expect("create synthetic staff");
+        let category = create_category_tx(
+            &connection,
+            CategoryInput {
+                name: format!("TEST Google Sync {suffix}"),
+                is_active: Some(true),
+            },
+        )
+        .expect("create synthetic category");
+        let service = create_service_tx(
+            &connection,
+            ServiceInput {
+                category_id: category.id,
+                name: "TEST Google Sync".into(),
+                duration_minutes: Some(30),
+                is_active: Some(true),
+            },
+        )
+        .expect("create synthetic service");
+        set_staff_services_tx(&mut connection, &staff.id, vec![service.id.clone()])
+            .expect("assign synthetic service");
+
+        let initial = AppointmentInput {
+            customer_id: customer.id.clone(),
+            staff_id: staff.id.clone(),
+            local_date: "2036-08-30".into(),
+            local_start_time: "14:00".into(),
+            service_ids: vec![service.id.clone()],
+            status: Some("planned".into()),
+            note: Some("SENTETIK TEST - GOOGLE LIVE ACCEPTANCE".into()),
+        };
+        let appointment = create_appointment_tx(&mut connection, initial.clone())
+            .expect("create synthetic appointment");
+        assert!(process_google_outbox_item(
+            &connection,
+            &mut transport,
+            &access_token,
+            &calendar_id,
+            &appointment.id,
+        )
+        .expect("create Google event"));
+        let event_id: String = connection
+            .query_row(
+                "SELECT google_event_id FROM appointment_google_calendar_sync WHERE appointment_id=?1",
+                params![appointment.id],
+                |row| row.get(0),
+        )
+        .expect("persisted Google mapping");
+        assert!(!event_id.is_empty());
+        if std::env::var("BEAUTYSALOON_LIVE_GOOGLE_CREATE_ONLY").as_deref() == Ok("1") {
+            return;
+        }
+
+        let updated = AppointmentInput {
+            local_start_time: "14:30".into(),
+            ..initial.clone()
+        };
+        update_appointment_tx(&mut connection, &appointment.id, updated.clone())
+            .expect("update synthetic appointment");
+        assert!(process_google_outbox_item(
+            &connection,
+            &mut transport,
+            &access_token,
+            &calendar_id,
+            &appointment.id,
+        )
+        .expect("update same Google event"));
+        let event_after_update: String = connection
+            .query_row(
+                "SELECT google_event_id FROM appointment_google_calendar_sync WHERE appointment_id=?1",
+                params![appointment.id],
+                |row| row.get(0),
+            )
+            .expect("mapping after update");
+        assert_eq!(event_id, event_after_update);
+
+        let confirmed = AppointmentInput {
+            status: Some("confirmed".into()),
+            ..updated.clone()
+        };
+        update_appointment_tx(&mut connection, &appointment.id, confirmed.clone())
+            .expect("confirm synthetic appointment");
+        assert!(process_google_outbox_item(
+            &connection,
+            &mut transport,
+            &access_token,
+            &calendar_id,
+            &appointment.id,
+        )
+        .expect("update status on same Google event"));
+
+        let cancelled = AppointmentInput {
+            status: Some("cancelled".into()),
+            ..confirmed
+        };
+        update_appointment_tx(&mut connection, &appointment.id, cancelled)
+            .expect("cancel synthetic appointment");
+        assert!(process_google_outbox_item(
+            &connection,
+            &mut transport,
+            &access_token,
+            &calendar_id,
+            &appointment.id,
+        )
+        .expect("mark same Google event cancelled"));
+        assert!(!process_google_outbox_item(
+            &connection,
+            &mut transport,
+            &access_token,
+            &calendar_id,
+            &appointment.id,
+        )
+        .expect("repeat sync without duplicate"));
+
+        let calendar =
+            url::form_urlencoded::byte_serialize(calendar_id.as_bytes()).collect::<String>();
+        let event = url::form_urlencoded::byte_serialize(event_id.as_bytes()).collect::<String>();
+        let response = transport
+            .send(services::google::HttpRequest {
+                method: "GET".into(),
+                url: format!(
+                    "{}/calendars/{calendar}/events/{event}",
+                    services::google::GOOGLE_CALENDAR_API_BASE
+                ),
+                headers: vec![("Authorization".into(), format!("Bearer {access_token}"))],
+                body: Vec::new(),
+            })
+            .expect("read mapped Google event");
+        assert_eq!(response.status, 200, "mapped event remains readable");
+        let event_payload: serde_json::Value =
+            serde_json::from_slice(&response.body).expect("read event JSON");
+        let summary = event_payload["summary"].as_str().expect("event summary");
+        let description = event_payload["description"]
+            .as_str()
+            .expect("event description");
+        assert!(summary.starts_with("IPTAL - BeautySaloon TEST - Test Google Sync"));
+        assert!(!summary.contains("555"));
+        assert!(!description.contains("555"));
+        assert_eq!(
+            event_payload["start"]["timeZone"].as_str(),
+            Some("Europe/Istanbul")
+        );
+        assert_eq!(
+            event_payload["end"]["timeZone"].as_str(),
+            Some("Europe/Istanbul")
+        );
+
+        drop(connection);
+        let reopened = open_database(&database_path).expect("reopen live database");
+        let persisted_event_id: String = reopened
+            .query_row(
+                "SELECT google_event_id FROM appointment_google_calendar_sync WHERE appointment_id=?1",
+                params![appointment.id],
+                |row| row.get(0),
+            )
+            .expect("persisted mapping after reopen");
+        assert_eq!(event_id, persisted_event_id);
+        assert!(integrity_check(&reopened).expect("integrity check"));
+    }
+
+    #[test]
+    #[ignore = "continues the explicitly authorized mapped live Google test event"]
+    fn live_google_calendar_continue_existing_acceptance() {
+        assert_eq!(
+            std::env::var("BEAUTYSALOON_ALLOW_LIVE_GOOGLE_ACCEPTANCE").as_deref(),
+            Ok("1")
+        );
+        let database_path = PathBuf::from(std::env::var_os("APPDATA").expect("APPDATA"))
+            .join("com.beautysaloon.desktop")
+            .join("database")
+            .join("salon-foundation.db");
+        let mut connection = open_database(&database_path).expect("open live database");
+        let config = google_config().expect("local Google config");
+        let calendar_id = config
+            .calendar_id
+            .clone()
+            .unwrap_or_else(|| "primary".to_string());
+        let protector = services::secure_store::WindowsDpapiProtector;
+        let refresh_token = services::secure_store::read_secret(
+            &connection,
+            &protector,
+            "google_calendar_refresh_token",
+        )
+        .expect("read refresh token")
+        .expect("persisted refresh token");
+        let mut transport = services::google::ReqwestHttpTransport;
+        let access_token =
+            services::google::refresh_access_token(&mut transport, &config, &refresh_token)
+                .expect("refresh access token");
+        let (appointment_id, customer_id, staff_id, event_id): (String, String, String, String) = connection
+            .query_row(
+                "SELECT a.id, a.customer_id, a.staff_id, m.google_event_id
+                 FROM appointments a JOIN appointment_google_calendar_sync m ON m.appointment_id=a.id
+                 WHERE a.note='SENTETIK TEST - GOOGLE LIVE ACCEPTANCE' AND m.google_event_id IS NOT NULL
+                 ORDER BY a.created_at DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("existing mapped synthetic appointment");
+        let service_ids = list_appointment_services(&connection, &appointment_id)
+            .expect("synthetic services")
+            .into_iter()
+            .map(|service| service.service_id)
+            .collect();
+        let updated = AppointmentInput {
+            customer_id,
+            staff_id,
+            local_date: "2036-08-30".into(),
+            local_start_time: "15:00".into(),
+            service_ids,
+            status: Some("planned".into()),
+            note: Some("SENTETIK TEST - GOOGLE LIVE ACCEPTANCE".into()),
+        };
+        update_appointment_tx(&mut connection, &appointment_id, updated.clone())
+            .expect("update same synthetic appointment");
+        assert!(process_google_outbox_item(
+            &connection,
+            &mut transport,
+            &access_token,
+            &calendar_id,
+            &appointment_id,
+        )
+        .expect("patch same Google event"));
+        let mapped_after_update: String = connection
+            .query_row(
+                "SELECT google_event_id FROM appointment_google_calendar_sync WHERE appointment_id=?1",
+                params![appointment_id],
+                |row| row.get(0),
+            )
+            .expect("mapping after update");
+        assert_eq!(event_id, mapped_after_update);
+
+        let confirmed = AppointmentInput {
+            status: Some("confirmed".into()),
+            ..updated.clone()
+        };
+        update_appointment_tx(&mut connection, &appointment_id, confirmed.clone())
+            .expect("update status");
+        assert!(process_google_outbox_item(
+            &connection,
+            &mut transport,
+            &access_token,
+            &calendar_id,
+            &appointment_id
+        )
+        .expect("patch status"));
+        let cancelled = AppointmentInput {
+            status: Some("cancelled".into()),
+            ..confirmed
+        };
+        update_appointment_tx(&mut connection, &appointment_id, cancelled)
+            .expect("cancel appointment");
+        assert!(process_google_outbox_item(
+            &connection,
+            &mut transport,
+            &access_token,
+            &calendar_id,
+            &appointment_id
+        )
+        .expect("patch cancellation"));
+        assert!(!process_google_outbox_item(
+            &connection,
+            &mut transport,
+            &access_token,
+            &calendar_id,
+            &appointment_id
+        )
+        .expect("no duplicate event"));
+
+        let calendar =
+            url::form_urlencoded::byte_serialize(calendar_id.as_bytes()).collect::<String>();
+        let event = url::form_urlencoded::byte_serialize(event_id.as_bytes()).collect::<String>();
+        let response = transport
+            .send(services::google::HttpRequest {
+                method: "GET".into(),
+                url: format!(
+                    "{}/calendars/{calendar}/events/{event}",
+                    services::google::GOOGLE_CALENDAR_API_BASE
+                ),
+                headers: vec![("Authorization".into(), format!("Bearer {access_token}"))],
+                body: Vec::new(),
+            })
+            .expect("read mapped event");
+        assert_eq!(response.status, 200);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&response.body).expect("event JSON");
+        let summary = payload["summary"].as_str().expect("summary");
+        let description = payload["description"].as_str().expect("description");
+        assert!(summary.starts_with("IPTAL - BeautySaloon TEST"));
+        assert!(!summary.contains("555") && !description.contains("555"));
+        assert_eq!(
+            payload["start"]["timeZone"].as_str(),
+            Some("Europe/Istanbul")
+        );
+        assert_eq!(payload["end"]["timeZone"].as_str(), Some("Europe/Istanbul"));
+        drop(connection);
+        let reopened = open_database(&database_path).expect("reopen database");
+        let persisted: String = reopened.query_row(
+            "SELECT google_event_id FROM appointment_google_calendar_sync WHERE appointment_id=?1",
+            params![appointment_id],
+            |row| row.get(0),
+        ).expect("persisted mapping");
+        assert_eq!(event_id, persisted);
+        assert!(integrity_check(&reopened).expect("integrity"));
+    }
+
+    #[test]
     fn duplicate_connect_prevented_by_guard() {
         let guard1 = try_acquire_google_connect_guard().expect("first acquire");
-        let guard2_err = try_acquire_google_connect_guard().expect_err("second acquire should fail");
+        let guard2_err =
+            try_acquire_google_connect_guard().expect_err("second acquire should fail");
         assert!(matches!(guard2_err, AppError::Conflict(_)));
         drop(guard1);
         let guard3 = try_acquire_google_connect_guard().expect("third acquire after drop");
@@ -3672,7 +4137,8 @@ mod tests {
         let port = listener.local_addr().expect("port").port();
         let redirect_uri = format!("http://127.0.0.1:{port}/oauth2callback");
 
-        let result = wait_for_oauth_callback(&listener, &redirect_uri, StdDuration::from_millis(50));
+        let result =
+            wait_for_oauth_callback(&listener, &redirect_uri, StdDuration::from_millis(50));
         assert!(matches!(result, Err(AppError::Validation(msg)) if msg == "GOOGLE_OAUTH_TIMEOUT"));
     }
 
@@ -3704,14 +4170,19 @@ mod tests {
         )
         .expect("concurrent appointment create");
 
-        let list = list_appointments_between(&connection, None, None, None, None, Some(&appointment.id), 10)
-            .expect("concurrent list");
+        let list = list_appointments_between(
+            &connection,
+            None,
+            None,
+            None,
+            None,
+            Some(&appointment.id),
+            10,
+        )
+        .expect("concurrent list");
         assert_eq!(list.len(), 1);
 
         let wait_result = wait_handle.join().expect("thread join");
         assert!(wait_result.is_err());
     }
 }
-
-
-

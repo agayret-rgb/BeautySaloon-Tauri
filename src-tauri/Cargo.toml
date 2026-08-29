@@ -28,7 +28,7 @@ sha2 = "=0.10.9"
 tauri = { version = "=2.11.5", features = [] }
 thiserror = "=2.0.14"
 url = "=2.5.8"
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 tempfile = "=3.20.0"

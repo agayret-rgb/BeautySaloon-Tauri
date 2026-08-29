@@ -17,8 +17,15 @@ import {
 const navigationItems = ["Bugun", "Takvim", "Musteriler", "Hizmetler", "Personel", "Ayarlar"] as const;
 
 function todayLocalDate(): string {
-  const now = new Date();
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+}
+
+function serviceActionError(error: unknown, fallback: string): string {
+  const message = error instanceof Error ? error.message : fallback;
+  if (message.includes("GOOGLE_BROWSER_LAUNCH_FAILED")) return "Tarayici acilamadi.";
+  if (message.includes("GOOGLE_OAUTH_TIMEOUT")) return "Google yetkilendirmesi zaman asimina ugradi.";
+  return message;
 }
 
 export function App() {
@@ -29,6 +36,7 @@ export function App() {
   const [googleStatus, setGoogleStatus] = useState<GoogleConnectionStatus | null>(null);
   const [cloudStatus, setCloudStatus] = useState<CloudConnectionStatus | null>(null);
   const [serviceStatus, setServiceStatus] = useState("Servis durumu bekliyor");
+  const [googleConnectPending, setGoogleConnectPending] = useState(false);
   const [cloudEmail, setCloudEmail] = useState("");
   const [cloudOtp, setCloudOtp] = useState("");
 
@@ -72,11 +80,25 @@ export function App() {
         await refreshServiceStatus();
         setServiceStatus(successMessage);
       } catch (error) {
-        setServiceStatus(error instanceof Error ? error.message : "Servis islemi tamamlanamadi");
+        setServiceStatus(serviceActionError(error, "Servis islemi tamamlanamadi"));
       }
     },
     [refreshServiceStatus]
   );
+
+  const startGoogleConnect = useCallback(async () => {
+    setGoogleConnectPending(true);
+    setServiceStatus("Google baglantisi baslatiliyor...");
+    try {
+      await connectGoogleCalendar();
+      await refreshServiceStatus();
+      setServiceStatus("Google baglantisi tamamlandi");
+    } catch (error) {
+      setServiceStatus(serviceActionError(error, "Google baglantisi baslatilamadi"));
+    } finally {
+      setGoogleConnectPending(false);
+    }
+  }, [refreshServiceStatus]);
 
   const isSettings = activeItem === "Ayarlar";
 
@@ -161,8 +183,8 @@ export function App() {
               <p>{googleStatus?.configured ? "Config bulundu" : "Config bekleniyor"}</p>
               <p>{googleStatus?.connected ? "Bagli" : "Bagli degil"} - {googleStatus?.pendingSyncCount ?? 0} bekleyen</p>
               <div className="service-actions">
-                <button type="button" className="secondary-action" onClick={() => void runServiceAction(connectGoogleCalendar, "Google baglantisi tamamlandi")}>
-                  Baglan
+                <button type="button" className="secondary-action" disabled={googleConnectPending} onClick={() => void startGoogleConnect()}>
+                  {googleConnectPending ? "Baslatiliyor..." : "Baglan"}
                 </button>
                 <button type="button" className="secondary-action" onClick={() => void runServiceAction(syncGoogleCalendar, "Google outbox islendi")}>
                   Senkronize et

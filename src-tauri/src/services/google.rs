@@ -282,7 +282,7 @@ pub fn upsert_calendar_event(
         ));
     }
     if !(200..300).contains(&response.status) {
-        return Err(AppError::Database("GOOGLE_CALENDAR_API_ERROR".to_string()));
+        return Err(calendar_api_error(&response));
     }
     let data: Value = serde_json::from_slice(&response.body)
         .map_err(|_| AppError::Database("GOOGLE_EVENT_RESPONSE_INVALID".to_string()))?;
@@ -291,6 +291,45 @@ pub fn upsert_calendar_event(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .ok_or_else(|| AppError::Database("GOOGLE_EVENT_ID_MISSING".to_string()))
+}
+
+fn calendar_api_error(response: &HttpResponse) -> AppError {
+    let data: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
+    let error = data.get("error").unwrap_or(&Value::Null);
+    let code = error
+        .get("code")
+        .and_then(Value::as_i64)
+        .unwrap_or(response.status as i64);
+    let reason = error
+        .get("errors")
+        .and_then(Value::as_array)
+        .and_then(|errors| errors.first())
+        .and_then(|item| item.get("reason"))
+        .and_then(Value::as_str)
+        .map(sanitize_google_error_part)
+        .unwrap_or_else(|| "unknown".to_string());
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(sanitize_google_error_part)
+        .unwrap_or_else(|| "no_message".to_string());
+    AppError::Database(format!(
+        "GOOGLE_CALENDAR_API_HTTP_{code}_{reason}_{message}"
+    ))
+}
+
+fn sanitize_google_error_part(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    sanitized.chars().take(96).collect()
 }
 
 pub fn reject_unrelated_event_mutation(
