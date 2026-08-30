@@ -22,7 +22,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 mod services;
 
-const CORE_SCHEMA_VERSION: i64 = 14;
+const CORE_SCHEMA_VERSION: i64 = 15;
 const ISTANBUL_OFFSET_MINUTES: i64 = 180;
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -152,6 +152,7 @@ pub struct ServiceItem {
     category_name: String,
     name: String,
     duration_minutes: Option<i64>,
+    default_price_minor: i64,
     sort_order: i64,
     is_active: bool,
     availability_status: String,
@@ -170,6 +171,7 @@ pub struct ServiceInput {
     category_id: String,
     name: String,
     duration_minutes: Option<i64>,
+    default_price_minor: Option<i64>,
     is_active: Option<bool>,
 }
 
@@ -179,6 +181,8 @@ pub struct AppointmentServiceSnapshot {
     service_id: String,
     service_name_snapshot: String,
     duration_minutes_snapshot: i64,
+    listed_price_snapshot_minor: i64,
+    charged_price_minor: i64,
     sort_order: i64,
 }
 
@@ -344,6 +348,7 @@ fn migrate_core(connection: &Connection) -> Result<(), AppError> {
           name TEXT NOT NULL,
           name_key TEXT NOT NULL,
           duration_minutes INTEGER CHECK (duration_minutes IS NULL OR (duration_minutes BETWEEN 5 AND 480 AND duration_minutes % 5 = 0)),
+          default_price_minor INTEGER NOT NULL DEFAULT 0 CHECK (default_price_minor >= 0),
           sort_order INTEGER NOT NULL CHECK (sort_order >= 0),
           is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
           created_at TEXT NOT NULL,
@@ -410,6 +415,8 @@ fn migrate_core(connection: &Connection) -> Result<(), AppError> {
           service_id TEXT NOT NULL,
           service_name_snapshot TEXT NOT NULL CHECK (length(trim(service_name_snapshot)) > 0 AND length(service_name_snapshot) <= 200),
           duration_minutes_snapshot INTEGER NOT NULL CHECK (duration_minutes_snapshot BETWEEN 5 AND 480),
+          listed_price_snapshot_minor INTEGER NOT NULL DEFAULT 0 CHECK (listed_price_snapshot_minor >= 0),
+          charged_price_minor INTEGER NOT NULL DEFAULT 0 CHECK (charged_price_minor >= 0),
           sort_order INTEGER NOT NULL CHECK (sort_order >= 0),
           created_at TEXT NOT NULL,
           PRIMARY KEY (appointment_id, service_id),
@@ -555,11 +562,36 @@ fn migrate_core(connection: &Connection) -> Result<(), AppError> {
         ",
     )?;
     migrate_v14_customers_phone_nullable(connection)?;
+    migrate_v15_service_pricing(connection)?;
     connection.execute(
         "UPDATE app_meta SET schema_version = ?1 WHERE schema_version < ?1",
         params![CORE_SCHEMA_VERSION],
     )?;
     Ok(())
+}
+
+fn migrate_v15_service_pricing(connection: &Connection) -> Result<(), AppError> {
+    if read_schema_version(connection)? >= 15 { return Ok(()); }
+    let service_columns = table_columns(connection, "services")?;
+    let appointment_columns = table_columns(connection, "appointment_services")?;
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<(), AppError> {
+        if !service_columns.contains("default_price_minor") {
+            connection.execute("ALTER TABLE services ADD COLUMN default_price_minor INTEGER NOT NULL DEFAULT 0 CHECK (default_price_minor >= 0)", [])?;
+        }
+        if !appointment_columns.contains("listed_price_snapshot_minor") {
+            connection.execute("ALTER TABLE appointment_services ADD COLUMN listed_price_snapshot_minor INTEGER NOT NULL DEFAULT 0 CHECK (listed_price_snapshot_minor >= 0)", [])?;
+        }
+        if !appointment_columns.contains("charged_price_minor") {
+            connection.execute("ALTER TABLE appointment_services ADD COLUMN charged_price_minor INTEGER NOT NULL DEFAULT 0 CHECK (charged_price_minor >= 0)", [])?;
+        }
+        connection.execute_batch("CREATE INDEX IF NOT EXISTS appointment_services_appointment_idx ON appointment_services(appointment_id, service_id);
+          CREATE INDEX IF NOT EXISTS appointments_completed_range_idx ON appointments(status, start_at_utc);")?;
+        connection.execute_batch("COMMIT;")?;
+        Ok(())
+    })();
+    if result.is_err() { let _ = connection.execute_batch("ROLLBACK;"); }
+    result
 }
 
 fn migrate_v14_customers_phone_nullable(connection: &Connection) -> Result<(), AppError> {
@@ -874,6 +906,7 @@ fn service_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceItem> {
         category_name: row.get("category_name")?,
         name: row.get("name")?,
         duration_minutes: duration,
+        default_price_minor: row.get("default_price_minor")?,
         sort_order: row.get("sort_order")?,
         is_active,
         availability_status: availability_status.to_string(),
@@ -1059,6 +1092,8 @@ fn create_service_tx(
         .duration_minutes
         .ok_or_else(|| AppError::Validation("duration required".to_string()))?;
     validate_duration(duration)?;
+    let default_price_minor = input.default_price_minor.unwrap_or(0);
+    if default_price_minor < 0 { return Err(AppError::Validation("defaultPriceMinor invalid".into())); }
     let id = new_uuid();
     let now = now_iso();
     let sort_order = next_sort_order(
@@ -1067,8 +1102,8 @@ fn create_service_tx(
         Some(("category_id", &input.category_id)),
     )?;
     connection.execute(
-        "INSERT INTO services (id, category_id, name, name_key, duration_minutes, sort_order, is_active, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8)",
-        params![id, input.category_id, name.clone(), name_key(&name), duration, sort_order, bool_to_i64(input.is_active.unwrap_or(true)), now],
+        "INSERT INTO services (id, category_id, name, name_key, duration_minutes, default_price_minor, sort_order, is_active, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
+        params![id, input.category_id, name.clone(), name_key(&name), duration, default_price_minor, sort_order, bool_to_i64(input.is_active.unwrap_or(true)), now],
     )?;
     get_service(connection, &id)?.ok_or_else(|| AppError::Database("service insert".to_string()))
 }
@@ -1093,9 +1128,11 @@ fn update_service_tx(
     if let Some(duration) = input.duration_minutes {
         validate_duration(duration)?;
     }
+    let default_price_minor = input.default_price_minor.unwrap_or(0);
+    if default_price_minor < 0 { return Err(AppError::Validation("defaultPriceMinor invalid".into())); }
     connection.execute(
-        "UPDATE services SET category_id=?1,name=?2,name_key=?3,duration_minutes=?4,is_active=?5,updated_at=?6 WHERE id=?7",
-        params![input.category_id, name.clone(), name_key(&name), input.duration_minutes, bool_to_i64(input.is_active.unwrap_or(true)), now_iso(), id],
+        "UPDATE services SET category_id=?1,name=?2,name_key=?3,duration_minutes=?4,default_price_minor=?5,is_active=?6,updated_at=?7 WHERE id=?8",
+        params![input.category_id, name.clone(), name_key(&name), input.duration_minutes, default_price_minor, bool_to_i64(input.is_active.unwrap_or(true)), now_iso(), id],
     )?;
     get_service(connection, id)?.ok_or_else(|| AppError::Database("service update".to_string()))
 }
@@ -1199,6 +1236,8 @@ fn appointment_snapshots(
             service_id: service.id,
             service_name_snapshot: service.name,
             duration_minutes_snapshot: duration,
+            listed_price_snapshot_minor: service.default_price_minor,
+            charged_price_minor: service.default_price_minor,
             sort_order: ((index + 1) * 10) as i64,
         });
     }
@@ -1284,9 +1323,9 @@ fn create_appointment_tx(
     )?;
     for snapshot in &snapshots {
         tx.execute(
-            "INSERT INTO appointment_services (appointment_id, service_id, service_name_snapshot, duration_minutes_snapshot, sort_order, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6)",
-            params![id, snapshot.service_id, snapshot.service_name_snapshot, snapshot.duration_minutes_snapshot, snapshot.sort_order, now],
+            "INSERT INTO appointment_services (appointment_id, service_id, service_name_snapshot, duration_minutes_snapshot, listed_price_snapshot_minor, charged_price_minor, sort_order, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![id, snapshot.service_id, snapshot.service_name_snapshot, snapshot.duration_minutes_snapshot, snapshot.listed_price_snapshot_minor, snapshot.charged_price_minor, snapshot.sort_order, now],
         )?;
     }
     enqueue_google_sync_if_enabled(&tx, &id)?;
@@ -1343,9 +1382,9 @@ fn update_appointment_tx(
         let now = now_iso();
         for snapshot in &snapshots {
             tx.execute(
-                "INSERT INTO appointment_services (appointment_id, service_id, service_name_snapshot, duration_minutes_snapshot, sort_order, created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6)",
-                params![id, snapshot.service_id, snapshot.service_name_snapshot, snapshot.duration_minutes_snapshot, snapshot.sort_order, now],
+                "INSERT INTO appointment_services (appointment_id, service_id, service_name_snapshot, duration_minutes_snapshot, listed_price_snapshot_minor, charged_price_minor, sort_order, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![id, snapshot.service_id, snapshot.service_name_snapshot, snapshot.duration_minutes_snapshot, snapshot.listed_price_snapshot_minor, snapshot.charged_price_minor, snapshot.sort_order, now],
             )?;
         }
     }
@@ -1385,17 +1424,36 @@ fn list_appointment_services(
     appointment_id: &str,
 ) -> Result<Vec<AppointmentServiceSnapshot>, AppError> {
     let mut statement = connection.prepare(
-        "SELECT service_id, service_name_snapshot, duration_minutes_snapshot, sort_order FROM appointment_services WHERE appointment_id=?1 ORDER BY sort_order ASC",
+        "SELECT service_id, service_name_snapshot, duration_minutes_snapshot, listed_price_snapshot_minor, charged_price_minor, sort_order FROM appointment_services WHERE appointment_id=?1 ORDER BY sort_order ASC",
     )?;
     let rows = statement.query_map(params![appointment_id], |row| {
         Ok(AppointmentServiceSnapshot {
             service_id: row.get(0)?,
             service_name_snapshot: row.get(1)?,
             duration_minutes_snapshot: row.get(2)?,
-            sort_order: row.get(3)?,
+            listed_price_snapshot_minor: row.get(3)?, charged_price_minor: row.get(4)?, sort_order: row.get(5)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceStatistic { service_id: String, service_name_snapshot: String, completed_count: i64, revenue_minor: i64 }
+
+fn set_appointment_service_charged_price(connection: &Connection, appointment_id: &str, service_id: &str, charged_price_minor: i64) -> Result<(), AppError> {
+    if charged_price_minor < 0 { return Err(AppError::Validation("chargedPriceMinor invalid".into())); }
+    let changed = connection.execute("UPDATE appointment_services SET charged_price_minor=?1 WHERE appointment_id=?2 AND service_id=?3", params![charged_price_minor, appointment_id, service_id])?;
+    if changed == 0 { return Err(AppError::NotFound("APPOINTMENT_SERVICE_NOT_FOUND".into())); }
+    Ok(())
+}
+
+fn service_statistics_tx(connection: &Connection, start_date: &str, end_date: &str) -> Result<Vec<ServiceStatistic>, AppError> {
+    let start = utc_iso(local_to_utc(start_date, "00:00")?);
+    let end = utc_iso(local_to_utc(end_date, "00:00")? + Duration::days(1));
+    let mut statement = connection.prepare("SELECT aps.service_id, aps.service_name_snapshot, COUNT(*), COALESCE(SUM(aps.charged_price_minor),0) FROM appointment_services aps JOIN appointments a ON a.id=aps.appointment_id WHERE a.status='completed' AND a.start_at_utc>=?1 AND a.start_at_utc<?2 GROUP BY aps.service_id, aps.service_name_snapshot ORDER BY aps.service_name_snapshot")?;
+    let rows = statement.query_map(params![start,end], |row| Ok(ServiceStatistic { service_id: row.get(0)?, service_name_snapshot: row.get(1)?, completed_count: row.get(2)?, revenue_minor: row.get(3)? }))?;
+    rows.collect::<Result<Vec<_>,_>>().map_err(Into::into)
 }
 
 fn get_appointment(connection: &Connection, id: &str) -> Result<AppointmentSummary, AppError> {
@@ -2133,6 +2191,18 @@ fn appointment_update(
 }
 
 #[tauri::command]
+fn appointment_service_set_charged_price(appointment_id: String, service_id: String, charged_price_minor: i64, state: tauri::State<'_, AppState>) -> Result<(), AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    set_appointment_service_charged_price(&connection, &appointment_id, &service_id, charged_price_minor)
+}
+
+#[tauri::command]
+fn service_statistics(start_date: String, end_date: String, state: tauri::State<'_, AppState>) -> Result<Vec<ServiceStatistic>, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    service_statistics_tx(&connection, &start_date, &end_date)
+}
+
+#[tauri::command]
 fn appointment_list_by_date(
     local_date: String,
     staff_id: Option<String>,
@@ -2815,6 +2885,8 @@ pub fn run() {
             service_list,
             appointment_create,
             appointment_update,
+            appointment_service_set_charged_price,
+            service_statistics,
             appointment_list_by_date,
             database_create_backup,
             database_clean_start,
@@ -2893,6 +2965,7 @@ mod tests {
                 category_id: category.id,
                 name: "Klasik Bakim".into(),
                 duration_minutes: Some(30),
+                default_price_minor: Some(0),
                 is_active: Some(true),
             },
         )
@@ -4113,6 +4186,7 @@ mod tests {
                 category_id: category.id,
                 name: "TEST Google Sync".into(),
                 duration_minutes: Some(30),
+                default_price_minor: Some(0),
                 is_active: Some(true),
             },
         )
@@ -4514,7 +4588,9 @@ mod tests {
         ).expect("v13 fixture");
         drop(old);
         let connection = open_database(&path).expect("migrate v13");
-        assert_eq!(read_schema_version(&connection).expect("version"), 14);
+        assert_eq!(read_schema_version(&connection).expect("version"), 15);
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM services WHERE default_price_minor <> 0", [], |row| row.get::<_, i64>(0)).expect("service defaults"), 0);
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM appointment_services WHERE listed_price_snapshot_minor <> 0 OR charged_price_minor <> 0", [], |row| row.get::<_, i64>(0)).expect("snapshot defaults"), 0);
         assert_eq!(
             connection
                 .query_row("SELECT COUNT(*) FROM customers", [], |row| row
@@ -4563,7 +4639,7 @@ mod tests {
         let reopened = open_database(&path).expect("restart safe");
         assert_eq!(
             read_schema_version(&reopened).expect("version after restart"),
-            14
+            15
         );
         assert!(integrity_check(&reopened).expect("integrity after restart"));
     }
@@ -4667,6 +4743,7 @@ mod tests {
                 category_id: category.id,
                 name: "BeautySaloon TEST CLOUD".into(),
                 duration_minutes: Some(30),
+                default_price_minor: Some(0),
                 is_active: Some(true),
             },
         )
