@@ -9,3 +9,4 @@ runtime-*.png
 *.tmp
 src-tauri/live-services.local.json
 src-tauri/live-services.local.*.json
+supabase/.temp/

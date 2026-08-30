@@ -22,7 +22,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 mod services;
 
-const CORE_SCHEMA_VERSION: i64 = 13;
+const CORE_SCHEMA_VERSION: i64 = 14;
 const ISTANBUL_OFFSET_MINUTES: i64 = 180;
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -89,7 +89,7 @@ pub struct Customer {
     id: String,
     first_name: String,
     last_name: String,
-    phone: String,
+    phone: Option<String>,
     email: Option<String>,
     notes: Option<String>,
     whatsapp_reminder_enabled: bool,
@@ -104,7 +104,7 @@ pub struct Customer {
 pub struct CustomerInput {
     first_name: String,
     last_name: String,
-    phone: String,
+    phone: Option<String>,
     email: Option<String>,
     notes: Option<String>,
     whatsapp_reminder_enabled: Option<bool>,
@@ -194,7 +194,7 @@ pub struct AppointmentSummary {
     status: String,
     note: Option<String>,
     customer_name: String,
-    customer_phone: String,
+    customer_phone: Option<String>,
     staff_name: String,
     service_names: Vec<String>,
     services: Vec<AppointmentServiceSnapshot>,
@@ -313,7 +313,7 @@ fn migrate_core(connection: &Connection) -> Result<(), AppError> {
           id TEXT PRIMARY KEY NOT NULL,
           first_name TEXT NOT NULL,
           last_name TEXT NOT NULL,
-          phone TEXT NOT NULL,
+          phone TEXT,
           email TEXT,
           whatsapp_reminder_enabled INTEGER NOT NULL DEFAULT 1,
           whatsapp_consent_confirmed INTEGER NOT NULL DEFAULT 0,
@@ -554,10 +554,60 @@ fn migrate_core(connection: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS foundation_notes_created_idx ON foundation_notes (created_at_utc DESC, id DESC);
         ",
     )?;
+    migrate_v14_customers_phone_nullable(connection)?;
     connection.execute(
         "UPDATE app_meta SET schema_version = ?1 WHERE schema_version < ?1",
         params![CORE_SCHEMA_VERSION],
     )?;
+    Ok(())
+}
+
+fn migrate_v14_customers_phone_nullable(connection: &Connection) -> Result<(), AppError> {
+    if read_schema_version(connection)? >= 14
+        || table_columns(connection, "customers")?
+            .get("phone")
+            .is_none()
+    {
+        return Ok(());
+    }
+    let required: i64 = connection.query_row(
+        "SELECT \"notnull\" FROM pragma_table_info('customers') WHERE name='phone'",
+        [],
+        |row| row.get(0),
+    )?;
+    if required == 0 {
+        return Ok(());
+    }
+    connection.pragma_update(None, "foreign_keys", "OFF")?;
+    connection.pragma_update(None, "legacy_alter_table", "ON")?;
+    let result = (|| -> Result<(), AppError> {
+        connection.execute_batch("BEGIN IMMEDIATE;
+          ALTER TABLE customers RENAME TO customers_v13;
+          CREATE TABLE customers (
+            id TEXT PRIMARY KEY NOT NULL, first_name TEXT NOT NULL, last_name TEXT NOT NULL, phone TEXT,
+            email TEXT, whatsapp_reminder_enabled INTEGER NOT NULL DEFAULT 1,
+            whatsapp_consent_confirmed INTEGER NOT NULL DEFAULT 0, whatsapp_consent_recorded_at TEXT,
+            notes TEXT, is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+          INSERT INTO customers (id,first_name,last_name,phone,email,whatsapp_reminder_enabled,whatsapp_consent_confirmed,whatsapp_consent_recorded_at,notes,is_active,created_at,updated_at)
+          SELECT id,first_name,last_name,phone,email,whatsapp_reminder_enabled,whatsapp_consent_confirmed,whatsapp_consent_recorded_at,notes,is_active,created_at,updated_at FROM customers_v13;
+          DROP TABLE customers_v13;
+          CREATE UNIQUE INDEX customers_phone_unique_idx ON customers(phone);
+          CREATE INDEX customers_active_name_idx ON customers(is_active,last_name,first_name);
+          COMMIT;")?;
+        Ok(())
+    })();
+    connection.pragma_update(None, "legacy_alter_table", "OFF")?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    result?;
+    let violations: i64 =
+        connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if violations != 0 || !integrity_check(connection)? {
+        return Err(AppError::Database(
+            "V14_CUSTOMER_MIGRATION_INTEGRITY".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -884,7 +934,7 @@ fn next_sort_order(
 fn create_customer_tx(connection: &Connection, input: CustomerInput) -> Result<Customer, AppError> {
     let first_name = normalize_text(&input.first_name, "firstName", 2, 100)?;
     let last_name = normalize_text(&input.last_name, "lastName", 2, 100)?;
-    let phone = normalize_phone(Some(&input.phone), true)?.expect("required phone");
+    let phone = normalize_phone(input.phone.as_deref(), false)?;
     let email = optional_text(input.email, 254)?;
     let notes = optional_text(input.notes, 2000)?;
     let now = now_iso();
@@ -918,7 +968,7 @@ fn update_customer_tx(
         .ok_or_else(|| AppError::NotFound("CUSTOMER_NOT_FOUND".to_string()))?;
     let first_name = normalize_text(&input.first_name, "firstName", 2, 100)?;
     let last_name = normalize_text(&input.last_name, "lastName", 2, 100)?;
-    let phone = normalize_phone(Some(&input.phone), true)?.expect("required phone");
+    let phone = normalize_phone(input.phone.as_deref(), false)?;
     let email = optional_text(input.email, 254)?;
     let notes = optional_text(input.notes, 2000)?;
     let now = now_iso();
@@ -1599,7 +1649,7 @@ fn reconcile_reminder_for_appointment(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, String>(6)?,
@@ -1617,7 +1667,7 @@ fn reconcile_reminder_for_appointment(
         && active == 1
         && reminder_enabled == 1
         && consent == 1
-        && normalize_phone(Some(&phone), true).is_ok();
+        && normalize_phone(phone.as_deref(), true).is_ok();
     let existing: Option<String> = connection
         .query_row(
             "SELECT id FROM appointment_reminders WHERE appointment_id=?1 AND channel='whatsapp' AND reminder_type='appointment_24h'",
@@ -1651,7 +1701,7 @@ fn reconcile_reminder_for_appointment(
         )?;
         let recipient = format!(
             "90{}",
-            normalize_phone(Some(&phone), true)?
+            normalize_phone(phone.as_deref(), true)?
                 .ok_or_else(|| AppError::Validation("phone required".to_string()))?
         );
         upsert_cloud_outbox(
@@ -1820,7 +1870,7 @@ fn list_appointments_between(
             row.get::<_, String>("status")?,
             row.get::<_, Option<String>>("note")?,
             row.get::<_, String>("customer_name")?,
-            row.get::<_, String>("customer_phone")?,
+            row.get::<_, Option<String>>("customer_phone")?,
             row.get::<_, String>("staff_name")?,
             row.get::<_, String>("updated_at")?,
         ))
@@ -2809,7 +2859,7 @@ mod tests {
             CustomerInput {
                 first_name: "Ayse".into(),
                 last_name: "Yilmaz".into(),
-                phone: "+90 555 111 22 33".into(),
+                phone: Some("+90 555 111 22 33".into()),
                 email: None,
                 notes: None,
                 whatsapp_reminder_enabled: Some(true),
@@ -2930,7 +2980,7 @@ mod tests {
     fn customer_staff_service_crud_and_phone_rules() {
         let (_temp, mut connection) = open_temp();
         let (customer, staff, service) = seed_core(&mut connection);
-        assert_eq!(customer.phone, "5551112233");
+        assert_eq!(customer.phone.as_deref(), Some("5551112233"));
         assert_eq!(staff.phone.as_deref(), Some("5552223344"));
         assert_eq!(service.availability_status, "ready");
 
@@ -2940,7 +2990,7 @@ mod tests {
             CustomerInput {
                 first_name: "Ayse Nur".into(),
                 last_name: "Yilmaz".into(),
-                phone: "05551112233".into(),
+                phone: Some("05551112233".into()),
                 email: Some("ayse@example.test".into()),
                 notes: Some("VIP".into()),
                 whatsapp_reminder_enabled: Some(false),
@@ -3292,7 +3342,7 @@ mod tests {
             CustomerInput {
                 first_name: customer.first_name.clone(),
                 last_name: customer.last_name.clone(),
-                phone: "05551112233".into(),
+                phone: Some("05551112233".into()),
                 email: None,
                 notes: None,
                 whatsapp_reminder_enabled: Some(true),
@@ -3595,7 +3645,7 @@ mod tests {
             CustomerInput {
                 first_name: customer.first_name,
                 last_name: customer.last_name,
-                phone: "05551112233".into(),
+                phone: Some("05551112233".into()),
                 email: None,
                 notes: None,
                 whatsapp_reminder_enabled: Some(true),
@@ -3709,7 +3759,7 @@ mod tests {
             CustomerInput {
                 first_name: customer.first_name,
                 last_name: customer.last_name,
-                phone: "05551112233".into(),
+                phone: Some("05551112233".into()),
                 email: None,
                 notes: None,
                 whatsapp_reminder_enabled: Some(true),
@@ -4029,7 +4079,7 @@ mod tests {
             CustomerInput {
                 first_name: "Test".into(),
                 last_name: "Google Sync".into(),
-                phone: format!("555{:07}", suffix % 10_000_000),
+                phone: Some(format!("555{:07}", suffix % 10_000_000)),
                 email: None,
                 notes: Some("SENTETIK GOOGLE LIVE ACCEPTANCE".into()),
                 whatsapp_reminder_enabled: Some(false),
@@ -4441,6 +4491,83 @@ mod tests {
         assert!(status.paused, "dispatcher must remain paused");
     }
 
+    #[test]
+    fn migrates_v13_required_customer_phone_to_nullable_without_losing_foreign_keys() {
+        let temp = tempdir().expect("temp");
+        let path = temp.path().join("v13.db");
+        let old = Connection::open(&path).expect("old database");
+        old.pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        old.execute_batch(
+            "CREATE TABLE app_meta (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, schema_version INTEGER NOT NULL, initialized_at TEXT NOT NULL);
+             INSERT INTO app_meta (schema_version, initialized_at) VALUES (13, '2026-01-01T00:00:00.000Z');
+             CREATE TABLE customers (
+               id TEXT PRIMARY KEY NOT NULL, first_name TEXT NOT NULL, last_name TEXT NOT NULL, phone TEXT NOT NULL,
+               email TEXT, whatsapp_reminder_enabled INTEGER NOT NULL DEFAULT 1, whatsapp_consent_confirmed INTEGER NOT NULL DEFAULT 0,
+               whatsapp_consent_recorded_at TEXT, notes TEXT, is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             CREATE UNIQUE INDEX customers_phone_unique_idx ON customers(phone);
+             CREATE INDEX customers_active_name_idx ON customers(is_active, last_name, first_name);
+             CREATE TABLE appointments (id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, staff_id TEXT NOT NULL, start_at_utc TEXT NOT NULL, end_at_utc TEXT NOT NULL, total_duration_minutes INTEGER NOT NULL, status TEXT NOT NULL, note TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY (customer_id) REFERENCES customers(id));
+             INSERT INTO customers VALUES ('c-1','Ada','Test','5551112233',NULL,1,0,NULL,'keep',1,'2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z');
+             INSERT INTO customers VALUES ('c-2','Bora','Test','5551112244','b@example.test',0,0,NULL,NULL,1,'2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z');
+             INSERT INTO appointments VALUES ('a-1','c-1','staff-1','2026-02-01T07:00:00.000Z','2026-02-01T08:00:00.000Z',60,'planned',NULL,'2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z');",
+        ).expect("v13 fixture");
+        drop(old);
+        let connection = open_database(&path).expect("migrate v13");
+        assert_eq!(read_schema_version(&connection).expect("version"), 14);
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM customers", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("count"),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT phone FROM customers WHERE id='c-1'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .expect("phone"),
+            "5551112233"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT customer_id FROM appointments WHERE id='a-1'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .expect("fk"),
+            "c-1"
+        );
+        connection.execute("INSERT INTO customers (id,first_name,last_name,phone,whatsapp_reminder_enabled,whatsapp_consent_confirmed,is_active,created_at,updated_at) VALUES ('c-3','Null','One',NULL,1,0,1,'x','x'),('c-4','Null','Two',NULL,1,0,1,'x','x')", []).expect("multiple nulls");
+        assert!(connection.execute("INSERT INTO customers (id,first_name,last_name,phone,whatsapp_reminder_enabled,whatsapp_consent_confirmed,is_active,created_at,updated_at) VALUES ('c-5','Dup','Phone','5551112233',1,0,1,'x','x')", []).is_err());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("fk check"),
+            0
+        );
+        assert!(integrity_check(&connection).expect("integrity"));
+        let tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='customers_v13'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("old table absent");
+        assert_eq!(tables, 0);
+        drop(connection);
+        let reopened = open_database(&path).expect("restart safe");
+        assert_eq!(
+            read_schema_version(&reopened).expect("version after restart"),
+            14
+        );
+        assert!(integrity_check(&reopened).expect("integrity after restart"));
+    }
+
     fn require_live_dispatcher_paused(
         connection: &Connection,
         transport: &mut dyn services::google::HttpTransport,
@@ -4506,7 +4633,7 @@ mod tests {
             CustomerInput {
                 first_name: "BeautySaloon".into(),
                 last_name: "TEST CLOUD".into(),
-                phone: "05550000000".into(),
+                phone: Some("05550000000".into()),
                 email: None,
                 notes: Some(marker.into()),
                 whatsapp_reminder_enabled: Some(true),
