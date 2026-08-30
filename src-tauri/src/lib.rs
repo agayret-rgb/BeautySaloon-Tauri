@@ -1,4 +1,4 @@
-use chrono::{Duration, NaiveDate, NaiveTime, Utc};
+use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -22,8 +22,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 mod services;
 
-const CORE_SCHEMA_VERSION: i64 = 15;
+const CORE_SCHEMA_VERSION: i64 = 16;
 const ISTANBUL_OFFSET_MINUTES: i64 = 180;
+const APPOINTMENT_STATUS_CANCELLED: &str = "cancelled";
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Error)]
@@ -66,7 +67,7 @@ struct LiveServicesConfig {
     supabase: Option<services::supabase::SupabaseConfig>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct GoogleConnectResult {
     connected: bool,
@@ -124,6 +125,35 @@ pub struct Staff {
     is_active: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StaffWorkingHour {
+    staff_id: String,
+    weekday: i64,
+    start_minute: i64,
+    end_minute: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StaffTimeOff {
+    id: String,
+    staff_id: String,
+    local_date: String,
+    full_day: bool,
+    start_minute: Option<i64>,
+    end_minute: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaffTimeOffInput {
+    local_date: String,
+    full_day: bool,
+    start_minute: Option<i64>,
+    end_minute: Option<i64>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StaffInput {
@@ -175,7 +205,7 @@ pub struct ServiceInput {
     is_active: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppointmentServiceSnapshot {
     service_id: String,
@@ -215,6 +245,25 @@ pub struct AppointmentInput {
     service_ids: Vec<String>,
     status: Option<String>,
     note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppointmentInterval {
+    start_at_utc: chrono::DateTime<Utc>,
+    end_at_utc: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppointmentAvailabilityReason {
+    OutsideWorkingHours,
+    StaffTimeOff,
+    AppointmentConflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppointmentAvailability {
+    Available,
+    Unavailable(AppointmentAvailabilityReason),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -563,6 +612,7 @@ fn migrate_core(connection: &Connection) -> Result<(), AppError> {
     )?;
     migrate_v14_customers_phone_nullable(connection)?;
     migrate_v15_service_pricing(connection)?;
+    migrate_v16_scheduling_schema(connection)?;
     connection.execute(
         "UPDATE app_meta SET schema_version = ?1 WHERE schema_version < ?1",
         params![CORE_SCHEMA_VERSION],
@@ -570,8 +620,23 @@ fn migrate_core(connection: &Connection) -> Result<(), AppError> {
     Ok(())
 }
 
+fn migrate_v16_scheduling_schema(connection: &Connection) -> Result<(), AppError> {
+    if read_schema_version(connection)? >= 16 {
+        return Ok(());
+    }
+    connection.execute_batch("BEGIN IMMEDIATE;
+      CREATE TABLE IF NOT EXISTS staff_working_hours (id TEXT PRIMARY KEY NOT NULL, staff_id TEXT NOT NULL REFERENCES staff(id) ON DELETE RESTRICT, weekday INTEGER NOT NULL CHECK(weekday BETWEEN 0 AND 6), start_minute INTEGER NOT NULL CHECK(start_minute BETWEEN 0 AND 1439), end_minute INTEGER NOT NULL CHECK(end_minute BETWEEN 1 AND 1440 AND start_minute < end_minute));
+      CREATE INDEX IF NOT EXISTS staff_working_hours_staff_weekday_idx ON staff_working_hours(staff_id, weekday, start_minute);
+      CREATE TABLE IF NOT EXISTS staff_time_off (id TEXT PRIMARY KEY NOT NULL, staff_id TEXT NOT NULL REFERENCES staff(id) ON DELETE RESTRICT, local_date TEXT NOT NULL, full_day INTEGER NOT NULL CHECK(full_day IN (0,1)), start_minute INTEGER, end_minute INTEGER, CHECK((full_day=1 AND start_minute IS NULL AND end_minute IS NULL) OR (full_day=0 AND start_minute BETWEEN 0 AND 1439 AND end_minute BETWEEN 1 AND 1440 AND start_minute < end_minute)));
+      CREATE INDEX IF NOT EXISTS staff_time_off_staff_date_idx ON staff_time_off(staff_id, local_date, start_minute);
+      COMMIT;")
+        .map_err(Into::into)
+}
+
 fn migrate_v15_service_pricing(connection: &Connection) -> Result<(), AppError> {
-    if read_schema_version(connection)? >= 15 { return Ok(()); }
+    if read_schema_version(connection)? >= 15 {
+        return Ok(());
+    }
     let service_columns = table_columns(connection, "services")?;
     let appointment_columns = table_columns(connection, "appointment_services")?;
     connection.execute_batch("BEGIN IMMEDIATE;")?;
@@ -590,7 +655,9 @@ fn migrate_v15_service_pricing(connection: &Connection) -> Result<(), AppError> 
         connection.execute_batch("COMMIT;")?;
         Ok(())
     })();
-    if result.is_err() { let _ = connection.execute_batch("ROLLBACK;"); }
+    if result.is_err() {
+        let _ = connection.execute_batch("ROLLBACK;");
+    }
     result
 }
 
@@ -935,6 +1002,233 @@ fn get_staff(connection: &Connection, id: &str) -> Result<Option<Staff>, AppErro
         .map_err(Into::into)
 }
 
+fn list_staff_working_hours(
+    connection: &Connection,
+    staff_id: &str,
+) -> Result<Vec<StaffWorkingHour>, AppError> {
+    let mut statement = connection.prepare("SELECT staff_id, weekday, start_minute, end_minute FROM staff_working_hours WHERE staff_id=?1 ORDER BY weekday, start_minute")?;
+    let rows = statement.query_map(params![staff_id], |row| {
+        Ok(StaffWorkingHour {
+            staff_id: row.get(0)?,
+            weekday: row.get(1)?,
+            start_minute: row.get(2)?,
+            end_minute: row.get(3)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn replace_staff_working_hours(
+    connection: &mut Connection,
+    staff_id: &str,
+    intervals: Vec<StaffWorkingHour>,
+) -> Result<(), AppError> {
+    if get_staff(connection, staff_id)?.is_none() {
+        return Err(AppError::NotFound("STAFF_NOT_FOUND".into()));
+    }
+    for item in &intervals {
+        if item.staff_id != staff_id
+            || !(0..=6).contains(&item.weekday)
+            || item.start_minute < 0
+            || item.end_minute > 1440
+            || item.start_minute >= item.end_minute
+        {
+            return Err(AppError::Validation("STAFF_WORKING_HOURS_INVALID".into()));
+        }
+    }
+    let mut ordered = intervals.clone();
+    ordered.sort_by_key(|item| (item.weekday, item.start_minute, item.end_minute));
+    for pair in ordered.windows(2) {
+        if pair[0].weekday == pair[1].weekday && pair[1].start_minute < pair[0].end_minute {
+            return Err(AppError::Conflict("STAFF_WORKING_HOURS_OVERLAP".into()));
+        }
+    }
+    let tx = connection.transaction()?;
+    tx.execute(
+        "DELETE FROM staff_working_hours WHERE staff_id=?1",
+        params![staff_id],
+    )?;
+    for item in intervals {
+        tx.execute("INSERT INTO staff_working_hours (id,staff_id,weekday,start_minute,end_minute) VALUES (?1,?2,?3,?4,?5)", params![new_uuid(),staff_id,item.weekday,item.start_minute,item.end_minute])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn is_staff_schedule_unrestricted(
+    connection: &Connection,
+    staff_id: &str,
+) -> Result<bool, AppError> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM staff_working_hours WHERE staff_id=?1",
+        params![staff_id],
+        |row| row.get(0),
+    )?;
+    Ok(count == 0)
+}
+
+fn staff_time_off_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StaffTimeOff> {
+    Ok(StaffTimeOff {
+        id: row.get(0)?,
+        staff_id: row.get(1)?,
+        local_date: row.get(2)?,
+        full_day: row.get(3)?,
+        start_minute: row.get(4)?,
+        end_minute: row.get(5)?,
+    })
+}
+
+fn list_staff_time_off(
+    connection: &Connection,
+    staff_id: &str,
+) -> Result<Vec<StaffTimeOff>, AppError> {
+    let mut statement = connection.prepare(
+        "SELECT id, staff_id, local_date, full_day, start_minute, end_minute
+         FROM staff_time_off
+         WHERE staff_id=?1
+         ORDER BY local_date, full_day DESC, start_minute, id",
+    )?;
+    let rows = statement.query_map(params![staff_id], staff_time_off_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn get_staff_time_off(
+    connection: &Connection,
+    staff_id: &str,
+    time_off_id: &str,
+) -> Result<Option<StaffTimeOff>, AppError> {
+    connection
+        .query_row(
+            "SELECT id, staff_id, local_date, full_day, start_minute, end_minute
+             FROM staff_time_off WHERE id=?1 AND staff_id=?2",
+            params![time_off_id, staff_id],
+            staff_time_off_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn validate_staff_time_off_input(input: &StaffTimeOffInput) -> Result<(), AppError> {
+    NaiveDate::parse_from_str(&input.local_date, "%Y-%m-%d")
+        .map_err(|_| AppError::Validation("STAFF_TIME_OFF_DATE_INVALID".into()))?;
+
+    match (input.full_day, input.start_minute, input.end_minute) {
+        (true, None, None) => Ok(()),
+        (false, Some(start_minute), Some(end_minute))
+            if start_minute >= 0 && end_minute <= 1440 && start_minute < end_minute =>
+        {
+            Ok(())
+        }
+        _ => Err(AppError::Validation("STAFF_TIME_OFF_INVALID".into())),
+    }
+}
+
+fn ensure_staff_time_off_has_no_conflict(
+    connection: &Connection,
+    staff_id: &str,
+    input: &StaffTimeOffInput,
+    excluded_time_off_id: Option<&str>,
+) -> Result<(), AppError> {
+    let conflict_count: i64 = if input.full_day {
+        connection.query_row(
+            "SELECT COUNT(*) FROM staff_time_off
+             WHERE staff_id=?1 AND local_date=?2 AND (?3 IS NULL OR id<>?3)",
+            params![staff_id, input.local_date, excluded_time_off_id],
+            |row| row.get(0),
+        )?
+    } else {
+        let start_minute = input.start_minute.expect("validated partial leave start");
+        let end_minute = input.end_minute.expect("validated partial leave end");
+        connection.query_row(
+            "SELECT COUNT(*) FROM staff_time_off
+             WHERE staff_id=?1 AND local_date=?2 AND (?3 IS NULL OR id<>?3)
+               AND (full_day=1 OR (start_minute<?5 AND end_minute>?4))",
+            params![
+                staff_id,
+                input.local_date,
+                excluded_time_off_id,
+                start_minute,
+                end_minute
+            ],
+            |row| row.get(0),
+        )?
+    };
+    if conflict_count > 0 {
+        return Err(AppError::Conflict("STAFF_TIME_OFF_CONFLICT".into()));
+    }
+    Ok(())
+}
+
+fn add_staff_time_off(
+    connection: &mut Connection,
+    staff_id: &str,
+    input: StaffTimeOffInput,
+) -> Result<StaffTimeOff, AppError> {
+    if get_staff(connection, staff_id)?.is_none() {
+        return Err(AppError::NotFound("STAFF_NOT_FOUND".into()));
+    }
+    validate_staff_time_off_input(&input)?;
+    ensure_staff_time_off_has_no_conflict(connection, staff_id, &input, None)?;
+    let id = new_uuid();
+    connection.execute(
+        "INSERT INTO staff_time_off (id, staff_id, local_date, full_day, start_minute, end_minute)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            id,
+            staff_id,
+            input.local_date,
+            input.full_day,
+            input.start_minute,
+            input.end_minute
+        ],
+    )?;
+    get_staff_time_off(connection, staff_id, &id)?
+        .ok_or_else(|| AppError::Database("staff time off insert".into()))
+}
+
+fn update_staff_time_off(
+    connection: &mut Connection,
+    staff_id: &str,
+    time_off_id: &str,
+    input: StaffTimeOffInput,
+) -> Result<StaffTimeOff, AppError> {
+    if get_staff_time_off(connection, staff_id, time_off_id)?.is_none() {
+        return Err(AppError::NotFound("STAFF_TIME_OFF_NOT_FOUND".into()));
+    }
+    validate_staff_time_off_input(&input)?;
+    ensure_staff_time_off_has_no_conflict(connection, staff_id, &input, Some(time_off_id))?;
+    connection.execute(
+        "UPDATE staff_time_off
+         SET local_date=?3, full_day=?4, start_minute=?5, end_minute=?6
+         WHERE id=?1 AND staff_id=?2",
+        params![
+            time_off_id,
+            staff_id,
+            input.local_date,
+            input.full_day,
+            input.start_minute,
+            input.end_minute
+        ],
+    )?;
+    get_staff_time_off(connection, staff_id, time_off_id)?
+        .ok_or_else(|| AppError::Database("staff time off update".into()))
+}
+
+fn remove_staff_time_off(
+    connection: &mut Connection,
+    staff_id: &str,
+    time_off_id: &str,
+) -> Result<(), AppError> {
+    let affected = connection.execute(
+        "DELETE FROM staff_time_off WHERE id=?1 AND staff_id=?2",
+        params![time_off_id, staff_id],
+    )?;
+    if affected == 0 {
+        return Err(AppError::NotFound("STAFF_TIME_OFF_NOT_FOUND".into()));
+    }
+    Ok(())
+}
+
 fn get_service(connection: &Connection, id: &str) -> Result<Option<ServiceItem>, AppError> {
     connection
         .query_row(
@@ -1093,7 +1387,9 @@ fn create_service_tx(
         .ok_or_else(|| AppError::Validation("duration required".to_string()))?;
     validate_duration(duration)?;
     let default_price_minor = input.default_price_minor.unwrap_or(0);
-    if default_price_minor < 0 { return Err(AppError::Validation("defaultPriceMinor invalid".into())); }
+    if default_price_minor < 0 {
+        return Err(AppError::Validation("defaultPriceMinor invalid".into()));
+    }
     let id = new_uuid();
     let now = now_iso();
     let sort_order = next_sort_order(
@@ -1129,7 +1425,9 @@ fn update_service_tx(
         validate_duration(duration)?;
     }
     let default_price_minor = input.default_price_minor.unwrap_or(0);
-    if default_price_minor < 0 { return Err(AppError::Validation("defaultPriceMinor invalid".into())); }
+    if default_price_minor < 0 {
+        return Err(AppError::Validation("defaultPriceMinor invalid".into()));
+    }
     connection.execute(
         "UPDATE services SET category_id=?1,name=?2,name_key=?3,duration_minutes=?4,default_price_minor=?5,is_active=?6,updated_at=?7 WHERE id=?8",
         params![input.category_id, name.clone(), name_key(&name), input.duration_minutes, default_price_minor, bool_to_i64(input.is_active.unwrap_or(true)), now_iso(), id],
@@ -1270,6 +1568,156 @@ fn assert_appointment_references(
     Ok(())
 }
 
+fn appointment_duration_minutes(
+    connection: &Connection,
+    appointment_id: &str,
+) -> Result<i64, AppError> {
+    let duration = connection
+        .query_row(
+            "SELECT COALESCE(SUM(aps.duration_minutes_snapshot), 0)
+             FROM appointments a
+             LEFT JOIN appointment_services aps ON aps.appointment_id=a.id
+             WHERE a.id=?1
+             GROUP BY a.id",
+            params![appointment_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .ok_or_else(|| AppError::NotFound("APPOINTMENT_NOT_FOUND".into()))?;
+    if duration <= 0 {
+        return Err(AppError::Validation("APPOINTMENT_DURATION_INVALID".into()));
+    }
+    Ok(duration)
+}
+
+fn appointment_interval_from_local(
+    local_date: &str,
+    local_start_time: &str,
+    duration_minutes: i64,
+) -> Result<AppointmentInterval, AppError> {
+    if duration_minutes <= 0 {
+        return Err(AppError::Validation("APPOINTMENT_DURATION_INVALID".into()));
+    }
+    let start_at_utc = local_to_utc(local_date, local_start_time)?;
+    let end_at_utc = start_at_utc + Duration::minutes(duration_minutes);
+    ensure_same_istanbul_day(start_at_utc, end_at_utc)?;
+    Ok(AppointmentInterval {
+        start_at_utc,
+        end_at_utc,
+    })
+}
+
+fn appointment_interval_local_components(
+    interval: &AppointmentInterval,
+) -> Result<(NaiveDate, i64, i64), AppError> {
+    ensure_same_istanbul_day(interval.start_at_utc, interval.end_at_utc)?;
+    let start = interval.start_at_utc + Duration::minutes(ISTANBUL_OFFSET_MINUTES);
+    let end = interval.end_at_utc + Duration::minutes(ISTANBUL_OFFSET_MINUTES);
+    let start_minute = i64::from(chrono::Timelike::hour(&start)) * 60
+        + i64::from(chrono::Timelike::minute(&start));
+    let end_minute =
+        i64::from(chrono::Timelike::hour(&end)) * 60 + i64::from(chrono::Timelike::minute(&end));
+    Ok((start.date_naive(), start_minute, end_minute))
+}
+
+fn staff_has_appointment_conflict(
+    connection: &Connection,
+    staff_id: &str,
+    interval: &AppointmentInterval,
+    exclude_appointment_id: Option<&str>,
+) -> Result<bool, AppError> {
+    let has_conflict: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM appointments a
+             INNER JOIN appointment_services aps ON aps.appointment_id=a.id
+             WHERE a.staff_id=?1 AND a.status<>?2 AND (?3 IS NULL OR a.id<>?3)
+               AND a.start_at_utc<?5
+             GROUP BY a.id, a.start_at_utc
+             HAVING julianday(?4) < julianday(a.start_at_utc) + SUM(aps.duration_minutes_snapshot) / 1440.0
+         )",
+        params![
+            staff_id,
+            "cancelled",
+            exclude_appointment_id,
+            utc_iso(interval.start_at_utc),
+            utc_iso(interval.end_at_utc)
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(has_conflict)
+}
+
+fn staff_has_time_off_conflict(
+    connection: &Connection,
+    staff_id: &str,
+    local_date: NaiveDate,
+    start_minute: i64,
+    end_minute: i64,
+) -> Result<bool, AppError> {
+    let has_conflict: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM staff_time_off
+             WHERE staff_id=?1 AND local_date=?2
+               AND (full_day=1 OR (start_minute<?4 AND end_minute>?3))
+         )",
+        params![
+            staff_id,
+            local_date.format("%Y-%m-%d").to_string(),
+            start_minute,
+            end_minute
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(has_conflict)
+}
+
+fn check_staff_appointment_availability(
+    connection: &Connection,
+    staff_id: &str,
+    interval: &AppointmentInterval,
+    exclude_appointment_id: Option<&str>,
+) -> Result<AppointmentAvailability, AppError> {
+    if get_staff(connection, staff_id)?.is_none() {
+        return Err(AppError::NotFound("STAFF_NOT_FOUND".into()));
+    }
+    let (local_date, start_minute, end_minute) = appointment_interval_local_components(interval)?;
+    if !is_staff_schedule_unrestricted(connection, staff_id)? {
+        let weekday = i64::from(local_date.weekday().num_days_from_monday());
+        let working_hours = list_staff_working_hours(connection, staff_id)?;
+        let inside_configured_interval = working_hours.iter().any(|working_hour| {
+            working_hour.weekday == weekday
+                && working_hour.start_minute <= start_minute
+                && working_hour.end_minute >= end_minute
+        });
+        if !inside_configured_interval {
+            return Ok(AppointmentAvailability::Unavailable(
+                AppointmentAvailabilityReason::OutsideWorkingHours,
+            ));
+        }
+    }
+    if staff_has_time_off_conflict(connection, staff_id, local_date, start_minute, end_minute)? {
+        return Ok(AppointmentAvailability::Unavailable(
+            AppointmentAvailabilityReason::StaffTimeOff,
+        ));
+    }
+    if staff_has_appointment_conflict(connection, staff_id, interval, exclude_appointment_id)? {
+        return Ok(AppointmentAvailability::Unavailable(
+            AppointmentAvailabilityReason::AppointmentConflict,
+        ));
+    }
+    Ok(AppointmentAvailability::Available)
+}
+
+fn appointment_availability_error(reason: AppointmentAvailabilityReason) -> AppError {
+    let code = match reason {
+        AppointmentAvailabilityReason::OutsideWorkingHours => "OUTSIDE_WORKING_HOURS",
+        AppointmentAvailabilityReason::StaffTimeOff => "STAFF_TIME_OFF",
+        AppointmentAvailabilityReason::AppointmentConflict => "APPOINTMENT_CONFLICT",
+    };
+    AppError::Conflict(code.into())
+}
+
 fn assert_no_conflict(
     connection: &Connection,
     staff_id: &str,
@@ -1310,6 +1758,17 @@ fn create_appointment_tx(
         return Err(AppError::Validation(
             "APPOINTMENT_NO_SHOW_TOO_EARLY".to_string(),
         ));
+    }
+    if status != APPOINTMENT_STATUS_CANCELLED {
+        let interval = AppointmentInterval {
+            start_at_utc: start,
+            end_at_utc: end,
+        };
+        if let AppointmentAvailability::Unavailable(reason) =
+            check_staff_appointment_availability(&tx, &input.staff_id, &interval, None)?
+        {
+            return Err(appointment_availability_error(reason));
+        }
     }
     if matches!(status.as_str(), "planned" | "confirmed" | "completed") {
         assert_no_conflict(&tx, &input.staff_id, &start_iso, &end_iso, None)?;
@@ -1366,6 +1825,17 @@ fn update_appointment_tx(
         return Err(AppError::Validation(
             "APPOINTMENT_NO_SHOW_TOO_EARLY".to_string(),
         ));
+    }
+    if status != APPOINTMENT_STATUS_CANCELLED {
+        let interval = AppointmentInterval {
+            start_at_utc: start,
+            end_at_utc: end,
+        };
+        if let AppointmentAvailability::Unavailable(reason) =
+            check_staff_appointment_availability(&tx, &input.staff_id, &interval, Some(id))?
+        {
+            return Err(appointment_availability_error(reason));
+        }
     }
     if matches!(status.as_str(), "planned" | "confirmed" | "completed") {
         assert_no_conflict(&tx, &input.staff_id, &start_iso, &end_iso, Some(id))?;
@@ -1431,7 +1901,9 @@ fn list_appointment_services(
             service_id: row.get(0)?,
             service_name_snapshot: row.get(1)?,
             duration_minutes_snapshot: row.get(2)?,
-            listed_price_snapshot_minor: row.get(3)?, charged_price_minor: row.get(4)?, sort_order: row.get(5)?,
+            listed_price_snapshot_minor: row.get(3)?,
+            charged_price_minor: row.get(4)?,
+            sort_order: row.get(5)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1439,21 +1911,46 @@ fn list_appointment_services(
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ServiceStatistic { service_id: String, service_name_snapshot: String, completed_count: i64, revenue_minor: i64 }
+pub struct ServiceStatistic {
+    service_id: String,
+    service_name_snapshot: String,
+    completed_count: i64,
+    revenue_minor: i64,
+}
 
-fn set_appointment_service_charged_price(connection: &Connection, appointment_id: &str, service_id: &str, charged_price_minor: i64) -> Result<(), AppError> {
-    if charged_price_minor < 0 { return Err(AppError::Validation("chargedPriceMinor invalid".into())); }
+fn set_appointment_service_charged_price(
+    connection: &Connection,
+    appointment_id: &str,
+    service_id: &str,
+    charged_price_minor: i64,
+) -> Result<(), AppError> {
+    if charged_price_minor < 0 {
+        return Err(AppError::Validation("chargedPriceMinor invalid".into()));
+    }
     let changed = connection.execute("UPDATE appointment_services SET charged_price_minor=?1 WHERE appointment_id=?2 AND service_id=?3", params![charged_price_minor, appointment_id, service_id])?;
-    if changed == 0 { return Err(AppError::NotFound("APPOINTMENT_SERVICE_NOT_FOUND".into())); }
+    if changed == 0 {
+        return Err(AppError::NotFound("APPOINTMENT_SERVICE_NOT_FOUND".into()));
+    }
     Ok(())
 }
 
-fn service_statistics_tx(connection: &Connection, start_date: &str, end_date: &str) -> Result<Vec<ServiceStatistic>, AppError> {
+fn service_statistics_tx(
+    connection: &Connection,
+    start_date: &str,
+    end_date: &str,
+) -> Result<Vec<ServiceStatistic>, AppError> {
     let start = utc_iso(local_to_utc(start_date, "00:00")?);
     let end = utc_iso(local_to_utc(end_date, "00:00")? + Duration::days(1));
     let mut statement = connection.prepare("SELECT aps.service_id, aps.service_name_snapshot, COUNT(*), COALESCE(SUM(aps.charged_price_minor),0) FROM appointment_services aps JOIN appointments a ON a.id=aps.appointment_id WHERE a.status='completed' AND a.start_at_utc>=?1 AND a.start_at_utc<?2 GROUP BY aps.service_id, aps.service_name_snapshot ORDER BY aps.service_name_snapshot")?;
-    let rows = statement.query_map(params![start,end], |row| Ok(ServiceStatistic { service_id: row.get(0)?, service_name_snapshot: row.get(1)?, completed_count: row.get(2)?, revenue_minor: row.get(3)? }))?;
-    rows.collect::<Result<Vec<_>,_>>().map_err(Into::into)
+    let rows = statement.query_map(params![start, end], |row| {
+        Ok(ServiceStatistic {
+            service_id: row.get(0)?,
+            service_name_snapshot: row.get(1)?,
+            completed_count: row.get(2)?,
+            revenue_minor: row.get(3)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 fn get_appointment(connection: &Connection, id: &str) -> Result<AppointmentSummary, AppError> {
@@ -2123,6 +2620,74 @@ fn staff_set_services(
 }
 
 #[tauri::command]
+fn staff_working_hours_list(
+    staff_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<StaffWorkingHour>, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    list_staff_working_hours(&connection, &staff_id)
+}
+
+#[tauri::command]
+fn staff_working_hours_set(
+    staff_id: String,
+    intervals: Vec<StaffWorkingHour>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), AppError> {
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    replace_staff_working_hours(&mut connection, &staff_id, intervals)
+}
+
+#[tauri::command]
+fn staff_schedule_is_unrestricted(
+    staff_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    is_staff_schedule_unrestricted(&connection, &staff_id)
+}
+
+#[tauri::command]
+fn staff_time_off_list(
+    staff_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<StaffTimeOff>, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    list_staff_time_off(&connection, &staff_id)
+}
+
+#[tauri::command]
+fn staff_time_off_add(
+    staff_id: String,
+    input: StaffTimeOffInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<StaffTimeOff, AppError> {
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    add_staff_time_off(&mut connection, &staff_id, input)
+}
+
+#[tauri::command]
+fn staff_time_off_update(
+    staff_id: String,
+    time_off_id: String,
+    input: StaffTimeOffInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<StaffTimeOff, AppError> {
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    update_staff_time_off(&mut connection, &staff_id, &time_off_id, input)
+}
+
+#[tauri::command]
+fn staff_time_off_remove(
+    staff_id: String,
+    time_off_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), AppError> {
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    remove_staff_time_off(&mut connection, &staff_id, &time_off_id)
+}
+
+#[tauri::command]
 fn service_category_create(
     input: CategoryInput,
     state: tauri::State<'_, AppState>,
@@ -2191,13 +2756,27 @@ fn appointment_update(
 }
 
 #[tauri::command]
-fn appointment_service_set_charged_price(appointment_id: String, service_id: String, charged_price_minor: i64, state: tauri::State<'_, AppState>) -> Result<(), AppError> {
+fn appointment_service_set_charged_price(
+    appointment_id: String,
+    service_id: String,
+    charged_price_minor: i64,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    set_appointment_service_charged_price(&connection, &appointment_id, &service_id, charged_price_minor)
+    set_appointment_service_charged_price(
+        &connection,
+        &appointment_id,
+        &service_id,
+        charged_price_minor,
+    )
 }
 
 #[tauri::command]
-fn service_statistics(start_date: String, end_date: String, state: tauri::State<'_, AppState>) -> Result<Vec<ServiceStatistic>, AppError> {
+fn service_statistics(
+    start_date: String,
+    end_date: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<ServiceStatistic>, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     service_statistics_tx(&connection, &start_date, &end_date)
 }
@@ -2878,6 +3457,13 @@ pub fn run() {
             staff_set_active,
             staff_list,
             staff_set_services,
+            staff_working_hours_list,
+            staff_working_hours_set,
+            staff_schedule_is_unrestricted,
+            staff_time_off_list,
+            staff_time_off_add,
+            staff_time_off_update,
+            staff_time_off_remove,
             service_category_create,
             service_create,
             service_update,
@@ -2972,6 +3558,37 @@ mod tests {
         .expect("service");
         set_staff_services_tx(connection, &staff.id, vec![service.id.clone()]).expect("assign");
         (customer, staff, service)
+    }
+
+    fn appointment_input(
+        customer_id: &str,
+        staff_id: &str,
+        local_date: &str,
+        local_start_time: &str,
+        service_ids: Vec<String>,
+        status: &str,
+    ) -> AppointmentInput {
+        AppointmentInput {
+            customer_id: customer_id.into(),
+            staff_id: staff_id.into(),
+            local_date: local_date.into(),
+            local_start_time: local_start_time.into(),
+            service_ids,
+            status: Some(status.into()),
+            note: None,
+        }
+    }
+
+    fn configure_daily_hours(connection: &mut Connection, staff_id: &str) {
+        let intervals = (0..=6)
+            .map(|weekday| StaffWorkingHour {
+                staff_id: staff_id.into(),
+                weekday,
+                start_minute: 540,
+                end_minute: 1080,
+            })
+            .collect();
+        replace_staff_working_hours(connection, staff_id, intervals).expect("daily hours");
     }
 
     #[test]
@@ -4588,9 +5205,32 @@ mod tests {
         ).expect("v13 fixture");
         drop(old);
         let connection = open_database(&path).expect("migrate v13");
-        assert_eq!(read_schema_version(&connection).expect("version"), 15);
-        assert_eq!(connection.query_row("SELECT COUNT(*) FROM services WHERE default_price_minor <> 0", [], |row| row.get::<_, i64>(0)).expect("service defaults"), 0);
+        assert_eq!(read_schema_version(&connection).expect("version"), 16);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM services WHERE default_price_minor <> 0",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("service defaults"),
+            0
+        );
         assert_eq!(connection.query_row("SELECT COUNT(*) FROM appointment_services WHERE listed_price_snapshot_minor <> 0 OR charged_price_minor <> 0", [], |row| row.get::<_, i64>(0)).expect("snapshot defaults"), 0);
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM staff_working_hours", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("working hours empty"),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM staff_time_off", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("time off empty"),
+            0
+        );
         assert_eq!(
             connection
                 .query_row("SELECT COUNT(*) FROM customers", [], |row| row
@@ -4639,7 +5279,7 @@ mod tests {
         let reopened = open_database(&path).expect("restart safe");
         assert_eq!(
             read_schema_version(&reopened).expect("version after restart"),
-            15
+            16
         );
         assert!(integrity_check(&reopened).expect("integrity after restart"));
     }
@@ -5015,6 +5655,1108 @@ mod tests {
         drop(guard1);
         let guard3 = try_acquire_google_connect_guard().expect("third acquire after drop");
         drop(guard3);
+    }
+
+    #[test]
+    fn weekly_hours_repository_replaces_only_valid_staff_schedule() {
+        let (_temp, mut connection) = open_temp();
+        let (_customer, staff, _service) = seed_core(&mut connection);
+        assert!(list_staff_working_hours(&connection, &staff.id)
+            .expect("empty")
+            .is_empty());
+        assert!(is_staff_schedule_unrestricted(&connection, &staff.id).expect("unrestricted"));
+        let first = vec![
+            StaffWorkingHour {
+                staff_id: staff.id.clone(),
+                weekday: 1,
+                start_minute: 540,
+                end_minute: 720,
+            },
+            StaffWorkingHour {
+                staff_id: staff.id.clone(),
+                weekday: 1,
+                start_minute: 780,
+                end_minute: 1080,
+            },
+        ];
+        replace_staff_working_hours(&mut connection, &staff.id, first.clone()).expect("replace");
+        assert_eq!(
+            list_staff_working_hours(&connection, &staff.id).expect("list"),
+            first
+        );
+        assert!(!is_staff_schedule_unrestricted(&connection, &staff.id).expect("configured"));
+        let second = vec![StaffWorkingHour {
+            staff_id: staff.id.clone(),
+            weekday: 2,
+            start_minute: 600,
+            end_minute: 1020,
+        }];
+        replace_staff_working_hours(&mut connection, &staff.id, second.clone())
+            .expect("replace second");
+        assert_eq!(
+            list_staff_working_hours(&connection, &staff.id).expect("list second"),
+            second
+        );
+        let invalid = vec![StaffWorkingHour {
+            staff_id: staff.id.clone(),
+            weekday: 7,
+            start_minute: 600,
+            end_minute: 600,
+        }];
+        assert!(replace_staff_working_hours(&mut connection, &staff.id, invalid).is_err());
+        assert_eq!(
+            list_staff_working_hours(&connection, &staff.id).expect("unchanged after invalid"),
+            second
+        );
+        let adjacent = vec![
+            StaffWorkingHour {
+                staff_id: staff.id.clone(),
+                weekday: 3,
+                start_minute: 540,
+                end_minute: 720,
+            },
+            StaffWorkingHour {
+                staff_id: staff.id.clone(),
+                weekday: 3,
+                start_minute: 720,
+                end_minute: 900,
+            },
+            StaffWorkingHour {
+                staff_id: staff.id.clone(),
+                weekday: 4,
+                start_minute: 600,
+                end_minute: 840,
+            },
+        ];
+        replace_staff_working_hours(&mut connection, &staff.id, adjacent.clone())
+            .expect("adjacent");
+        assert_eq!(
+            list_staff_working_hours(&connection, &staff.id).expect("adjacent list"),
+            adjacent
+        );
+        let overlap = vec![
+            StaffWorkingHour {
+                staff_id: staff.id.clone(),
+                weekday: 5,
+                start_minute: 540,
+                end_minute: 720,
+            },
+            StaffWorkingHour {
+                staff_id: staff.id.clone(),
+                weekday: 5,
+                start_minute: 690,
+                end_minute: 840,
+            },
+        ];
+        assert!(replace_staff_working_hours(&mut connection, &staff.id, overlap).is_err());
+        assert_eq!(
+            list_staff_working_hours(&connection, &staff.id).expect("unchanged after overlap"),
+            adjacent
+        );
+    }
+
+    #[test]
+    fn staff_working_hour_serializes_for_tauri_command_payload() {
+        let value = serde_json::to_value(StaffWorkingHour {
+            staff_id: "staff-1".into(),
+            weekday: 1,
+            start_minute: 540,
+            end_minute: 720,
+        })
+        .expect("serialize working hour");
+
+        assert_eq!(value["staffId"], "staff-1");
+        assert_eq!(value["weekday"], 1);
+        assert_eq!(value["startMinute"], 540);
+        assert_eq!(value["endMinute"], 720);
+    }
+
+    #[test]
+    fn staff_time_off_repository_enforces_full_day_and_partial_domain_rules() {
+        let (_temp, mut connection) = open_temp();
+        let (_customer, staff, _service) = seed_core(&mut connection);
+        let other_staff = create_staff_tx(
+            &mut connection,
+            StaffInput {
+                first_name: "Other".into(),
+                last_name: None,
+                phone: None,
+                specialty_note: None,
+                color_key: "blue".into(),
+                is_active: Some(true),
+            },
+        )
+        .expect("other staff");
+        let full_day = StaffTimeOffInput {
+            local_date: "2026-10-01".into(),
+            full_day: true,
+            start_minute: None,
+            end_minute: None,
+        };
+        let full_day_record =
+            add_staff_time_off(&mut connection, &staff.id, full_day).expect("add full day");
+        assert!(full_day_record.full_day);
+        assert_eq!(
+            list_staff_time_off(&connection, &staff.id).expect("list full day"),
+            vec![full_day_record.clone()]
+        );
+        assert!(add_staff_time_off(
+            &mut connection,
+            &staff.id,
+            StaffTimeOffInput {
+                local_date: "2026-10-01".into(),
+                full_day: true,
+                start_minute: None,
+                end_minute: None,
+            },
+        )
+        .is_err());
+        assert!(add_staff_time_off(
+            &mut connection,
+            &staff.id,
+            StaffTimeOffInput {
+                local_date: "2026-10-01".into(),
+                full_day: false,
+                start_minute: Some(780),
+                end_minute: Some(900),
+            },
+        )
+        .is_err());
+        let updated_full_day = update_staff_time_off(
+            &mut connection,
+            &staff.id,
+            &full_day_record.id,
+            StaffTimeOffInput {
+                local_date: "2026-10-02".into(),
+                full_day: true,
+                start_minute: None,
+                end_minute: None,
+            },
+        )
+        .expect("update full day");
+        assert_eq!(updated_full_day.local_date, "2026-10-02");
+
+        let partial_input = StaffTimeOffInput {
+            local_date: "2026-10-03".into(),
+            full_day: false,
+            start_minute: Some(780),
+            end_minute: Some(900),
+        };
+        let partial = add_staff_time_off(&mut connection, &staff.id, partial_input.clone())
+            .expect("add partial");
+        assert_eq!(partial.start_minute, Some(780));
+        assert_eq!(partial.end_minute, Some(900));
+        let self_updated = update_staff_time_off(
+            &mut connection,
+            &staff.id,
+            &partial.id,
+            partial_input.clone(),
+        )
+        .expect("update excludes itself");
+        assert_eq!(self_updated, partial);
+        let adjacent = add_staff_time_off(
+            &mut connection,
+            &staff.id,
+            StaffTimeOffInput {
+                local_date: "2026-10-03".into(),
+                full_day: false,
+                start_minute: Some(900),
+                end_minute: Some(960),
+            },
+        )
+        .expect("adjacent partial");
+        assert!(add_staff_time_off(
+            &mut connection,
+            &staff.id,
+            StaffTimeOffInput {
+                local_date: "2026-10-03".into(),
+                full_day: false,
+                start_minute: Some(870),
+                end_minute: Some(930),
+            },
+        )
+        .is_err());
+        assert!(add_staff_time_off(
+            &mut connection,
+            &staff.id,
+            StaffTimeOffInput {
+                local_date: "2026-10-03".into(),
+                full_day: true,
+                start_minute: None,
+                end_minute: None,
+            },
+        )
+        .is_err());
+        assert!(add_staff_time_off(
+            &mut connection,
+            &staff.id,
+            StaffTimeOffInput {
+                local_date: "2026-10-04".into(),
+                full_day: false,
+                start_minute: Some(960),
+                end_minute: Some(960),
+            },
+        )
+        .is_err());
+        assert!(add_staff_time_off(
+            &mut connection,
+            &staff.id,
+            StaffTimeOffInput {
+                local_date: "2026-10-04".into(),
+                full_day: true,
+                start_minute: Some(600),
+                end_minute: Some(720),
+            },
+        )
+        .is_err());
+        let invalid_update = update_staff_time_off(
+            &mut connection,
+            &staff.id,
+            &partial.id,
+            StaffTimeOffInput {
+                local_date: "2026-10-03".into(),
+                full_day: false,
+                start_minute: Some(950),
+                end_minute: Some(900),
+            },
+        );
+        assert!(invalid_update.is_err());
+        assert_eq!(
+            get_staff_time_off(&connection, &staff.id, &partial.id).expect("read partial"),
+            Some(partial.clone())
+        );
+        assert!(add_staff_time_off(
+            &mut connection,
+            &other_staff.id,
+            StaffTimeOffInput {
+                local_date: "2026-10-03".into(),
+                full_day: true,
+                start_minute: None,
+                end_minute: None,
+            },
+        )
+        .is_ok());
+        assert!(add_staff_time_off(
+            &mut connection,
+            &staff.id,
+            StaffTimeOffInput {
+                local_date: "2026-10-05".into(),
+                full_day: false,
+                start_minute: Some(780),
+                end_minute: Some(900),
+            },
+        )
+        .is_ok());
+        remove_staff_time_off(&mut connection, &staff.id, &adjacent.id).expect("remove target");
+        assert!(get_staff_time_off(&connection, &staff.id, &adjacent.id)
+            .expect("removed")
+            .is_none());
+        assert_eq!(
+            get_staff_time_off(&connection, &staff.id, &partial.id).expect("other retained"),
+            Some(partial)
+        );
+    }
+
+    #[test]
+    fn staff_time_off_tauri_dtos_use_typed_camel_case_fields() {
+        let input: StaffTimeOffInput = serde_json::from_value(serde_json::json!({
+            "localDate": "2026-10-03",
+            "fullDay": false,
+            "startMinute": 780,
+            "endMinute": 900
+        }))
+        .expect("deserialize command input");
+        assert_eq!(input.local_date, "2026-10-03");
+        assert!(!input.full_day);
+        assert_eq!(input.start_minute, Some(780));
+        assert_eq!(input.end_minute, Some(900));
+
+        let value = serde_json::to_value(StaffTimeOff {
+            id: "time-off-1".into(),
+            staff_id: "staff-1".into(),
+            local_date: "2026-10-03".into(),
+            full_day: false,
+            start_minute: Some(780),
+            end_minute: Some(900),
+        })
+        .expect("serialize command output");
+        assert_eq!(value["id"], "time-off-1");
+        assert_eq!(value["staffId"], "staff-1");
+        assert_eq!(value["localDate"], "2026-10-03");
+        assert_eq!(value["fullDay"], false);
+        assert_eq!(value["startMinute"], 780);
+        assert_eq!(value["endMinute"], 900);
+    }
+
+    #[test]
+    fn appointment_availability_core_uses_historical_durations_and_sql_conflicts() {
+        let (_temp, mut connection) = open_temp();
+        let (customer, staff, service) = seed_core(&mut connection);
+        let category_id = service.category_id.clone();
+        let second_service = create_service_tx(
+            &connection,
+            ServiceInput {
+                category_id: category_id.clone(),
+                name: "Ek Bakim".into(),
+                duration_minutes: Some(45),
+                default_price_minor: Some(0),
+                is_active: Some(true),
+            },
+        )
+        .expect("second service");
+        set_staff_services_tx(
+            &mut connection,
+            &staff.id,
+            vec![service.id.clone(), second_service.id.clone()],
+        )
+        .expect("assign services");
+        let appointment = create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id.clone(),
+                staff_id: staff.id.clone(),
+                local_date: "2036-10-05".into(),
+                local_start_time: "10:00".into(),
+                service_ids: vec![service.id.clone()],
+                status: Some("planned".into()),
+                note: None,
+            },
+        )
+        .expect("single-service appointment");
+        assert_eq!(
+            appointment_duration_minutes(&connection, &appointment.id).expect("single duration"),
+            30
+        );
+        let multi_service = create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id.clone(),
+                staff_id: staff.id.clone(),
+                local_date: "2036-10-06".into(),
+                local_start_time: "10:00".into(),
+                service_ids: vec![service.id.clone(), second_service.id.clone()],
+                status: Some("planned".into()),
+                note: None,
+            },
+        )
+        .expect("multi-service appointment");
+        assert_eq!(
+            appointment_duration_minutes(&connection, &multi_service.id).expect("multi duration"),
+            75
+        );
+        update_service_tx(
+            &connection,
+            &service.id,
+            ServiceInput {
+                category_id: category_id.clone(),
+                name: "Klasik Bakim Yeni".into(),
+                duration_minutes: Some(60),
+                default_price_minor: Some(0),
+                is_active: Some(true),
+            },
+        )
+        .expect("edit current duration");
+        assert_eq!(
+            appointment_duration_minutes(&connection, &appointment.id)
+                .expect("historical single duration"),
+            30
+        );
+        assert_eq!(
+            appointment_duration_minutes(&connection, &multi_service.id)
+                .expect("historical multi duration"),
+            75
+        );
+
+        let adjacent =
+            appointment_interval_from_local("2036-10-05", "10:30", 30).expect("adjacent interval");
+        assert!(
+            !staff_has_appointment_conflict(&connection, &staff.id, &adjacent, None)
+                .expect("adjacent query")
+        );
+        for (time, duration) in [("10:15", 30), ("09:45", 60), ("10:05", 10)] {
+            let interval = appointment_interval_from_local("2036-10-05", time, duration)
+                .expect("overlapping interval");
+            assert!(
+                staff_has_appointment_conflict(&connection, &staff.id, &interval, None)
+                    .expect("overlap query")
+            );
+        }
+        let exact =
+            appointment_interval_from_local("2036-10-05", "10:00", 30).expect("exact interval");
+        assert!(!staff_has_appointment_conflict(
+            &connection,
+            &staff.id,
+            &exact,
+            Some(&appointment.id),
+        )
+        .expect("exclude self"));
+        let other_staff = create_staff_tx(
+            &mut connection,
+            StaffInput {
+                first_name: "Derya".into(),
+                last_name: None,
+                phone: None,
+                specialty_note: None,
+                color_key: "blue".into(),
+                is_active: Some(true),
+            },
+        )
+        .expect("other staff");
+        assert!(
+            !staff_has_appointment_conflict(&connection, &other_staff.id, &exact, None)
+                .expect("different staff")
+        );
+        connection
+            .execute(
+                "UPDATE appointments SET status='cancelled' WHERE id=?1",
+                params![appointment.id],
+            )
+            .expect("cancel appointment");
+        assert!(
+            !staff_has_appointment_conflict(&connection, &staff.id, &exact, None)
+                .expect("cancelled does not block")
+        );
+        connection
+            .execute(
+                "UPDATE appointments SET status='no_show' WHERE id=?1",
+                params![appointment.id],
+            )
+            .expect("mark no show");
+        assert!(
+            staff_has_appointment_conflict(&connection, &staff.id, &exact, None)
+                .expect("non-cancelled blocks")
+        );
+    }
+
+    #[test]
+    fn appointment_availability_core_applies_working_hours_and_time_off() {
+        let (_temp, mut connection) = open_temp();
+        let (_customer, staff, _service) = seed_core(&mut connection);
+        let working_date = NaiveDate::from_ymd_opt(2036, 10, 7).expect("working date");
+        let weekday = i64::from(working_date.weekday().num_days_from_monday());
+        replace_staff_working_hours(
+            &mut connection,
+            &staff.id,
+            vec![
+                StaffWorkingHour {
+                    staff_id: staff.id.clone(),
+                    weekday,
+                    start_minute: 540,
+                    end_minute: 720,
+                },
+                StaffWorkingHour {
+                    staff_id: staff.id.clone(),
+                    weekday,
+                    start_minute: 780,
+                    end_minute: 1080,
+                },
+            ],
+        )
+        .expect("schedule");
+        for (time, duration, expected) in [
+            ("09:00", 30, AppointmentAvailability::Available),
+            (
+                "08:45",
+                30,
+                AppointmentAvailability::Unavailable(
+                    AppointmentAvailabilityReason::OutsideWorkingHours,
+                ),
+            ),
+            (
+                "17:30",
+                60,
+                AppointmentAvailability::Unavailable(
+                    AppointmentAvailabilityReason::OutsideWorkingHours,
+                ),
+            ),
+            (
+                "11:30",
+                60,
+                AppointmentAvailability::Unavailable(
+                    AppointmentAvailabilityReason::OutsideWorkingHours,
+                ),
+            ),
+            ("13:00", 60, AppointmentAvailability::Available),
+        ] {
+            let interval = appointment_interval_from_local("2036-10-07", time, duration)
+                .expect("scheduled interval");
+            assert_eq!(
+                check_staff_appointment_availability(&connection, &staff.id, &interval, None)
+                    .expect("availability"),
+                expected
+            );
+        }
+        let unscheduled_day =
+            appointment_interval_from_local("2036-10-08", "10:00", 30).expect("unscheduled day");
+        assert_eq!(
+            check_staff_appointment_availability(&connection, &staff.id, &unscheduled_day, None)
+                .expect("weekday availability"),
+            AppointmentAvailability::Unavailable(
+                AppointmentAvailabilityReason::OutsideWorkingHours,
+            )
+        );
+
+        add_staff_time_off(
+            &mut connection,
+            &staff.id,
+            StaffTimeOffInput {
+                local_date: "2036-10-07".into(),
+                full_day: true,
+                start_minute: None,
+                end_minute: None,
+            },
+        )
+        .expect("full day leave");
+        let full_day_interval =
+            appointment_interval_from_local("2036-10-07", "09:00", 30).expect("full day interval");
+        assert_eq!(
+            check_staff_appointment_availability(&connection, &staff.id, &full_day_interval, None)
+                .expect("full day availability"),
+            AppointmentAvailability::Unavailable(AppointmentAvailabilityReason::StaffTimeOff)
+        );
+        let full_day_time_off_id = list_staff_time_off(&connection, &staff.id).expect("leaves")[0]
+            .id
+            .clone();
+        remove_staff_time_off(&mut connection, &staff.id, &full_day_time_off_id)
+            .expect("remove full day");
+        let next_week = "2036-10-14";
+        add_staff_time_off(
+            &mut connection,
+            &staff.id,
+            StaffTimeOffInput {
+                local_date: next_week.into(),
+                full_day: false,
+                start_minute: Some(780),
+                end_minute: Some(900),
+            },
+        )
+        .expect("partial leave");
+        let partial_overlap =
+            appointment_interval_from_local(next_week, "14:30", 30).expect("partial overlap");
+        assert_eq!(
+            check_staff_appointment_availability(&connection, &staff.id, &partial_overlap, None)
+                .expect("partial availability"),
+            AppointmentAvailability::Unavailable(AppointmentAvailabilityReason::StaffTimeOff)
+        );
+        let partial_adjacent =
+            appointment_interval_from_local(next_week, "15:00", 30).expect("partial adjacent");
+        assert_eq!(
+            check_staff_appointment_availability(&connection, &staff.id, &partial_adjacent, None)
+                .expect("partial adjacency"),
+            AppointmentAvailability::Available
+        );
+    }
+
+    #[test]
+    fn appointment_create_enforces_availability_without_local_or_outbox_side_effects() {
+        let (_temp, mut connection) = open_temp();
+        let (customer, staff, service) = seed_core(&mut connection);
+        configure_daily_hours(&mut connection, &staff.id);
+        let valid = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-10-20",
+                "09:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("valid create");
+        let appointments_before: i64 = connection
+            .query_row("SELECT COUNT(*) FROM appointments", [], |row| row.get(0))
+            .expect("appointment count");
+        let services_before: i64 = connection
+            .query_row("SELECT COUNT(*) FROM appointment_services", [], |row| {
+                row.get(0)
+            })
+            .expect("appointment service count");
+        let google_outbox_before: i64 = connection
+            .query_row("SELECT COUNT(*) FROM google_calendar_outbox", [], |row| {
+                row.get(0)
+            })
+            .expect("google outbox count");
+        let cloud_outbox_before: i64 = connection
+            .query_row("SELECT COUNT(*) FROM reminder_cloud_outbox", [], |row| {
+                row.get(0)
+            })
+            .expect("cloud outbox count");
+        assert!(create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-10-20",
+                "08:30",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .is_err());
+        assert!(create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-10-20",
+                "09:15",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .is_err());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM appointments", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("unchanged appointments"),
+            appointments_before
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM appointment_services", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("unchanged services"),
+            services_before
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM google_calendar_outbox", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("unchanged google outbox"),
+            google_outbox_before
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM reminder_cloud_outbox", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("unchanged cloud outbox"),
+            cloud_outbox_before
+        );
+        add_staff_time_off(
+            &mut connection,
+            &staff.id,
+            StaffTimeOffInput {
+                local_date: "2036-10-20".into(),
+                full_day: false,
+                start_minute: Some(780),
+                end_minute: Some(840),
+            },
+        )
+        .expect("time off");
+        assert!(create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-10-20",
+                "13:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .is_err());
+        let adjacent = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-10-20",
+                "09:30",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("adjacent create");
+        assert_ne!(adjacent.id, valid.id);
+        let other_staff = create_staff_tx(
+            &mut connection,
+            StaffInput {
+                first_name: "Mina".into(),
+                last_name: None,
+                phone: None,
+                specialty_note: None,
+                color_key: "blue".into(),
+                is_active: Some(true),
+            },
+        )
+        .expect("other staff");
+        set_staff_services_tx(&mut connection, &other_staff.id, vec![service.id.clone()])
+            .expect("assign other staff");
+        assert!(create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &other_staff.id,
+                "2036-10-20",
+                "09:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn appointment_update_enforces_availability_and_preserves_failed_updates() {
+        let (_temp, mut connection) = open_temp();
+        let (customer, staff, service) = seed_core(&mut connection);
+        configure_daily_hours(&mut connection, &staff.id);
+        let long_service = create_service_tx(
+            &connection,
+            ServiceInput {
+                category_id: service.category_id.clone(),
+                name: "Uzun Bakim".into(),
+                duration_minutes: Some(60),
+                default_price_minor: Some(0),
+                is_active: Some(true),
+            },
+        )
+        .expect("long service");
+        set_staff_services_tx(
+            &mut connection,
+            &staff.id,
+            vec![service.id.clone(), long_service.id.clone()],
+        )
+        .expect("assign long service");
+        let first = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-10-21",
+                "09:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("first appointment");
+        let second = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-10-21",
+                "10:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("second appointment");
+        let moved = update_appointment_tx(
+            &mut connection,
+            &first.id,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-10-21",
+                "09:30",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("valid reschedule");
+        assert_eq!(
+            moved.start_at_utc,
+            utc_iso(local_to_utc("2036-10-21", "09:30").unwrap())
+        );
+        let before_failed_update = get_appointment(&connection, &first.id).expect("before failure");
+        let snapshots_before =
+            list_appointment_services(&connection, &first.id).expect("snapshots before");
+        assert!(update_appointment_tx(
+            &mut connection,
+            &first.id,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-10-21",
+                "10:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .is_err());
+        assert_eq!(
+            get_appointment(&connection, &first.id)
+                .expect("after conflict")
+                .start_at_utc,
+            before_failed_update.start_at_utc
+        );
+        assert_eq!(
+            list_appointment_services(&connection, &first.id).expect("snapshots after conflict"),
+            snapshots_before
+        );
+        let other_staff = create_staff_tx(
+            &mut connection,
+            StaffInput {
+                first_name: "Ece".into(),
+                last_name: None,
+                phone: None,
+                specialty_note: None,
+                color_key: "teal".into(),
+                is_active: Some(true),
+            },
+        )
+        .expect("other staff");
+        set_staff_services_tx(&mut connection, &other_staff.id, vec![service.id.clone()])
+            .expect("assign other staff");
+        let other_appointment = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &other_staff.id,
+                "2036-10-21",
+                "11:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("other appointment");
+        assert!(update_appointment_tx(
+            &mut connection,
+            &first.id,
+            appointment_input(
+                &customer.id,
+                &other_staff.id,
+                "2036-10-21",
+                "11:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .is_err());
+        assert_eq!(
+            get_appointment(&connection, &first.id)
+                .expect("staff preserved")
+                .staff_id,
+            staff.id
+        );
+        add_staff_time_off(
+            &mut connection,
+            &staff.id,
+            StaffTimeOffInput {
+                local_date: "2036-10-22".into(),
+                full_day: true,
+                start_minute: None,
+                end_minute: None,
+            },
+        )
+        .expect("leave");
+        assert!(update_appointment_tx(
+            &mut connection,
+            &first.id,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-10-22",
+                "09:30",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .is_err());
+        assert!(update_appointment_tx(
+            &mut connection,
+            &first.id,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-10-21",
+                "09:30",
+                vec![service.id.clone(), long_service.id.clone()],
+                "planned",
+            ),
+        )
+        .is_err());
+        let service_change = update_appointment_tx(
+            &mut connection,
+            &first.id,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-10-21",
+                "13:00",
+                vec![service.id.clone(), long_service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("valid longer composition");
+        assert_eq!(
+            appointment_duration_minutes(&connection, &service_change.id).expect("new duration"),
+            90
+        );
+        let self_update = update_appointment_tx(
+            &mut connection,
+            &first.id,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-10-21",
+                "13:00",
+                vec![service.id.clone(), long_service.id.clone()],
+                "planned",
+            ),
+        );
+        assert!(self_update.is_ok());
+        let cancelled = update_appointment_tx(
+            &mut connection,
+            &second.id,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-10-21",
+                "10:00",
+                vec![service.id.clone()],
+                APPOINTMENT_STATUS_CANCELLED,
+            ),
+        )
+        .expect("cancel releases slot");
+        assert_eq!(cancelled.status, APPOINTMENT_STATUS_CANCELLED);
+        let replacement = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-10-21",
+                "10:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("cancelled slot available");
+        assert_ne!(replacement.id, second.id);
+        assert!(update_appointment_tx(
+            &mut connection,
+            &second.id,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-10-21",
+                "10:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .is_err());
+        assert_eq!(
+            get_appointment(&connection, &second.id)
+                .expect("cancelled state retained")
+                .status,
+            APPOINTMENT_STATUS_CANCELLED
+        );
+        assert_eq!(other_appointment.staff_id, other_staff.id);
+    }
+
+    #[test]
+    fn availability_queries_use_staff_indexes_at_ten_thousand_appointment_scale() {
+        let (_temp, mut connection) = open_temp();
+        let (customer, staff, service) = seed_core(&mut connection);
+        configure_daily_hours(&mut connection, &staff.id);
+        let base = chrono::DateTime::parse_from_rfc3339("2036-01-01T06:00:00Z")
+            .expect("base timestamp")
+            .with_timezone(&Utc);
+        let time_off_date = NaiveDate::from_ymd_opt(2037, 1, 1).expect("time off base");
+        let tx = connection.transaction().expect("scale transaction");
+        for index in 0..10_000_i64 {
+            let appointment_id = format!("scale-appointment-{index}");
+            let start_at = utc_iso(base + Duration::minutes(index * 30));
+            let end_at = utc_iso(base + Duration::minutes(index * 30 + 30));
+            tx.execute(
+                "INSERT INTO appointments (id, customer_id, staff_id, start_at_utc, end_at_utc, total_duration_minutes, status, note, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 30, 'planned', NULL, ?6, ?6)",
+                params![appointment_id, &customer.id, &staff.id, start_at, end_at, now_iso()],
+            )
+            .expect("scale appointment");
+            tx.execute(
+                "INSERT INTO appointment_services (appointment_id, service_id, service_name_snapshot, duration_minutes_snapshot, listed_price_snapshot_minor, charged_price_minor, sort_order, created_at)
+                 VALUES (?1, ?2, 'Scale', 30, 0, 0, 10, ?3)",
+                params![format!("scale-appointment-{index}"), &service.id, now_iso()],
+            )
+            .expect("scale appointment service");
+        }
+        for index in 0..2_000_i64 {
+            let local_date = time_off_date
+                .checked_add_signed(Duration::days(index * 2))
+                .expect("time off date")
+                .format("%Y-%m-%d")
+                .to_string();
+            tx.execute(
+                "INSERT INTO staff_time_off (id, staff_id, local_date, full_day, start_minute, end_minute)
+                 VALUES (?1, ?2, ?3, 0, 540, 570)",
+                params![format!("scale-time-off-{index}"), &staff.id, local_date],
+            )
+            .expect("scale time off");
+        }
+        tx.commit().expect("commit scale data");
+
+        let interval =
+            appointment_interval_from_local("2036-02-01", "10:00", 30).expect("scale interval");
+        assert!(
+            staff_has_appointment_conflict(&connection, &staff.id, &interval, None)
+                .expect("bounded conflict query")
+        );
+        let mut conflict_plan_statement = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT EXISTS(
+                   SELECT 1
+                   FROM appointments a
+                   INNER JOIN appointment_services aps ON aps.appointment_id=a.id
+                   WHERE a.staff_id=?1 AND a.status<>?2 AND (?3 IS NULL OR a.id<>?3)
+                     AND a.start_at_utc<?5
+                   GROUP BY a.id, a.start_at_utc
+                   HAVING julianday(?4) < julianday(a.start_at_utc) + SUM(aps.duration_minutes_snapshot) / 1440.0
+                 )",
+            )
+            .expect("conflict plan statement");
+        let conflict_plan = conflict_plan_statement
+            .query_map(
+                params![
+                    staff.id,
+                    APPOINTMENT_STATUS_CANCELLED,
+                    Option::<String>::None,
+                    utc_iso(interval.start_at_utc),
+                    utc_iso(interval.end_at_utc)
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .expect("conflict plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("conflict plan rows");
+        assert!(
+            conflict_plan
+                .iter()
+                .any(|detail| detail.contains("appointments_staff_time_idx")),
+            "conflict plan did not use staff/time index: {conflict_plan:?}"
+        );
+        let mut time_off_plan_statement = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT EXISTS(
+                   SELECT 1 FROM staff_time_off
+                   WHERE staff_id=?1 AND local_date=?2
+                     AND (full_day=1 OR (start_minute<?4 AND end_minute>?3))
+                 )",
+            )
+            .expect("time off plan statement");
+        let time_off_plan = time_off_plan_statement
+            .query_map(params![staff.id, "2037-01-01", 540, 600], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("time off plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("time off plan rows");
+        assert!(
+            time_off_plan
+                .iter()
+                .any(|detail| detail.contains("staff_time_off_staff_date_idx")),
+            "time off plan did not use staff/date index: {time_off_plan:?}"
+        );
     }
 
     #[test]
