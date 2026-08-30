@@ -1536,7 +1536,7 @@ fn upsert_cloud_outbox(
     connection: &Connection,
     reminder_id: &str,
     action: &str,
-    payload_json: Option<String>,
+    payload: Option<serde_json::Value>,
 ) -> Result<(), AppError> {
     let now = now_iso();
     connection.execute(
@@ -1550,7 +1550,28 @@ fn upsert_cloud_outbox(
         params![reminder_id],
         |row| row.get(0),
     )?;
-    let mutation_id = format!("{reminder_id}:{revision}:{action}");
+    let mutation_id = new_uuid();
+    let payload_json = if action == "upsert" {
+        let mut payload =
+            payload.ok_or_else(|| AppError::Database("CLOUD_PAYLOAD_MISSING".to_string()))?;
+        let object = payload
+            .as_object_mut()
+            .ok_or_else(|| AppError::Database("CLOUD_PAYLOAD_INVALID".to_string()))?;
+        object.insert("apiVersion".to_string(), serde_json::json!(1));
+        object.insert("reminderId".to_string(), serde_json::json!(reminder_id));
+        object.insert("revision".to_string(), serde_json::json!(revision));
+        object.insert(
+            "clientMutationId".to_string(),
+            serde_json::json!(mutation_id),
+        );
+        object.insert("reactivateCancelled".to_string(), serde_json::json!(false));
+        Some(
+            serde_json::to_string(&payload)
+                .map_err(|_| AppError::Database("CLOUD_PAYLOAD_INVALID".to_string()))?,
+        )
+    } else {
+        None
+    };
     let payload_hash = pseudo_hash_64(&format!("{mutation_id}:{:?}", payload_json));
     connection.execute(
         "INSERT INTO reminder_cloud_outbox (id, reminder_id, revision, action, client_mutation_id, payload_json, payload_hash, sync_status, created_at_utc, updated_at_utc)
@@ -1570,7 +1591,7 @@ fn reconcile_reminder_for_appointment(
 ) -> Result<bool, AppError> {
     let row = connection
         .query_row(
-            "SELECT a.start_at_utc, a.status, c.is_active, c.phone, c.whatsapp_reminder_enabled, c.whatsapp_consent_confirmed
+            "SELECT a.start_at_utc, a.status, c.is_active, c.phone, c.whatsapp_reminder_enabled, c.whatsapp_consent_confirmed, c.first_name, c.last_name
              FROM appointments a INNER JOIN customers c ON c.id=a.customer_id WHERE a.id=?1",
             params![appointment_id],
             |row| {
@@ -1581,11 +1602,15 @@ fn reconcile_reminder_for_appointment(
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
             },
         )
         .optional()?;
-    let Some((start_at, status, active, phone, reminder_enabled, consent)) = row else {
+    let Some((start_at, status, active, phone, reminder_enabled, consent, first_name, last_name)) =
+        row
+    else {
         return Ok(false);
     };
     let eligible = matches!(status.as_str(), "planned" | "confirmed")
@@ -1615,13 +1640,39 @@ fn reconcile_reminder_for_appointment(
              DO UPDATE SET scheduled_for_utc=excluded.scheduled_for_utc, status='pending', cancelled_at_utc=NULL, updated_at=excluded.updated_at",
             params![reminder_id, appointment_id, scheduled, now],
         )?;
+        let start = chrono::DateTime::parse_from_rfc3339(&start_at)
+            .map_err(|_| AppError::Validation("appointment start_at invalid".to_string()))?
+            .with_timezone(&Utc)
+            + Duration::minutes(ISTANBUL_OFFSET_MINUTES);
+        let service_summary: String = connection.query_row(
+            "SELECT group_concat(service_name_snapshot, ', ') FROM (SELECT service_name_snapshot FROM appointment_services WHERE appointment_id=?1 ORDER BY sort_order ASC)",
+            params![appointment_id],
+            |row| row.get(0),
+        )?;
+        let recipient = format!(
+            "90{}",
+            normalize_phone(Some(&phone), true)?
+                .ok_or_else(|| AppError::Validation("phone required".to_string()))?
+        );
         upsert_cloud_outbox(
             connection,
             &reminder_id,
             "upsert",
-            Some(format!(
-                r#"{{"appointmentId":"{appointment_id}","scheduledForUtc":"{scheduled}"}}"#
-            )),
+            Some(serde_json::json!({
+                "appointmentId": appointment_id,
+                "scheduledForUtc": scheduled,
+                "recipient": recipient,
+                "template": {
+                    "name": "randevu_hatirlatma",
+                    "language": "tr",
+                    "parameters": [
+                        format!("{} {}", first_name.trim(), last_name.trim()),
+                        start.format("%d.%m.%Y").to_string(),
+                        start.format("%H:%M").to_string(),
+                        service_summary
+                    ]
+                }
+            })),
         )?;
         Ok(true)
     } else if let Some(reminder_id) = existing {
@@ -2589,6 +2640,31 @@ fn cloud_status(
 }
 
 #[tauri::command]
+fn dispatcher_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<services::reminder_cloud::DispatcherStatus, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    let config = supabase_config()?;
+    let protector = services::secure_store::WindowsDpapiProtector;
+    let session = services::secure_store::read_supabase_session(&connection, &protector)?
+        .ok_or_else(|| AppError::Validation("CLOUD_SESSION_MISSING".to_string()))?;
+    let mut transport = services::google::ReqwestHttpTransport;
+    match services::reminder_cloud::read_dispatcher_status(&mut transport, &config, &session) {
+        Ok(status) => Ok(status),
+        Err(AppError::Validation(code)) if code == "CLOUD_AUTH_INVALID" => {
+            let refreshed = services::supabase::refresh_session(
+                &mut transport,
+                &config,
+                &session.refresh_token,
+            )?;
+            services::secure_store::store_supabase_session(&connection, &protector, &refreshed)?;
+            services::reminder_cloud::read_dispatcher_status(&mut transport, &config, &refreshed)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[tauri::command]
 fn cloud_request_otp(email: String, state: tauri::State<'_, AppState>) -> Result<bool, AppError> {
     drop(state);
     let config = supabase_config()?;
@@ -2703,6 +2779,7 @@ pub fn run() {
             google_calendar_sync,
             cloud_connection_status,
             cloud_status,
+            dispatcher_status,
             cloud_request_otp,
             otp_request,
             cloud_verify_otp,
@@ -3623,6 +3700,164 @@ mod tests {
     }
 
     #[test]
+    fn targeted_cloud_outbox_processing_leaves_other_pending_items_untouched() {
+        let (_temp, mut connection) = open_temp();
+        let (mut customer, staff, service) = seed_core(&mut connection);
+        customer = update_customer_tx(
+            &connection,
+            &customer.id,
+            CustomerInput {
+                first_name: customer.first_name,
+                last_name: customer.last_name,
+                phone: "05551112233".into(),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: Some(true),
+                whatsapp_consent_confirmed: Some(true),
+            },
+        )
+        .expect("customer");
+        let appointments = ["2026-09-01", "2026-09-02", "2026-09-03"]
+            .iter()
+            .map(|local_date| {
+                create_appointment_tx(
+                    &mut connection,
+                    AppointmentInput {
+                        customer_id: customer.id.clone(),
+                        staff_id: staff.id.clone(),
+                        local_date: (*local_date).into(),
+                        local_start_time: "10:00".into(),
+                        service_ids: vec![service.id.clone()],
+                        status: Some("confirmed".into()),
+                        note: None,
+                    },
+                )
+                .expect("appointment")
+            })
+            .collect::<Vec<_>>();
+        let ids = appointments
+            .iter()
+            .map(|appointment| {
+                connection
+                    .query_row(
+                        "SELECT id FROM reminder_cloud_outbox WHERE reminder_id=(SELECT id FROM appointment_reminders WHERE appointment_id=?1)",
+                        params![appointment.id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .expect("outbox id")
+            })
+            .collect::<Vec<_>>();
+        let config = services::supabase::SupabaseConfig {
+            project_url: "https://example.supabase.co".into(),
+            publishable_key: "pub-key-with-enough-length".into(),
+        };
+        let session = services::supabase::SupabaseSession {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: None,
+        };
+        let mut transport = services::google::FakeHttpTransport::new(vec![
+            services::google::HttpResponse {
+                status: 200,
+                body: br#"{"data":{"revision":1,"status":"pending"}}"#.to_vec(),
+            },
+            services::google::HttpResponse {
+                status: 200,
+                body: br#"{"data":{"revision":2,"status":"cancelled"}}"#.to_vec(),
+            },
+        ]);
+        let first = services::reminder_cloud::process_outbox_item(
+            &connection,
+            &mut transport,
+            &config,
+            &session,
+            &ids[0],
+        )
+        .expect("target upsert");
+        assert_eq!(first.processed, 1);
+        let untouched: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_cloud_outbox WHERE id IN (?1, ?2) AND sync_status='pending'",
+                params![&ids[1], &ids[2]],
+                |row| row.get(0),
+            )
+            .expect("untouched");
+        assert_eq!(untouched, 2);
+        assert_eq!(transport.requests.len(), 1);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&transport.requests[0].body).expect("upsert payload");
+        assert_eq!(payload["apiVersion"], 1);
+        assert!(payload["reminderId"].as_str().is_some());
+        assert!(payload["clientMutationId"].as_str().is_some());
+        assert_eq!(payload["recipient"].as_str(), Some("905551112233"));
+        assert_eq!(
+            payload["template"]["name"].as_str(),
+            Some("randevu_hatirlatma")
+        );
+        assert_eq!(
+            payload["template"]["parameters"].as_array().map(Vec::len),
+            Some(4)
+        );
+
+        let missing = services::reminder_cloud::process_outbox_item(
+            &connection,
+            &mut transport,
+            &config,
+            &session,
+            "missing-outbox-id",
+        )
+        .expect("missing is safe no-op");
+        assert_eq!(missing.processed, 0);
+        let duplicate = services::reminder_cloud::process_outbox_item(
+            &connection,
+            &mut transport,
+            &config,
+            &session,
+            &ids[0],
+        )
+        .expect("synced is safe no-op");
+        assert_eq!(duplicate.processed, 0);
+        assert_eq!(transport.requests.len(), 1);
+
+        let reminder_id: String = connection
+            .query_row(
+                "SELECT id FROM appointment_reminders WHERE appointment_id=?1",
+                params![appointments[0].id],
+                |row| row.get(0),
+            )
+            .expect("target reminder");
+        upsert_cloud_outbox(&connection, &reminder_id, "cancel", None).expect("cancel outbox");
+        let cancel_id: String = connection
+            .query_row(
+                "SELECT id FROM reminder_cloud_outbox WHERE reminder_id=?1 AND action='cancel'",
+                params![reminder_id],
+                |row| row.get(0),
+            )
+            .expect("cancel id");
+        let cancel = services::reminder_cloud::process_outbox_item(
+            &connection,
+            &mut transport,
+            &config,
+            &session,
+            &cancel_id,
+        )
+        .expect("target cancel");
+        assert_eq!(cancel.processed, 1);
+        assert_eq!(transport.requests.len(), 2);
+        assert!(transport.requests[1]
+            .url
+            .ends_with("/functions/v1/reminder-cancel"));
+        let still_untouched: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_cloud_outbox WHERE id IN (?1, ?2) AND sync_status='pending'",
+                params![&ids[1], &ids[2]],
+                |row| row.get(0),
+            )
+            .expect("still untouched");
+        assert_eq!(still_untouched, 2);
+    }
+
+    #[test]
     fn live_services_config_file_loads_only_local_command_configuration() {
         let config = parse_live_services_config(
             r#"{
@@ -4116,6 +4351,454 @@ mod tests {
             |row| row.get(0),
         ).expect("persisted mapping");
         assert_eq!(event_id, persisted);
+        assert!(integrity_check(&reopened).expect("integrity"));
+    }
+
+    #[test]
+    #[ignore = "requires explicit live Supabase OTP authorization"]
+    fn live_supabase_otp_request() {
+        assert_eq!(
+            std::env::var("BEAUTYSALOON_ALLOW_LIVE_SUPABASE_OTP").as_deref(),
+            Ok("1")
+        );
+        let email = std::env::var("BEAUTYSALOON_LIVE_SUPABASE_OTP_EMAIL")
+            .expect("OTP email is supplied only through the environment");
+        let config = supabase_config().expect("local Supabase public config");
+        let mut transport = services::google::ReqwestHttpTransport;
+        services::supabase::request_email_otp(&mut transport, &config, &email)
+            .expect("request live OTP");
+    }
+
+    #[test]
+    #[ignore = "requires explicit live Supabase OTP verification authorization"]
+    fn live_supabase_otp_verify_and_persist() {
+        assert_eq!(
+            std::env::var("BEAUTYSALOON_ALLOW_LIVE_SUPABASE_OTP").as_deref(),
+            Ok("1")
+        );
+        let email = std::env::var("BEAUTYSALOON_LIVE_SUPABASE_OTP_EMAIL")
+            .expect("OTP email is supplied only through the environment");
+        let otp = std::env::var("BEAUTYSALOON_LIVE_SUPABASE_OTP_CODE")
+            .expect("OTP is supplied only through the environment");
+        let config = supabase_config().expect("local Supabase public config");
+        let mut transport = services::google::ReqwestHttpTransport;
+        let session = services::supabase::verify_email_otp(&mut transport, &config, &email, &otp)
+            .expect("verify live OTP");
+        let database_path = PathBuf::from(std::env::var_os("APPDATA").expect("APPDATA"))
+            .join("com.beautysaloon.desktop")
+            .join("database")
+            .join("salon-foundation.db");
+        let connection = open_database(&database_path).expect("open live database");
+        let protector = services::secure_store::WindowsDpapiProtector;
+        services::secure_store::store_supabase_session(&connection, &protector, &session)
+            .expect("store DPAPI session");
+        drop(connection);
+        let reopened = open_database(&database_path).expect("reopen live database");
+        assert!(
+            services::secure_store::read_supabase_session(&reopened, &protector)
+                .expect("read DPAPI session")
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires explicit authenticated dispatcher status read"]
+    fn live_dispatcher_status_read() {
+        let database_path = PathBuf::from(std::env::var_os("APPDATA").expect("APPDATA"))
+            .join("com.beautysaloon.desktop")
+            .join("database")
+            .join("salon-foundation.db");
+        let connection = open_database(&database_path).expect("open live database");
+        let protector = services::secure_store::WindowsDpapiProtector;
+        let session = services::secure_store::read_supabase_session(&connection, &protector)
+            .expect("read session")
+            .expect("persisted session");
+        let config = supabase_config().expect("Supabase config");
+        let mut transport = services::google::ReqwestHttpTransport;
+        let status =
+            services::reminder_cloud::read_dispatcher_status(&mut transport, &config, &session)
+                .or_else(|error| match error {
+                    AppError::Validation(code) if code == "CLOUD_AUTH_INVALID" => {
+                        let refreshed = services::supabase::refresh_session(
+                            &mut transport,
+                            &config,
+                            &session.refresh_token,
+                        )?;
+                        services::secure_store::store_supabase_session(
+                            &connection,
+                            &protector,
+                            &refreshed,
+                        )?;
+                        services::reminder_cloud::read_dispatcher_status(
+                            &mut transport,
+                            &config,
+                            &refreshed,
+                        )
+                    }
+                    error => Err(error),
+                })
+                .expect("read dispatcher status");
+        assert!(status.paused, "dispatcher must remain paused");
+    }
+
+    fn require_live_dispatcher_paused(
+        connection: &Connection,
+        transport: &mut dyn services::google::HttpTransport,
+        config: &services::supabase::SupabaseConfig,
+        session: &mut services::supabase::SupabaseSession,
+    ) -> Result<(), AppError> {
+        let status =
+            match services::reminder_cloud::read_dispatcher_status(transport, config, session) {
+                Ok(status) => status,
+                Err(AppError::Validation(code)) if code == "CLOUD_AUTH_INVALID" => {
+                    let protector = services::secure_store::WindowsDpapiProtector;
+                    let refreshed = services::supabase::refresh_session(
+                        transport,
+                        config,
+                        &session.refresh_token,
+                    )?;
+                    services::secure_store::store_supabase_session(
+                        connection, &protector, &refreshed,
+                    )?;
+                    *session = refreshed;
+                    services::reminder_cloud::read_dispatcher_status(transport, config, session)?
+                }
+                Err(error) => return Err(error),
+            };
+        if !status.paused {
+            return Err(AppError::Conflict("DISPATCHER_NOT_PAUSED".to_string()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires explicit single synthetic hosted reminder acceptance authorization"]
+    fn live_targeted_cloud_reminder_acceptance() {
+        assert_eq!(
+            std::env::var("BEAUTYSALOON_ALLOW_LIVE_CLOUD_ACCEPTANCE").as_deref(),
+            Ok("1"),
+            "live acceptance requires an explicit environment gate"
+        );
+        let database_path = PathBuf::from(std::env::var_os("APPDATA").expect("APPDATA"))
+            .join("com.beautysaloon.desktop")
+            .join("database")
+            .join("salon-foundation.db");
+        let mut connection = open_database(&database_path).expect("open live database");
+        let protector = services::secure_store::WindowsDpapiProtector;
+        let mut session = services::secure_store::read_supabase_session(&connection, &protector)
+            .expect("read session")
+            .expect("persisted session");
+        let config = supabase_config().expect("Supabase config");
+        let mut transport = services::google::ReqwestHttpTransport;
+
+        require_live_dispatcher_paused(&connection, &mut transport, &config, &mut session)
+            .expect("dispatcher paused before synthetic create");
+        let non_target_pending_before: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_cloud_outbox WHERE sync_status='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pending baseline");
+        let marker = "BeautySaloon TEST CLOUD";
+        let customer = create_customer_tx(
+            &connection,
+            CustomerInput {
+                first_name: "BeautySaloon".into(),
+                last_name: "TEST CLOUD".into(),
+                phone: "05550000000".into(),
+                email: None,
+                notes: Some(marker.into()),
+                whatsapp_reminder_enabled: Some(true),
+                whatsapp_consent_confirmed: Some(true),
+            },
+        )
+        .expect("synthetic customer");
+        let staff = create_staff_tx(
+            &connection,
+            StaffInput {
+                first_name: "BeautySaloon".into(),
+                last_name: Some("TEST CLOUD".into()),
+                phone: None,
+                specialty_note: Some(marker.into()),
+                color_key: "slate".into(),
+                is_active: Some(true),
+            },
+        )
+        .expect("synthetic staff");
+        let category = create_category_tx(
+            &connection,
+            CategoryInput {
+                name: "BeautySaloon TEST CLOUD".into(),
+                is_active: Some(true),
+            },
+        )
+        .expect("synthetic category");
+        let service = create_service_tx(
+            &connection,
+            ServiceInput {
+                category_id: category.id,
+                name: "BeautySaloon TEST CLOUD".into(),
+                duration_minutes: Some(30),
+                is_active: Some(true),
+            },
+        )
+        .expect("synthetic service");
+        set_staff_services_tx(&mut connection, &staff.id, vec![service.id.clone()])
+            .expect("synthetic staff service");
+        let (local_date, local_time) = future_local_slot(48);
+        let appointment = create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id,
+                staff_id: staff.id,
+                local_date,
+                local_start_time: local_time,
+                service_ids: vec![service.id.clone()],
+                status: Some("confirmed".into()),
+                note: Some(marker.into()),
+            },
+        )
+        .expect("synthetic appointment");
+        // The acceptance is cloud-only; prevent this synthetic record entering Google sync.
+        connection
+            .execute(
+                "DELETE FROM google_calendar_outbox WHERE appointment_id=?1",
+                params![appointment.id],
+            )
+            .expect("remove synthetic Google outbox");
+        connection
+            .execute(
+                "DELETE FROM appointment_google_calendar_sync WHERE appointment_id=?1",
+                params![appointment.id],
+            )
+            .expect("remove synthetic Google mapping");
+        let reminder_id: String = connection
+            .query_row(
+                "SELECT id FROM appointment_reminders WHERE appointment_id=?1",
+                params![appointment.id],
+                |row| row.get(0),
+            )
+            .expect("synthetic reminder");
+        let create_outbox_id: String = connection
+            .query_row(
+                "SELECT id FROM reminder_cloud_outbox WHERE reminder_id=?1 AND action='upsert' AND sync_status='pending' ORDER BY revision DESC LIMIT 1",
+                params![reminder_id],
+                |row| row.get(0),
+            )
+            .expect("synthetic create outbox");
+
+        require_live_dispatcher_paused(&connection, &mut transport, &config, &mut session)
+            .expect("dispatcher paused before hosted create");
+        assert_eq!(
+            services::reminder_cloud::process_outbox_item(
+                &connection,
+                &mut transport,
+                &config,
+                &session,
+                &create_outbox_id,
+            )
+            .expect("hosted create")
+            .processed,
+            1
+        );
+        let created = services::reminder_cloud::read_reminder_status(
+            &mut transport,
+            &config,
+            &session,
+            &reminder_id,
+        )
+        .expect("read hosted create")
+        .expect("hosted synthetic reminder");
+        assert_eq!(created.status, "pending");
+        services::reminder_cloud::reconcile_remote_status(
+            &connection,
+            &reminder_id,
+            created.revision,
+            &created.status,
+            &created.remote_updated_at_utc,
+        )
+        .expect("reconcile create");
+
+        let (updated_date, updated_time) = future_local_slot(72);
+        update_appointment_tx(
+            &mut connection,
+            &appointment.id,
+            AppointmentInput {
+                customer_id: appointment.customer_id.clone(),
+                staff_id: appointment.staff_id.clone(),
+                local_date: updated_date,
+                local_start_time: updated_time,
+                service_ids: vec![service.id],
+                status: Some("planned".into()),
+                note: Some(marker.into()),
+            },
+        )
+        .expect("synthetic update");
+        connection
+            .execute(
+                "DELETE FROM google_calendar_outbox WHERE appointment_id=?1",
+                params![appointment.id],
+            )
+            .expect("remove synthetic Google update outbox");
+        connection
+            .execute(
+                "DELETE FROM appointment_google_calendar_sync WHERE appointment_id=?1",
+                params![appointment.id],
+            )
+            .expect("remove synthetic Google update mapping");
+        let update_outbox_id: String = connection
+            .query_row(
+                "SELECT id FROM reminder_cloud_outbox WHERE reminder_id=?1 AND action='upsert' AND sync_status='pending' ORDER BY revision DESC LIMIT 1",
+                params![reminder_id],
+                |row| row.get(0),
+            )
+            .expect("synthetic update outbox");
+        require_live_dispatcher_paused(&connection, &mut transport, &config, &mut session)
+            .expect("dispatcher paused before hosted update");
+        assert_eq!(
+            services::reminder_cloud::process_outbox_item(
+                &connection,
+                &mut transport,
+                &config,
+                &session,
+                &update_outbox_id,
+            )
+            .expect("hosted update")
+            .processed,
+            1
+        );
+        let updated = services::reminder_cloud::read_reminder_status(
+            &mut transport,
+            &config,
+            &session,
+            &reminder_id,
+        )
+        .expect("read hosted update")
+        .expect("hosted synthetic reminder after update");
+        assert!(updated.revision > created.revision);
+        assert_eq!(updated.status, "pending");
+        services::reminder_cloud::reconcile_remote_status(
+            &connection,
+            &reminder_id,
+            updated.revision,
+            &updated.status,
+            &updated.remote_updated_at_utc,
+        )
+        .expect("reconcile update");
+        assert_eq!(
+            services::reminder_cloud::process_outbox_item(
+                &connection,
+                &mut transport,
+                &config,
+                &session,
+                &update_outbox_id,
+            )
+            .expect("idempotent retry")
+            .processed,
+            0
+        );
+
+        let cancel_services = list_appointment_services(&connection, &appointment.id)
+            .expect("services")
+            .into_iter()
+            .map(|item| item.service_id)
+            .collect();
+        let (cancel_date, cancel_time) = future_local_slot(72);
+        update_appointment_tx(
+            &mut connection,
+            &appointment.id,
+            AppointmentInput {
+                customer_id: appointment.customer_id.clone(),
+                staff_id: appointment.staff_id.clone(),
+                local_date: cancel_date,
+                local_start_time: cancel_time,
+                service_ids: cancel_services,
+                status: Some("cancelled".into()),
+                note: Some(marker.into()),
+            },
+        )
+        .expect("synthetic cancel");
+        connection
+            .execute(
+                "DELETE FROM google_calendar_outbox WHERE appointment_id=?1",
+                params![appointment.id],
+            )
+            .expect("remove synthetic Google cancel outbox");
+        connection
+            .execute(
+                "DELETE FROM appointment_google_calendar_sync WHERE appointment_id=?1",
+                params![appointment.id],
+            )
+            .expect("remove synthetic Google cancel mapping");
+        let cancel_outbox_id: String = connection
+            .query_row(
+                "SELECT id FROM reminder_cloud_outbox WHERE reminder_id=?1 AND action='cancel' AND sync_status='pending' ORDER BY revision DESC LIMIT 1",
+                params![reminder_id],
+                |row| row.get(0),
+            )
+            .expect("synthetic cancel outbox");
+        require_live_dispatcher_paused(&connection, &mut transport, &config, &mut session)
+            .expect("dispatcher paused before hosted cancel");
+        assert_eq!(
+            services::reminder_cloud::process_outbox_item(
+                &connection,
+                &mut transport,
+                &config,
+                &session,
+                &cancel_outbox_id,
+            )
+            .expect("hosted cancel")
+            .processed,
+            1
+        );
+        let cancelled = services::reminder_cloud::read_reminder_status(
+            &mut transport,
+            &config,
+            &session,
+            &reminder_id,
+        )
+        .expect("read hosted cancellation")
+        .expect("hosted synthetic cancellation");
+        assert_eq!(cancelled.status, "cancelled");
+        services::reminder_cloud::reconcile_remote_status(
+            &connection,
+            &reminder_id,
+            cancelled.revision,
+            &cancelled.status,
+            &cancelled.remote_updated_at_utc,
+        )
+        .expect("reconcile cancellation");
+        let untouched_pending: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_cloud_outbox WHERE sync_status='pending' AND reminder_id<>?1",
+                params![reminder_id],
+                |row| row.get(0),
+            )
+            .expect("non-target pending");
+        assert_eq!(untouched_pending, non_target_pending_before);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM appointment_reminders WHERE id=?1",
+                    params![reminder_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("local cancelled reminder"),
+            "cancelled"
+        );
+        drop(connection);
+        let reopened = open_database(&database_path).expect("reopen live database");
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT sync_status FROM reminder_cloud_outbox WHERE id=?1",
+                    params![cancel_outbox_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("persisted cancel outbox"),
+            "synced"
+        );
         assert!(integrity_check(&reopened).expect("integrity"));
     }
 

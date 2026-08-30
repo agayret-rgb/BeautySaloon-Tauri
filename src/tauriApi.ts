@@ -77,6 +77,11 @@ export interface CloudConnectionStatus {
   sessionPresent: boolean;
 }
 
+export interface DispatcherStatus {
+  paused: boolean;
+  pauseReason: string | null;
+}
+
 export interface GoogleConnectResult {
   connected: boolean;
   calendarId: string;
@@ -114,6 +119,10 @@ export async function syncGoogleCalendar(): Promise<number> {
 
 export async function getCloudConnectionStatus(): Promise<CloudConnectionStatus> {
   return invoke<CloudConnectionStatus>("cloud_connection_status");
+}
+
+export async function getDispatcherStatus(): Promise<DispatcherStatus> {
+  return invoke<DispatcherStatus>("dispatcher_status");
 }
 
 export async function requestCloudOtp(email: string): Promise<boolean> {
@@ -156,6 +165,7 @@ export const coreDataCommands = [
   "google_calendar_sync",
   "cloud_connection_status",
   "cloud_status",
+  "dispatcher_status",
   "cloud_request_otp",
   "otp_request",
   "cloud_verify_otp",

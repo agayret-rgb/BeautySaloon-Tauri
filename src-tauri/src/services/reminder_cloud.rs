@@ -12,6 +12,104 @@ pub struct CloudSyncStatus {
     pub unauthorized: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DispatcherStatus {
+    pub paused: bool,
+    pub pause_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteReminderStatus {
+    pub revision: i64,
+    pub status: String,
+    pub remote_updated_at_utc: String,
+}
+
+pub fn read_reminder_status(
+    transport: &mut dyn HttpTransport,
+    config: &SupabaseConfig,
+    session: &SupabaseSession,
+    reminder_id: &str,
+) -> Result<Option<RemoteReminderStatus>, AppError> {
+    let response = invoke_function(
+        transport,
+        config,
+        session,
+        "reminder-status",
+        json!({ "apiVersion": 1, "reminderIds": [reminder_id] }),
+    )?;
+    let reminders = response
+        .get("data")
+        .and_then(|data| data.get("reminders"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::Database("CLOUD_STATUS_INVALID".to_string()))?;
+    let Some(item) = reminders
+        .iter()
+        .find(|item| item.get("reminderId").and_then(Value::as_str) == Some(reminder_id))
+    else {
+        return Ok(None);
+    };
+    let revision = item
+        .get("revision")
+        .and_then(Value::as_i64)
+        .filter(|revision| *revision > 0)
+        .ok_or_else(|| AppError::Database("CLOUD_STATUS_INVALID".to_string()))?;
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| {
+            matches!(
+                *status,
+                "pending" | "processing" | "sent" | "failed" | "uncertain" | "cancelled"
+            )
+        })
+        .ok_or_else(|| AppError::Database("CLOUD_STATUS_INVALID".to_string()))?;
+    let remote_updated_at_utc = item
+        .get("remoteUpdatedAtUtc")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Database("CLOUD_STATUS_INVALID".to_string()))?;
+    Ok(Some(RemoteReminderStatus {
+        revision,
+        status: status.to_string(),
+        remote_updated_at_utc: remote_updated_at_utc.to_string(),
+    }))
+}
+
+pub fn read_dispatcher_status(
+    transport: &mut dyn HttpTransport,
+    config: &SupabaseConfig,
+    session: &SupabaseSession,
+) -> Result<DispatcherStatus, AppError> {
+    let response = invoke_function(transport, config, session, "dispatcher-status", json!({}))?;
+    let data = response.get("data").unwrap_or(&response);
+    let paused = data
+        .get("paused")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| AppError::Database("DISPATCHER_STATUS_INVALID".to_string()))?;
+    let pause_reason = data
+        .get("pause_reason")
+        .and_then(Value::as_str)
+        .map(sanitize_pause_reason)
+        .transpose()?;
+    Ok(DispatcherStatus {
+        paused,
+        pause_reason,
+    })
+}
+
+fn sanitize_pause_reason(value: &str) -> Result<String, AppError> {
+    if value.len() > 96
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | ' ')
+        })
+    {
+        return Err(AppError::Database("DISPATCHER_STATUS_INVALID".to_string()));
+    }
+    Ok(value.to_string())
+}
+
 pub fn invoke_function(
     transport: &mut dyn HttpTransport,
     config: &SupabaseConfig,
@@ -79,47 +177,104 @@ pub fn process_ordered_outbox(
         blocked: 0,
         unauthorized: false,
     };
-    for (id, reminder_id, revision, action, mutation_id, payload_json) in rows {
-        connection.execute(
-            "UPDATE reminder_cloud_outbox SET sync_status='in_flight', last_attempt_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'), last_error_code=NULL WHERE id=?1 AND sync_status='pending'",
-            params![id],
-        )?;
-        let body = if action == "cancel" {
-            json!({ "apiVersion": 1, "reminderId": reminder_id, "revision": revision, "clientMutationId": mutation_id })
-        } else {
-            serde_json::from_str(
-                payload_json
-                    .as_deref()
-                    .ok_or_else(|| AppError::Database("CLOUD_PAYLOAD_MISSING".to_string()))?,
-            )
-            .map_err(|_| AppError::Database("CLOUD_PAYLOAD_INVALID".to_string()))?
-        };
-        let function_name = if action == "cancel" {
-            "reminder-cancel"
-        } else {
-            "reminder-upsert"
-        };
-        match invoke_function(transport, config, session, function_name, body) {
-            Ok(response) => {
-                let data = response.get("data").unwrap_or(&response);
-                let remote_revision = data
-                    .get("revision")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(revision);
-                let remote_status =
-                    data.get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or(if action == "cancel" {
-                            "cancelled"
-                        } else {
-                            "pending"
-                        });
-                let remote_updated = data
-                    .get("remoteUpdatedAtUtc")
+    for (id, ..) in rows {
+        let item_status = process_outbox_item(connection, transport, config, session, &id)?;
+        status.processed += item_status.processed;
+        status.blocked += item_status.blocked;
+        status.unauthorized |= item_status.unauthorized;
+        if item_status.unauthorized || item_status.processed == 0 && item_status.blocked == 0 {
+            break;
+        }
+    }
+    Ok(status)
+}
+
+/// Processes one exact pending outbox item. This is intentionally not a Tauri command:
+/// callers must already hold the local outbox id created by the trusted projection.
+pub(crate) fn process_outbox_item(
+    connection: &Connection,
+    transport: &mut dyn HttpTransport,
+    config: &SupabaseConfig,
+    session: &SupabaseSession,
+    outbox_id: &str,
+) -> Result<CloudSyncStatus, AppError> {
+    let row = connection
+        .query_row(
+            "SELECT current.id, current.reminder_id, current.revision, current.action, current.client_mutation_id, current.payload_json
+             FROM reminder_cloud_outbox current
+             WHERE current.id=?1
+               AND current.sync_status='pending'
+               AND NOT EXISTS (
+                 SELECT 1 FROM reminder_cloud_outbox previous
+                 WHERE previous.reminder_id=current.reminder_id
+                   AND previous.revision < current.revision
+                   AND previous.sync_status IN ('pending','in_flight','blocked')
+               )",
+            params![outbox_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((id, reminder_id, revision, action, mutation_id, payload_json)) = row else {
+        return Ok(CloudSyncStatus {
+            processed: 0,
+            blocked: 0,
+            unauthorized: false,
+        });
+    };
+    let mut status = CloudSyncStatus {
+        processed: 0,
+        blocked: 0,
+        unauthorized: false,
+    };
+    connection.execute(
+        "UPDATE reminder_cloud_outbox SET sync_status='in_flight', last_attempt_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'), last_error_code=NULL WHERE id=?1 AND sync_status='pending'",
+        params![&id],
+    )?;
+    let body = if action == "cancel" {
+        json!({ "apiVersion": 1, "reminderId": reminder_id, "revision": revision, "clientMutationId": mutation_id })
+    } else {
+        serde_json::from_str(
+            payload_json
+                .as_deref()
+                .ok_or_else(|| AppError::Database("CLOUD_PAYLOAD_MISSING".to_string()))?,
+        )
+        .map_err(|_| AppError::Database("CLOUD_PAYLOAD_INVALID".to_string()))?
+    };
+    let function_name = if action == "cancel" {
+        "reminder-cancel"
+    } else {
+        "reminder-upsert"
+    };
+    match invoke_function(transport, config, session, function_name, body) {
+        Ok(response) => {
+            let data = response.get("data").unwrap_or(&response);
+            let remote_revision = data
+                .get("revision")
+                .and_then(Value::as_i64)
+                .unwrap_or(revision);
+            let remote_status =
+                data.get("status")
                     .and_then(Value::as_str)
-                    .unwrap_or("");
-                connection.execute("UPDATE reminder_cloud_outbox SET sync_status='synced', last_error_code=NULL, updated_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1", params![id])?;
-                connection.execute(
+                    .unwrap_or(if action == "cancel" {
+                        "cancelled"
+                    } else {
+                        "pending"
+                    });
+            let remote_updated = data
+                .get("remoteUpdatedAtUtc")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            connection.execute("UPDATE reminder_cloud_outbox SET sync_status='synced', last_error_code=NULL, updated_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1", params![id])?;
+            connection.execute(
                     "UPDATE reminder_cloud_state
                      SET last_synced_revision=max(last_synced_revision, ?1),
                          last_remote_revision=?2,
@@ -130,19 +285,16 @@ pub fn process_ordered_outbox(
                      WHERE reminder_id=?5",
                     params![revision, remote_revision, remote_status, remote_updated, reminder_id],
                 )?;
-                status.processed += 1;
-            }
-            Err(AppError::Validation(code)) if code == "CLOUD_AUTH_INVALID" => {
-                connection.execute("UPDATE reminder_cloud_outbox SET sync_status='blocked', last_error_code=?1 WHERE id=?2", params![code, id])?;
-                status.unauthorized = true;
-                status.blocked += 1;
-                break;
-            }
-            Err(error) => {
-                let code = error.to_string();
-                connection.execute("UPDATE reminder_cloud_outbox SET sync_status='pending', last_error_code=?1 WHERE id=?2", params![code, id])?;
-                break;
-            }
+            status.processed += 1;
+        }
+        Err(AppError::Validation(code)) if code == "CLOUD_AUTH_INVALID" => {
+            connection.execute("UPDATE reminder_cloud_outbox SET sync_status='blocked', last_error_code=?1 WHERE id=?2", params![code, id])?;
+            status.unauthorized = true;
+            status.blocked += 1;
+        }
+        Err(error) => {
+            let code = error.to_string();
+            connection.execute("UPDATE reminder_cloud_outbox SET sync_status='pending', last_error_code=?1 WHERE id=?2", params![code, id])?;
         }
     }
     Ok(status)
