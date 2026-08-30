@@ -22,7 +22,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 mod services;
 
-const CORE_SCHEMA_VERSION: i64 = 16;
+const CORE_SCHEMA_VERSION: i64 = 17;
 const ISTANBUL_OFFSET_MINUTES: i64 = 180;
 const APPOINTMENT_STATUS_CANCELLED: &str = "cancelled";
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -52,6 +52,104 @@ impl Serialize for AppError {
     {
         serializer.serialize_str(&self.to_string())
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AuditEntityType {
+    Customer,
+    Staff,
+    Service,
+    Appointment,
+    AppointmentService,
+}
+
+impl AuditEntityType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Customer => "customer",
+            Self::Staff => "staff",
+            Self::Service => "service",
+            Self::Appointment => "appointment",
+            Self::AppointmentService => "appointment_service",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AuditAction {
+    Create,
+    Update,
+    Archive,
+    Reactivate,
+    Deactivate,
+    StatusChange,
+    PriceOverride,
+}
+
+impl AuditAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Archive => "archive",
+            Self::Reactivate => "reactivate",
+            Self::Deactivate => "deactivate",
+            Self::StatusChange => "status_change",
+            Self::PriceOverride => "price_override",
+        }
+    }
+}
+
+enum AuditMetadata<'a> {
+    ChangedFields(&'a [&'a str]),
+    StatusChange {
+        from_status: &'a str,
+        to_status: &'a str,
+    },
+    PriceOverride {
+        previous_minor: i64,
+        new_minor: i64,
+    },
+}
+
+fn append_audit_event(
+    connection: &Connection,
+    entity_type: AuditEntityType,
+    entity_id: &str,
+    action: AuditAction,
+    metadata: Option<AuditMetadata<'_>>,
+) -> Result<(), AppError> {
+    let metadata_json = match metadata {
+        None => None,
+        Some(AuditMetadata::ChangedFields(changed_fields)) => Some(
+            serde_json::json!({ "changed_fields": changed_fields }).to_string(),
+        ),
+        Some(AuditMetadata::StatusChange {
+            from_status,
+            to_status,
+        }) => Some(
+            serde_json::json!({ "from_status": from_status, "to_status": to_status }).to_string(),
+        ),
+        Some(AuditMetadata::PriceOverride {
+            previous_minor,
+            new_minor,
+        }) => Some(
+            serde_json::json!({ "previous_price_minor": previous_minor, "new_price_minor": new_minor }).to_string(),
+        ),
+    };
+    connection.execute(
+        "INSERT INTO audit_log (id, occurred_at, entity_type, entity_id, action, metadata_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            new_uuid(),
+            now_iso(),
+            entity_type.as_str(),
+            entity_id,
+            action.as_str(),
+            metadata_json
+        ],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -613,6 +711,7 @@ fn migrate_core(connection: &Connection) -> Result<(), AppError> {
     migrate_v14_customers_phone_nullable(connection)?;
     migrate_v15_service_pricing(connection)?;
     migrate_v16_scheduling_schema(connection)?;
+    migrate_v17_archive_and_audit_schema(connection)?;
     connection.execute(
         "UPDATE app_meta SET schema_version = ?1 WHERE schema_version < ?1",
         params![CORE_SCHEMA_VERSION],
@@ -630,6 +729,40 @@ fn migrate_v16_scheduling_schema(connection: &Connection) -> Result<(), AppError
       CREATE TABLE IF NOT EXISTS staff_time_off (id TEXT PRIMARY KEY NOT NULL, staff_id TEXT NOT NULL REFERENCES staff(id) ON DELETE RESTRICT, local_date TEXT NOT NULL, full_day INTEGER NOT NULL CHECK(full_day IN (0,1)), start_minute INTEGER, end_minute INTEGER, CHECK((full_day=1 AND start_minute IS NULL AND end_minute IS NULL) OR (full_day=0 AND start_minute BETWEEN 0 AND 1439 AND end_minute BETWEEN 1 AND 1440 AND start_minute < end_minute)));
       CREATE INDEX IF NOT EXISTS staff_time_off_staff_date_idx ON staff_time_off(staff_id, local_date, start_minute);
       COMMIT;")
+        .map_err(Into::into)
+}
+
+// Audit metadata is limited to safe mutation details. Never store credentials,
+// authentication material, customer phone/email values, or free-form notes here.
+fn migrate_v17_archive_and_audit_schema(connection: &Connection) -> Result<(), AppError> {
+    if read_schema_version(connection)? >= 17 {
+        return Ok(());
+    }
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE IF NOT EXISTS audit_log (
+               id TEXT PRIMARY KEY NOT NULL,
+               occurred_at TEXT NOT NULL,
+               entity_type TEXT NOT NULL CHECK (length(trim(entity_type)) > 0 AND length(entity_type) <= 64),
+               entity_id TEXT NOT NULL CHECK (length(trim(entity_id)) > 0 AND length(entity_id) <= 128),
+               action TEXT NOT NULL CHECK (length(trim(action)) > 0 AND length(action) <= 64),
+               metadata_json TEXT NULL
+             );
+             CREATE INDEX IF NOT EXISTS audit_log_occurred_at_idx ON audit_log (occurred_at DESC, id DESC);
+             CREATE INDEX IF NOT EXISTS audit_log_entity_occurred_at_idx ON audit_log (entity_type, entity_id, occurred_at DESC, id DESC);
+             CREATE TRIGGER IF NOT EXISTS audit_log_append_only_update
+             BEFORE UPDATE ON audit_log
+             BEGIN
+               SELECT RAISE(ABORT, 'AUDIT_LOG_APPEND_ONLY');
+             END;
+             CREATE TRIGGER IF NOT EXISTS audit_log_append_only_delete
+             BEFORE DELETE ON audit_log
+             BEGIN
+               SELECT RAISE(ABORT, 'AUDIT_LOG_APPEND_ONLY');
+             END;
+             COMMIT;",
+        )
         .map_err(Into::into)
 }
 
@@ -1258,7 +1391,10 @@ fn next_sort_order(
     Ok(value)
 }
 
-fn create_customer_tx(connection: &Connection, input: CustomerInput) -> Result<Customer, AppError> {
+fn create_customer_tx(
+    connection: &mut Connection,
+    input: CustomerInput,
+) -> Result<Customer, AppError> {
     let first_name = normalize_text(&input.first_name, "firstName", 2, 100)?;
     let last_name = normalize_text(&input.last_name, "lastName", 2, 100)?;
     let phone = normalize_phone(input.phone.as_deref(), false)?;
@@ -1267,7 +1403,8 @@ fn create_customer_tx(connection: &Connection, input: CustomerInput) -> Result<C
     let now = now_iso();
     let consent = input.whatsapp_consent_confirmed.unwrap_or(false);
     let id = new_uuid();
-    connection.execute(
+    let tx = connection.transaction()?;
+    tx.execute(
         "INSERT INTO customers (id, first_name, last_name, phone, email, whatsapp_reminder_enabled, whatsapp_consent_confirmed, whatsapp_consent_recorded_at, notes, is_active, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10)",
         params![
@@ -1283,15 +1420,23 @@ fn create_customer_tx(connection: &Connection, input: CustomerInput) -> Result<C
             now
         ],
     )?;
+    append_audit_event(
+        &tx,
+        AuditEntityType::Customer,
+        &id,
+        AuditAction::Create,
+        None,
+    )?;
+    tx.commit()?;
     get_customer(connection, &id)?.ok_or_else(|| AppError::Database("customer insert".to_string()))
 }
 
 fn update_customer_tx(
-    connection: &Connection,
+    connection: &mut Connection,
     id: &str,
     input: CustomerInput,
 ) -> Result<Customer, AppError> {
-    get_customer(connection, id)?
+    let existing = get_customer(connection, id)?
         .ok_or_else(|| AppError::NotFound("CUSTOMER_NOT_FOUND".to_string()))?;
     let first_name = normalize_text(&input.first_name, "firstName", 2, 100)?;
     let last_name = normalize_text(&input.last_name, "lastName", 2, 100)?;
@@ -1300,14 +1445,90 @@ fn update_customer_tx(
     let notes = optional_text(input.notes, 2000)?;
     let now = now_iso();
     let consent = input.whatsapp_consent_confirmed.unwrap_or(false);
-    connection.execute(
+    let mut changed_fields = Vec::new();
+    if existing.first_name != first_name {
+        changed_fields.push("first_name");
+    }
+    if existing.last_name != last_name {
+        changed_fields.push("last_name");
+    }
+    if existing.phone != phone {
+        changed_fields.push("phone");
+    }
+    if existing.email != email {
+        changed_fields.push("email");
+    }
+    if existing.notes != notes {
+        changed_fields.push("notes");
+    }
+    if existing.whatsapp_reminder_enabled != input.whatsapp_reminder_enabled.unwrap_or(true) {
+        changed_fields.push("whatsapp_reminder_enabled");
+    }
+    if existing.whatsapp_consent_confirmed != consent {
+        changed_fields.push("whatsapp_consent_confirmed");
+    }
+    if changed_fields.is_empty() {
+        return Ok(existing);
+    }
+    let tx = connection.transaction()?;
+    tx.execute(
         "UPDATE customers SET first_name=?1,last_name=?2,phone=?3,email=?4,whatsapp_reminder_enabled=?5,whatsapp_consent_confirmed=?6,whatsapp_consent_recorded_at=CASE WHEN ?6 = 1 THEN COALESCE(whatsapp_consent_recorded_at, ?7) ELSE NULL END,notes=?8,updated_at=?7 WHERE id=?9",
         params![first_name,last_name,phone,email,bool_to_i64(input.whatsapp_reminder_enabled.unwrap_or(true)),bool_to_i64(consent),now,notes,id],
     )?;
+    append_audit_event(
+        &tx,
+        AuditEntityType::Customer,
+        id,
+        AuditAction::Update,
+        Some(AuditMetadata::ChangedFields(&changed_fields)),
+    )?;
+    tx.commit()?;
     get_customer(connection, id)?.ok_or_else(|| AppError::Database("customer update".to_string()))
 }
 
-fn create_staff_tx(connection: &Connection, input: StaffInput) -> Result<Staff, AppError> {
+fn set_customer_active(
+    connection: &mut Connection,
+    customer_id: &str,
+    is_active: bool,
+) -> Result<Customer, AppError> {
+    let existing = get_customer(connection, customer_id)?
+        .ok_or_else(|| AppError::NotFound("CUSTOMER_NOT_FOUND".into()))?;
+    if existing.is_active == is_active {
+        return Ok(existing);
+    }
+    let tx = connection.transaction()?;
+    tx.execute(
+        "UPDATE customers SET is_active=?1, updated_at=?2 WHERE id=?3",
+        params![bool_to_i64(is_active), now_iso(), customer_id],
+    )?;
+    append_audit_event(
+        &tx,
+        AuditEntityType::Customer,
+        customer_id,
+        if is_active {
+            AuditAction::Reactivate
+        } else {
+            AuditAction::Archive
+        },
+        None,
+    )?;
+    tx.commit()?;
+    get_customer(connection, customer_id)?
+        .ok_or_else(|| AppError::Database("customer active state".into()))
+}
+
+fn archive_customer(connection: &mut Connection, customer_id: &str) -> Result<Customer, AppError> {
+    set_customer_active(connection, customer_id, false)
+}
+
+fn reactivate_customer(
+    connection: &mut Connection,
+    customer_id: &str,
+) -> Result<Customer, AppError> {
+    set_customer_active(connection, customer_id, true)
+}
+
+fn create_staff_tx(connection: &mut Connection, input: StaffInput) -> Result<Staff, AppError> {
     let first_name = normalize_text(&input.first_name, "firstName", 2, 100)?;
     let last_name = optional_text(input.last_name, 100)?;
     let phone = normalize_phone(input.phone.as_deref(), false)?;
@@ -1316,30 +1537,104 @@ fn create_staff_tx(connection: &Connection, input: StaffInput) -> Result<Staff, 
     let now = now_iso();
     let id = new_uuid();
     let sort_order = next_sort_order(connection, "staff", None)?;
-    connection.execute(
+    let tx = connection.transaction()?;
+    tx.execute(
         "INSERT INTO staff (id, first_name, last_name, phone, specialty_note, color_key, sort_order, is_active, created_at, updated_at)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
         params![id, first_name, last_name, phone, specialty_note, color_key, sort_order, bool_to_i64(input.is_active.unwrap_or(true)), now],
     )?;
+    append_audit_event(&tx, AuditEntityType::Staff, &id, AuditAction::Create, None)?;
+    tx.commit()?;
     get_staff(connection, &id)?.ok_or_else(|| AppError::Database("staff insert".to_string()))
 }
 
 fn update_staff_tx(
-    connection: &Connection,
+    connection: &mut Connection,
     id: &str,
     input: StaffInput,
 ) -> Result<Staff, AppError> {
-    get_staff(connection, id)?.ok_or_else(|| AppError::NotFound("STAFF_NOT_FOUND".to_string()))?;
+    let existing = get_staff(connection, id)?
+        .ok_or_else(|| AppError::NotFound("STAFF_NOT_FOUND".to_string()))?;
     let first_name = normalize_text(&input.first_name, "firstName", 2, 100)?;
     let last_name = optional_text(input.last_name, 100)?;
     let phone = normalize_phone(input.phone.as_deref(), false)?;
     let specialty_note = optional_text(input.specialty_note, 1000)?;
     let color_key = validate_color(&input.color_key)?;
-    connection.execute(
+    let is_active = input.is_active.unwrap_or(true);
+    let mut changed_fields = Vec::new();
+    if existing.first_name != first_name {
+        changed_fields.push("first_name");
+    }
+    if existing.last_name != last_name {
+        changed_fields.push("last_name");
+    }
+    if existing.phone != phone {
+        changed_fields.push("phone");
+    }
+    if existing.specialty_note != specialty_note {
+        changed_fields.push("specialty_note");
+    }
+    if existing.color_key != color_key {
+        changed_fields.push("color_key");
+    }
+    if existing.is_active != is_active {
+        changed_fields.push("is_active");
+    }
+    if changed_fields.is_empty() {
+        return Ok(existing);
+    }
+    let tx = connection.transaction()?;
+    tx.execute(
         "UPDATE staff SET first_name=?1,last_name=?2,phone=?3,specialty_note=?4,color_key=?5,is_active=?6,updated_at=?7 WHERE id=?8",
-        params![first_name, last_name, phone, specialty_note, color_key, bool_to_i64(input.is_active.unwrap_or(true)), now_iso(), id],
+        params![first_name, last_name, phone, specialty_note, color_key, bool_to_i64(is_active), now_iso(), id],
     )?;
+    append_audit_event(
+        &tx,
+        AuditEntityType::Staff,
+        id,
+        AuditAction::Update,
+        Some(AuditMetadata::ChangedFields(&changed_fields)),
+    )?;
+    tx.commit()?;
     get_staff(connection, id)?.ok_or_else(|| AppError::Database("staff update".to_string()))
+}
+
+fn set_staff_active(
+    connection: &mut Connection,
+    staff_id: &str,
+    is_active: bool,
+) -> Result<Staff, AppError> {
+    let existing = get_staff(connection, staff_id)?
+        .ok_or_else(|| AppError::NotFound("STAFF_NOT_FOUND".into()))?;
+    if existing.is_active == is_active {
+        return Ok(existing);
+    }
+    let tx = connection.transaction()?;
+    tx.execute(
+        "UPDATE staff SET is_active=?1, updated_at=?2 WHERE id=?3",
+        params![bool_to_i64(is_active), now_iso(), staff_id],
+    )?;
+    append_audit_event(
+        &tx,
+        AuditEntityType::Staff,
+        staff_id,
+        if is_active {
+            AuditAction::Reactivate
+        } else {
+            AuditAction::Deactivate
+        },
+        None,
+    )?;
+    tx.commit()?;
+    get_staff(connection, staff_id)?.ok_or_else(|| AppError::Database("staff active state".into()))
+}
+
+fn deactivate_staff(connection: &mut Connection, staff_id: &str) -> Result<Staff, AppError> {
+    set_staff_active(connection, staff_id, false)
+}
+
+fn reactivate_staff(connection: &mut Connection, staff_id: &str) -> Result<Staff, AppError> {
+    set_staff_active(connection, staff_id, true)
 }
 
 fn create_category_tx(
@@ -1376,7 +1671,7 @@ fn get_category(connection: &Connection, id: &str) -> Result<ServiceCategory, Ap
 }
 
 fn create_service_tx(
-    connection: &Connection,
+    connection: &mut Connection,
     input: ServiceInput,
 ) -> Result<ServiceItem, AppError> {
     get_category(connection, &input.category_id)
@@ -1397,10 +1692,19 @@ fn create_service_tx(
         "services",
         Some(("category_id", &input.category_id)),
     )?;
-    connection.execute(
+    let tx = connection.transaction()?;
+    tx.execute(
         "INSERT INTO services (id, category_id, name, name_key, duration_minutes, default_price_minor, sort_order, is_active, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
         params![id, input.category_id, name.clone(), name_key(&name), duration, default_price_minor, sort_order, bool_to_i64(input.is_active.unwrap_or(true)), now],
     )?;
+    append_audit_event(
+        &tx,
+        AuditEntityType::Service,
+        &id,
+        AuditAction::Create,
+        None,
+    )?;
+    tx.commit()?;
     get_service(connection, &id)?.ok_or_else(|| AppError::Database("service insert".to_string()))
 }
 
@@ -1412,11 +1716,11 @@ fn validate_duration(duration: i64) -> Result<(), AppError> {
 }
 
 fn update_service_tx(
-    connection: &Connection,
+    connection: &mut Connection,
     id: &str,
     input: ServiceInput,
 ) -> Result<ServiceItem, AppError> {
-    get_service(connection, id)?
+    let existing = get_service(connection, id)?
         .ok_or_else(|| AppError::NotFound("SERVICE_NOT_FOUND".to_string()))?;
     get_category(connection, &input.category_id)
         .map_err(|_| AppError::NotFound("CATEGORY_NOT_FOUND".to_string()))?;
@@ -1428,19 +1732,98 @@ fn update_service_tx(
     if default_price_minor < 0 {
         return Err(AppError::Validation("defaultPriceMinor invalid".into()));
     }
-    connection.execute(
+    let mut changed_fields = Vec::new();
+    if existing.category_id != input.category_id {
+        changed_fields.push("category_id");
+    }
+    if existing.name != name {
+        changed_fields.push("name");
+    }
+    if existing.duration_minutes != input.duration_minutes {
+        changed_fields.push("duration_minutes");
+    }
+    if existing.default_price_minor != default_price_minor {
+        changed_fields.push("default_price_minor");
+    }
+    if existing.is_active != input.is_active.unwrap_or(true) {
+        changed_fields.push("is_active");
+    }
+    if changed_fields.is_empty() {
+        return Ok(existing);
+    }
+    let tx = connection.transaction()?;
+    tx.execute(
         "UPDATE services SET category_id=?1,name=?2,name_key=?3,duration_minutes=?4,default_price_minor=?5,is_active=?6,updated_at=?7 WHERE id=?8",
         params![input.category_id, name.clone(), name_key(&name), input.duration_minutes, default_price_minor, bool_to_i64(input.is_active.unwrap_or(true)), now_iso(), id],
     )?;
+    append_audit_event(
+        &tx,
+        AuditEntityType::Service,
+        id,
+        AuditAction::Update,
+        Some(AuditMetadata::ChangedFields(&changed_fields)),
+    )?;
+    tx.commit()?;
     get_service(connection, id)?.ok_or_else(|| AppError::Database("service update".to_string()))
 }
 
-fn list_service_items(connection: &Connection) -> Result<Vec<ServiceItem>, AppError> {
-    let mut statement = connection.prepare(
+fn set_service_active(
+    connection: &mut Connection,
+    service_id: &str,
+    is_active: bool,
+) -> Result<ServiceItem, AppError> {
+    let existing = get_service(connection, service_id)?
+        .ok_or_else(|| AppError::NotFound("SERVICE_NOT_FOUND".into()))?;
+    if existing.is_active == is_active {
+        return Ok(existing);
+    }
+    let tx = connection.transaction()?;
+    tx.execute(
+        "UPDATE services SET is_active=?1, updated_at=?2 WHERE id=?3",
+        params![bool_to_i64(is_active), now_iso(), service_id],
+    )?;
+    append_audit_event(
+        &tx,
+        AuditEntityType::Service,
+        service_id,
+        if is_active {
+            AuditAction::Reactivate
+        } else {
+            AuditAction::Deactivate
+        },
+        None,
+    )?;
+    tx.commit()?;
+    get_service(connection, service_id)?
+        .ok_or_else(|| AppError::Database("service active state".into()))
+}
+
+fn deactivate_service(
+    connection: &mut Connection,
+    service_id: &str,
+) -> Result<ServiceItem, AppError> {
+    set_service_active(connection, service_id, false)
+}
+
+fn reactivate_service(
+    connection: &mut Connection,
+    service_id: &str,
+) -> Result<ServiceItem, AppError> {
+    set_service_active(connection, service_id, true)
+}
+
+fn list_service_items(connection: &Connection, status: &str) -> Result<Vec<ServiceItem>, AppError> {
+    let status_sql = match status {
+        "inactive" => "WHERE s.is_active=0",
+        "all" => "",
+        _ => "WHERE s.is_active=1",
+    };
+    let mut statement = connection.prepare(&format!(
         "SELECT s.*, c.name AS category_name, c.is_active AS category_is_active
          FROM services s INNER JOIN service_categories c ON c.id = s.category_id
-         ORDER BY c.sort_order ASC, s.sort_order ASC, s.name COLLATE NOCASE ASC",
-    )?;
+         {status_sql}
+         ORDER BY c.sort_order ASC, s.sort_order ASC, s.name COLLATE NOCASE ASC"
+    ))?;
     let rows = statement.query_map([], service_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
@@ -1787,6 +2170,13 @@ fn create_appointment_tx(
             params![id, snapshot.service_id, snapshot.service_name_snapshot, snapshot.duration_minutes_snapshot, snapshot.listed_price_snapshot_minor, snapshot.charged_price_minor, snapshot.sort_order, now],
         )?;
     }
+    append_audit_event(
+        &tx,
+        AuditEntityType::Appointment,
+        &id,
+        AuditAction::Create,
+        None,
+    )?;
     enqueue_google_sync_if_enabled(&tx, &id)?;
     reconcile_reminder_for_appointment(&tx, &id)?;
     tx.commit()?;
@@ -1840,6 +2230,38 @@ fn update_appointment_tx(
     if matches!(status.as_str(), "planned" | "confirmed" | "completed") {
         assert_no_conflict(&tx, &input.staff_id, &start_iso, &end_iso, Some(id))?;
     }
+    let no_change = used_existing
+        && current.customer_id == input.customer_id
+        && current.staff_id == input.staff_id
+        && current.start_at_utc == start_iso
+        && current.end_at_utc == end_iso
+        && current.total_duration_minutes == total_duration
+        && current.status == status
+        && current.note == note;
+    if no_change {
+        drop(tx);
+        return get_appointment(connection, id);
+    }
+    let mut changed_fields = Vec::new();
+    if current.customer_id != input.customer_id {
+        changed_fields.push("customer_id");
+    }
+    if current.staff_id != input.staff_id {
+        changed_fields.push("staff_id");
+    }
+    if current.start_at_utc != start_iso || current.end_at_utc != end_iso {
+        changed_fields.push("schedule");
+    }
+    if current.total_duration_minutes != total_duration {
+        changed_fields.push("duration_minutes");
+    }
+    if !used_existing {
+        changed_fields.push("service_ids");
+    }
+    if current.note != note {
+        changed_fields.push("note");
+    }
+    let status_changed = current.status != status;
     tx.execute(
         "UPDATE appointments SET customer_id=?1,staff_id=?2,start_at_utc=?3,end_at_utc=?4,total_duration_minutes=?5,status=?6,note=?7,updated_at=?8 WHERE id=?9",
         params![input.customer_id, input.staff_id, start_iso, end_iso, total_duration, status, note, now_iso(), id],
@@ -1858,6 +2280,26 @@ fn update_appointment_tx(
             )?;
         }
     }
+    let audit_action = if status_changed {
+        AuditAction::StatusChange
+    } else {
+        AuditAction::Update
+    };
+    let audit_metadata = if status_changed {
+        Some(AuditMetadata::StatusChange {
+            from_status: &current.status,
+            to_status: &status,
+        })
+    } else {
+        Some(AuditMetadata::ChangedFields(&changed_fields))
+    };
+    append_audit_event(
+        &tx,
+        AuditEntityType::Appointment,
+        id,
+        audit_action,
+        audit_metadata,
+    )?;
     enqueue_google_sync_if_enabled(&tx, id)?;
     reconcile_reminder_for_appointment(&tx, id)?;
     tx.commit()?;
@@ -1868,6 +2310,11 @@ fn update_appointment_tx(
 struct RawAppointment {
     customer_id: String,
     staff_id: String,
+    start_at_utc: String,
+    end_at_utc: String,
+    total_duration_minutes: i64,
+    status: String,
+    note: Option<String>,
 }
 
 fn get_raw_appointment(
@@ -1876,12 +2323,17 @@ fn get_raw_appointment(
 ) -> Result<Option<RawAppointment>, AppError> {
     connection
         .query_row(
-            "SELECT customer_id, staff_id FROM appointments WHERE id=?1",
+            "SELECT customer_id, staff_id, start_at_utc, end_at_utc, total_duration_minutes, status, note FROM appointments WHERE id=?1",
             params![id],
             |row| {
                 Ok(RawAppointment {
                     customer_id: row.get(0)?,
                     staff_id: row.get(1)?,
+                    start_at_utc: row.get(2)?,
+                    end_at_utc: row.get(3)?,
+                    total_duration_minutes: row.get(4)?,
+                    status: row.get(5)?,
+                    note: row.get(6)?,
                 })
             },
         )
@@ -1919,7 +2371,7 @@ pub struct ServiceStatistic {
 }
 
 fn set_appointment_service_charged_price(
-    connection: &Connection,
+    connection: &mut Connection,
     appointment_id: &str,
     service_id: &str,
     charged_price_minor: i64,
@@ -1927,10 +2379,34 @@ fn set_appointment_service_charged_price(
     if charged_price_minor < 0 {
         return Err(AppError::Validation("chargedPriceMinor invalid".into()));
     }
-    let changed = connection.execute("UPDATE appointment_services SET charged_price_minor=?1 WHERE appointment_id=?2 AND service_id=?3", params![charged_price_minor, appointment_id, service_id])?;
-    if changed == 0 {
-        return Err(AppError::NotFound("APPOINTMENT_SERVICE_NOT_FOUND".into()));
+    let previous_price_minor: i64 = connection
+        .query_row(
+            "SELECT charged_price_minor FROM appointment_services WHERE appointment_id=?1 AND service_id=?2",
+            params![appointment_id, service_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| AppError::NotFound("APPOINTMENT_SERVICE_NOT_FOUND".into()))?;
+    if previous_price_minor == charged_price_minor {
+        return Ok(());
     }
+    let tx = connection.transaction()?;
+    tx.execute(
+        "UPDATE appointment_services SET charged_price_minor=?1 WHERE appointment_id=?2 AND service_id=?3",
+        params![charged_price_minor, appointment_id, service_id],
+    )?;
+    let entity_id = format!("{appointment_id}:{service_id}");
+    append_audit_event(
+        &tx,
+        AuditEntityType::AppointmentService,
+        &entity_id,
+        AuditAction::PriceOverride,
+        Some(AuditMetadata::PriceOverride {
+            previous_minor: previous_price_minor,
+            new_minor: charged_price_minor,
+        }),
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -2494,8 +2970,8 @@ fn customer_create(
     input: CustomerInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<Customer, AppError> {
-    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    create_customer_tx(&connection, input)
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    create_customer_tx(&mut connection, input)
 }
 
 #[tauri::command]
@@ -2504,8 +2980,8 @@ fn customer_update(
     input: CustomerInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<Customer, AppError> {
-    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    update_customer_tx(&connection, &id, input)
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    update_customer_tx(&mut connection, &id, input)
 }
 
 #[tauri::command]
@@ -2514,13 +2990,23 @@ fn customer_set_active(
     is_active: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<Customer, AppError> {
-    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    connection.execute(
-        "UPDATE customers SET is_active=?1, updated_at=?2 WHERE id=?3",
-        params![bool_to_i64(is_active), now_iso(), id],
-    )?;
-    get_customer(&connection, &id)?
-        .ok_or_else(|| AppError::NotFound("CUSTOMER_NOT_FOUND".to_string()))
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    set_customer_active(&mut connection, &id, is_active)
+}
+
+#[tauri::command]
+fn customer_archive(id: String, state: tauri::State<'_, AppState>) -> Result<Customer, AppError> {
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    archive_customer(&mut connection, &id)
+}
+
+#[tauri::command]
+fn customer_reactivate(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Customer, AppError> {
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    reactivate_customer(&mut connection, &id)
 }
 
 #[tauri::command]
@@ -2563,8 +3049,8 @@ fn customer_search(
 
 #[tauri::command]
 fn staff_create(input: StaffInput, state: tauri::State<'_, AppState>) -> Result<Staff, AppError> {
-    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    create_staff_tx(&connection, input)
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    create_staff_tx(&mut connection, input)
 }
 
 #[tauri::command]
@@ -2573,8 +3059,8 @@ fn staff_update(
     input: StaffInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<Staff, AppError> {
-    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    update_staff_tx(&connection, &id, input)
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    update_staff_tx(&mut connection, &id, input)
 }
 
 #[tauri::command]
@@ -2583,12 +3069,20 @@ fn staff_set_active(
     is_active: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<Staff, AppError> {
-    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    connection.execute(
-        "UPDATE staff SET is_active=?1, updated_at=?2 WHERE id=?3",
-        params![bool_to_i64(is_active), now_iso(), id],
-    )?;
-    get_staff(&connection, &id)?.ok_or_else(|| AppError::NotFound("STAFF_NOT_FOUND".to_string()))
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    set_staff_active(&mut connection, &id, is_active)
+}
+
+#[tauri::command]
+fn staff_deactivate(id: String, state: tauri::State<'_, AppState>) -> Result<Staff, AppError> {
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    deactivate_staff(&mut connection, &id)
+}
+
+#[tauri::command]
+fn staff_reactivate(id: String, state: tauri::State<'_, AppState>) -> Result<Staff, AppError> {
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    reactivate_staff(&mut connection, &id)
 }
 
 #[tauri::command]
@@ -2701,8 +3195,8 @@ fn service_create(
     input: ServiceInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<ServiceItem, AppError> {
-    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    create_service_tx(&connection, input)
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    create_service_tx(&mut connection, input)
 }
 
 #[tauri::command]
@@ -2711,8 +3205,8 @@ fn service_update(
     input: ServiceInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<ServiceItem, AppError> {
-    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    update_service_tx(&connection, &id, input)
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    update_service_tx(&mut connection, &id, input)
 }
 
 #[tauri::command]
@@ -2721,19 +3215,36 @@ fn service_set_active(
     is_active: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<ServiceItem, AppError> {
-    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    connection.execute(
-        "UPDATE services SET is_active=?1, updated_at=?2 WHERE id=?3",
-        params![bool_to_i64(is_active), now_iso(), id],
-    )?;
-    get_service(&connection, &id)?
-        .ok_or_else(|| AppError::NotFound("SERVICE_NOT_FOUND".to_string()))
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    set_service_active(&mut connection, &id, is_active)
 }
 
 #[tauri::command]
-fn service_list(state: tauri::State<'_, AppState>) -> Result<Vec<ServiceItem>, AppError> {
+fn service_deactivate(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<ServiceItem, AppError> {
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    deactivate_service(&mut connection, &id)
+}
+
+#[tauri::command]
+fn service_reactivate(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<ServiceItem, AppError> {
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    reactivate_service(&mut connection, &id)
+}
+
+#[tauri::command]
+fn service_list(
+    status: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<ServiceItem>, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    list_service_items(&connection)
+    let status = status.as_deref().unwrap_or("active");
+    list_service_items(&connection, status)
 }
 
 #[tauri::command]
@@ -2762,9 +3273,9 @@ fn appointment_service_set_charged_price(
     charged_price_minor: i64,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), AppError> {
-    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     set_appointment_service_charged_price(
-        &connection,
+        &mut connection,
         &appointment_id,
         &service_id,
         charged_price_minor,
@@ -3026,10 +3537,10 @@ async fn google_calendar_connect(
             .calendar_id
             .clone()
             .unwrap_or_else(|| "primary".to_string());
-        let connection = open_database(&database_path)?;
+        let mut connection = open_database(&database_path)?;
         let protector = services::secure_store::WindowsDpapiProtector;
         services::secure_store::upsert_secret(
-            &connection,
+            &mut connection,
             &protector,
             "google_calendar_refresh_token",
             &token_set.refresh_token,
@@ -3451,10 +3962,14 @@ pub fn run() {
             customer_create,
             customer_update,
             customer_set_active,
+            customer_archive,
+            customer_reactivate,
             customer_search,
             staff_create,
             staff_update,
             staff_set_active,
+            staff_deactivate,
+            staff_reactivate,
             staff_list,
             staff_set_services,
             staff_working_hours_list,
@@ -3468,6 +3983,8 @@ pub fn run() {
             service_create,
             service_update,
             service_set_active,
+            service_deactivate,
+            service_reactivate,
             service_list,
             appointment_create,
             appointment_update,
@@ -3591,6 +4108,27 @@ mod tests {
         replace_staff_working_hours(connection, staff_id, intervals).expect("daily hours");
     }
 
+    fn audit_actions(
+        connection: &Connection,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Vec<(String, Option<String>)> {
+        let mut statement = connection
+            .prepare(
+                "SELECT action, metadata_json FROM audit_log
+                 WHERE entity_type=?1 AND entity_id=?2
+                 ORDER BY occurred_at ASC, id ASC",
+            )
+            .expect("audit query");
+        let rows = statement
+            .query_map(params![entity_type, entity_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("audit rows");
+        rows.collect::<Result<Vec<_>, _>>()
+            .expect("collect audit rows")
+    }
+
     #[test]
     fn empty_db_bootstrap_matches_v1_core_schema() {
         let (_temp, connection) = open_temp();
@@ -3616,6 +4154,9 @@ mod tests {
             "google_calendar_settings",
             "appointment_google_calendar_sync",
             "google_calendar_outbox",
+            "staff_working_hours",
+            "staff_time_off",
+            "audit_log",
         ] {
             let count: i64 = connection
                 .query_row(
@@ -3675,7 +4216,7 @@ mod tests {
         assert_eq!(service.availability_status, "ready");
 
         let updated = update_customer_tx(
-            &connection,
+            &mut connection,
             &customer.id,
             CustomerInput {
                 first_name: "Ayse Nur".into(),
@@ -3799,7 +4340,12 @@ mod tests {
             1
         );
         assert_eq!(staff_list_for_test(&connection).expect("staff").len(), 1);
-        assert_eq!(list_service_items(&connection).expect("services").len(), 1);
+        assert_eq!(
+            list_service_items(&connection, "active")
+                .expect("services")
+                .len(),
+            1
+        );
         assert_eq!(
             list_appointments_between(
                 &connection,
@@ -4027,7 +4573,7 @@ mod tests {
         let mut connection = open_database(&db_path).expect("open");
         let (mut customer, staff, service) = seed_core(&mut connection);
         customer = update_customer_tx(
-            &connection,
+            &mut connection,
             &customer.id,
             CustomerInput {
                 first_name: customer.first_name.clone(),
@@ -4234,7 +4780,7 @@ mod tests {
         )
         .expect("create");
         services::google::mark_google_outbox_synced(
-            &connection,
+            &mut connection,
             &appointment.id,
             &created_id,
             &appointment.start_at_utc,
@@ -4330,7 +4876,7 @@ mod tests {
         let (_temp, mut connection) = open_temp();
         let (mut customer, staff, service) = seed_core(&mut connection);
         customer = update_customer_tx(
-            &connection,
+            &mut connection,
             &customer.id,
             CustomerInput {
                 first_name: customer.first_name,
@@ -4444,7 +4990,7 @@ mod tests {
         let (_temp, mut connection) = open_temp();
         let (mut customer, staff, service) = seed_core(&mut connection);
         customer = update_customer_tx(
-            &connection,
+            &mut connection,
             &customer.id,
             CustomerInput {
                 first_name: customer.first_name,
@@ -4765,7 +5311,7 @@ mod tests {
 
         let suffix = (Utc::now().timestamp_millis() as u64) % 10_000_000;
         let customer = create_customer_tx(
-            &connection,
+            &mut connection,
             CustomerInput {
                 first_name: "Test".into(),
                 last_name: "Google Sync".into(),
@@ -4778,7 +5324,7 @@ mod tests {
         )
         .expect("create synthetic customer");
         let staff = create_staff_tx(
-            &connection,
+            &mut connection,
             StaffInput {
                 first_name: "Test".into(),
                 last_name: Some("Google Sync".into()),
@@ -4798,7 +5344,7 @@ mod tests {
         )
         .expect("create synthetic category");
         let service = create_service_tx(
-            &connection,
+            &mut connection,
             ServiceInput {
                 category_id: category.id,
                 name: "TEST Google Sync".into(),
@@ -5205,7 +5751,7 @@ mod tests {
         ).expect("v13 fixture");
         drop(old);
         let connection = open_database(&path).expect("migrate v13");
-        assert_eq!(read_schema_version(&connection).expect("version"), 16);
+        assert_eq!(read_schema_version(&connection).expect("version"), 17);
         assert_eq!(
             connection
                 .query_row(
@@ -5229,6 +5775,13 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM staff_time_off", [], |row| row
                     .get::<_, i64>(0))
                 .expect("time off empty"),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM audit_log", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("audit empty"),
             0
         );
         assert_eq!(
@@ -5279,9 +5832,707 @@ mod tests {
         let reopened = open_database(&path).expect("restart safe");
         assert_eq!(
             read_schema_version(&reopened).expect("version after restart"),
-            16
+            17
         );
         assert!(integrity_check(&reopened).expect("integrity after restart"));
+    }
+
+    #[test]
+    fn migrates_v16_to_append_only_audit_without_changing_business_history() {
+        let temp = tempdir().expect("temp");
+        let path = temp.path().join("v16.db");
+        let (customer_id, staff_id, service_id, appointment_id, counts) = {
+            let mut v16 = open_database(&path).expect("create v16-shaped fixture");
+            let (customer, staff, service) = seed_core(&mut v16);
+            let appointment = create_appointment_tx(
+                &mut v16,
+                appointment_input(
+                    &customer.id,
+                    &staff.id,
+                    "2036-11-02",
+                    "10:00",
+                    vec![service.id.clone()],
+                    "planned",
+                ),
+            )
+            .expect("fixture appointment");
+            let counts = (
+                v16.query_row("SELECT COUNT(*) FROM customers", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("customer count"),
+                v16.query_row("SELECT COUNT(*) FROM staff", [], |row| row.get::<_, i64>(0))
+                    .expect("staff count"),
+                v16.query_row("SELECT COUNT(*) FROM services", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("service count"),
+                v16.query_row("SELECT COUNT(*) FROM appointments", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("appointment count"),
+                v16.query_row("SELECT COUNT(*) FROM appointment_services", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("appointment service count"),
+            );
+            v16.execute_batch(
+                "DROP TRIGGER IF EXISTS audit_log_append_only_update;
+                 DROP TRIGGER IF EXISTS audit_log_append_only_delete;
+                 DROP TABLE audit_log;
+                 UPDATE app_meta SET schema_version=16;",
+            )
+            .expect("make v16 fixture");
+            (customer.id, staff.id, service.id, appointment.id, counts)
+        };
+
+        let connection = open_database(&path).expect("migrate v16");
+        assert_eq!(read_schema_version(&connection).expect("schema"), 17);
+        assert_eq!(
+            (
+                connection
+                    .query_row("SELECT COUNT(*) FROM customers", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .expect("customer count"),
+                connection
+                    .query_row("SELECT COUNT(*) FROM staff", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .expect("staff count"),
+                connection
+                    .query_row("SELECT COUNT(*) FROM services", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .expect("service count"),
+                connection
+                    .query_row("SELECT COUNT(*) FROM appointments", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .expect("appointment count"),
+                connection
+                    .query_row("SELECT COUNT(*) FROM appointment_services", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .expect("appointment service count"),
+            ),
+            counts
+        );
+        for (table, id) in [
+            ("customers", customer_id.as_str()),
+            ("staff", staff_id.as_str()),
+            ("services", service_id.as_str()),
+            ("appointments", appointment_id.as_str()),
+        ] {
+            let exists: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE id=?1"),
+                    params![id],
+                    |row| row.get(0),
+                )
+                .expect("preserved id");
+            assert_eq!(exists, 1, "{table}");
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT customer_id || ':' || staff_id FROM appointments WHERE id=?1",
+                    params![appointment_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("appointment foreign keys"),
+            format!("{customer_id}:{staff_id}")
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM appointment_services WHERE appointment_id=?1 AND service_id=?2",
+                    params![appointment_id, service_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("appointment service foreign key"),
+            1
+        );
+        for table in ["customers", "staff", "services"] {
+            let active: i64 = connection
+                .query_row(
+                    &format!("SELECT is_active FROM {table} LIMIT 1"),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("active state");
+            assert_eq!(active, 1, "{table} remains active");
+        }
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM audit_log", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("audit empty"),
+            0
+        );
+        for index in [
+            "audit_log_occurred_at_idx",
+            "audit_log_entity_occurred_at_idx",
+        ] {
+            let exists: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    params![index],
+                    |row| row.get(0),
+                )
+                .expect("audit index");
+            assert_eq!(exists, 1, "{index}");
+        }
+        connection
+            .execute(
+                "INSERT INTO audit_log (id, occurred_at, entity_type, entity_id, action, metadata_json)
+                 VALUES ('audit-1', '2036-11-02T07:00:00.000Z', 'appointment', ?1, 'create', '{\"source\":\"migration-test\"}')",
+                params![appointment_id],
+            )
+            .expect("audit insert");
+        assert!(connection
+            .execute(
+                "UPDATE audit_log SET action='update' WHERE id='audit-1'",
+                []
+            )
+            .is_err());
+        assert!(connection
+            .execute("DELETE FROM audit_log WHERE id='audit-1'", [])
+            .is_err());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("foreign key check"),
+            0
+        );
+        assert!(integrity_check(&connection).expect("integrity"));
+        drop(connection);
+        let reopened = open_database(&path).expect("restart safe");
+        assert_eq!(read_schema_version(&reopened).expect("reopened schema"), 17);
+        assert!(integrity_check(&reopened).expect("reopened integrity"));
+    }
+
+    #[test]
+    fn archive_and_inactive_domain_preserve_history_and_block_new_appointments() {
+        let (_temp, mut connection) = open_temp();
+        let (customer, staff, service) = seed_core(&mut connection);
+        let historical = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-12-01",
+                "10:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("historical appointment");
+        let historical_snapshots =
+            list_appointment_services(&connection, &historical.id).expect("historical snapshots");
+        let appointment_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM appointments", [], |row| row.get(0))
+            .expect("appointment count");
+        let appointment_service_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM appointment_services", [], |row| {
+                row.get(0)
+            })
+            .expect("appointment service count");
+
+        let archived = archive_customer(&mut connection, &customer.id).expect("archive customer");
+        assert!(!archived.is_active);
+        assert!(
+            get_customer(&connection, &customer.id)
+                .expect("customer detail")
+                .expect("customer preserved")
+                .is_active
+                == false
+        );
+        assert!(customer_search_for_test(&connection, "ayse", "active")
+            .expect("active customer list")
+            .is_empty());
+        assert_eq!(
+            customer_search_for_test(&connection, "ayse", "all")
+                .expect("all customer list")
+                .len(),
+            1
+        );
+        assert!(create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-12-01",
+                "11:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .is_err());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM appointments", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("archived customer did not book"),
+            appointment_count
+        );
+        assert!(get_appointment(&connection, &historical.id).is_ok());
+        assert_eq!(
+            list_appointment_services(&connection, &historical.id).expect("history snapshots"),
+            historical_snapshots
+        );
+        assert!(
+            reactivate_customer(&mut connection, &customer.id)
+                .expect("reactivate customer")
+                .is_active
+        );
+        create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-12-01",
+                "11:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("reactivated customer can book");
+
+        assert!(
+            !deactivate_staff(&mut connection, &staff.id)
+                .expect("deactivate staff")
+                .is_active
+        );
+        let active_staff_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM staff WHERE is_active=1", [], |row| {
+                row.get(0)
+            })
+            .expect("active staff list");
+        assert_eq!(active_staff_count, 0);
+        assert!(create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-12-01",
+                "12:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .is_err());
+        assert!(get_appointment(&connection, &historical.id).is_ok());
+        assert!(
+            reactivate_staff(&mut connection, &staff.id)
+                .expect("reactivate staff")
+                .is_active
+        );
+        create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-12-01",
+                "12:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("reactivated staff can book");
+
+        let inactive =
+            deactivate_service(&mut connection, &service.id).expect("deactivate service");
+        assert!(!inactive.is_active);
+        assert!(list_service_items(&connection, "active")
+            .expect("active service list")
+            .is_empty());
+        assert_eq!(
+            list_service_items(&connection, "all")
+                .expect("all service list")
+                .len(),
+            1
+        );
+        assert!(create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-12-01",
+                "13:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .is_err());
+        assert_eq!(
+            list_appointment_services(&connection, &historical.id)
+                .expect("inactive service history snapshots"),
+            historical_snapshots
+        );
+        assert!(
+            reactivate_service(&mut connection, &service.id)
+                .expect("reactivate service")
+                .is_active
+        );
+        create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-12-01",
+                "13:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("reactivated service can book");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM customers", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("customer retained"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM staff", [], |row| row.get::<_, i64>(0))
+                .expect("staff retained"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM services", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("service retained"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM appointment_services", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("new snapshots only from successful bookings"),
+            appointment_service_count + 3
+        );
+    }
+
+    #[test]
+    fn appointment_cancel_preserves_history_and_releases_the_slot() {
+        let (_temp, mut connection) = open_temp();
+        let (customer, staff, service) = seed_core(&mut connection);
+        let appointment = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-12-05",
+                "10:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("create appointment");
+        let snapshots_before =
+            list_appointment_services(&connection, &appointment.id).expect("snapshots before");
+
+        update_appointment_tx(
+            &mut connection,
+            &appointment.id,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-12-05",
+                "10:00",
+                vec![service.id.clone()],
+                "cancelled",
+            ),
+        )
+        .expect("cancel appointment");
+        update_appointment_tx(
+            &mut connection,
+            &appointment.id,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-12-05",
+                "10:00",
+                vec![service.id.clone()],
+                "cancelled",
+            ),
+        )
+        .expect("cancel no-op");
+
+        assert_eq!(
+            get_appointment(&connection, &appointment.id)
+                .expect("cancelled appointment")
+                .status,
+            "cancelled"
+        );
+        assert_eq!(
+            list_appointment_services(&connection, &appointment.id).expect("snapshots retained"),
+            snapshots_before
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM appointments WHERE id=?1",
+                    params![appointment.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("appointment row retained"),
+            1
+        );
+        assert_eq!(
+            audit_actions(&connection, "appointment", &appointment.id)
+                .iter()
+                .filter(|(action, _)| action == "status_change")
+                .count(),
+            1
+        );
+
+        create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-12-05",
+                "10:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("cancelled appointment releases slot");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("foreign key check"),
+            0
+        );
+    }
+
+    #[test]
+    fn audit_wiring_is_atomic_private_and_deduplicated() {
+        let (_temp, mut connection) = open_temp();
+        let (customer, staff, service) = seed_core(&mut connection);
+
+        let private_phone = "05559998877";
+        let private_email = "private@example.test";
+        let private_note = "oauth-token-like-note-must-not-be-audited";
+        update_customer_tx(
+            &mut connection,
+            &customer.id,
+            CustomerInput {
+                first_name: "Ayse Yeni".into(),
+                last_name: customer.last_name.clone(),
+                phone: Some(private_phone.into()),
+                email: Some(private_email.into()),
+                notes: Some(private_note.into()),
+                whatsapp_reminder_enabled: Some(true),
+                whatsapp_consent_confirmed: Some(false),
+            },
+        )
+        .expect("customer update");
+        archive_customer(&mut connection, &customer.id).expect("archive");
+        archive_customer(&mut connection, &customer.id).expect("archive no-op");
+        reactivate_customer(&mut connection, &customer.id).expect("reactivate");
+        let customer_audit = audit_actions(&connection, "customer", &customer.id);
+        assert_eq!(
+            customer_audit
+                .iter()
+                .map(|(action, _)| action.as_str())
+                .collect::<Vec<_>>(),
+            vec!["create", "update", "archive", "reactivate"]
+        );
+        let customer_metadata = customer_audit[1].1.as_deref().expect("update metadata");
+        assert!(customer_metadata.contains("changed_fields"));
+        assert!(customer_metadata.contains("phone"));
+        assert!(customer_metadata.contains("email"));
+        assert!(customer_metadata.contains("notes"));
+        assert!(!customer_metadata.contains(private_phone));
+        assert!(!customer_metadata.contains(private_email));
+        assert!(!customer_metadata.contains(private_note));
+
+        deactivate_staff(&mut connection, &staff.id).expect("deactivate staff");
+        reactivate_staff(&mut connection, &staff.id).expect("reactivate staff");
+        assert_eq!(
+            audit_actions(&connection, "staff", &staff.id)
+                .iter()
+                .map(|(action, _)| action.as_str())
+                .collect::<Vec<_>>(),
+            vec!["create", "deactivate", "reactivate"]
+        );
+        deactivate_service(&mut connection, &service.id).expect("deactivate service");
+        reactivate_service(&mut connection, &service.id).expect("reactivate service");
+        assert_eq!(
+            audit_actions(&connection, "service", &service.id)
+                .iter()
+                .map(|(action, _)| action.as_str())
+                .collect::<Vec<_>>(),
+            vec!["create", "deactivate", "reactivate"]
+        );
+
+        let appointment = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-12-04",
+                "10:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("appointment create");
+        update_appointment_tx(
+            &mut connection,
+            &appointment.id,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-12-04",
+                "11:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("appointment reschedule");
+        update_appointment_tx(
+            &mut connection,
+            &appointment.id,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-12-04",
+                "11:00",
+                vec![service.id.clone()],
+                "cancelled",
+            ),
+        )
+        .expect("appointment cancel");
+        update_appointment_tx(
+            &mut connection,
+            &appointment.id,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-12-04",
+                "11:00",
+                vec![service.id.clone()],
+                "cancelled",
+            ),
+        )
+        .expect("appointment status no-op");
+        let appointment_audit = audit_actions(&connection, "appointment", &appointment.id);
+        assert_eq!(
+            appointment_audit
+                .iter()
+                .map(|(action, _)| action.as_str())
+                .collect::<Vec<_>>(),
+            vec!["create", "update", "status_change"]
+        );
+        assert!(appointment_audit[2]
+            .1
+            .as_deref()
+            .expect("status metadata")
+            .contains("cancelled"));
+
+        let snapshots = list_appointment_services(&connection, &appointment.id).expect("snapshot");
+        let listed_before = snapshots[0].listed_price_snapshot_minor;
+        set_appointment_service_charged_price(
+            &mut connection,
+            &appointment.id,
+            &service.id,
+            125_000,
+        )
+        .expect("price override");
+        set_appointment_service_charged_price(
+            &mut connection,
+            &appointment.id,
+            &service.id,
+            125_000,
+        )
+        .expect("price override no-op");
+        let price_audit = audit_actions(
+            &connection,
+            "appointment_service",
+            &format!("{}:{}", appointment.id, service.id),
+        );
+        assert_eq!(price_audit.len(), 1);
+        assert_eq!(price_audit[0].0, "price_override");
+        assert!(price_audit[0]
+            .1
+            .as_deref()
+            .expect("price metadata")
+            .contains("125000"));
+        assert_eq!(
+            list_appointment_services(&connection, &appointment.id).expect("listed unchanged")[0]
+                .listed_price_snapshot_minor,
+            listed_before
+        );
+
+        let audit_before_invalid: i64 = connection
+            .query_row("SELECT COUNT(*) FROM audit_log", [], |row| row.get(0))
+            .expect("audit count");
+        assert!(create_customer_tx(
+            &mut connection,
+            CustomerInput {
+                first_name: "A".into(),
+                last_name: "Invalid".into(),
+                phone: None,
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: None,
+                whatsapp_consent_confirmed: None,
+            },
+        )
+        .is_err());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM audit_log", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("no audit for invalid mutation"),
+            audit_before_invalid
+        );
+
+        connection
+            .execute_batch(
+                "CREATE TRIGGER audit_log_test_insert_failure
+                 BEFORE INSERT ON audit_log
+                 BEGIN SELECT RAISE(ABORT, 'AUDIT_TEST_INSERT_FAILURE'); END;",
+            )
+            .expect("failure trigger");
+        let customer_count_before: i64 = connection
+            .query_row("SELECT COUNT(*) FROM customers", [], |row| row.get(0))
+            .expect("customer count");
+        assert!(create_customer_tx(
+            &mut connection,
+            CustomerInput {
+                first_name: "Atomic".into(),
+                last_name: "Rollback".into(),
+                phone: None,
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: None,
+                whatsapp_consent_confirmed: None,
+            },
+        )
+        .is_err());
+        connection
+            .execute_batch("DROP TRIGGER audit_log_test_insert_failure;")
+            .expect("drop failure trigger");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM customers", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("rolled back customer count"),
+            customer_count_before
+        );
     }
 
     fn require_live_dispatcher_paused(
@@ -5345,7 +6596,7 @@ mod tests {
             .expect("pending baseline");
         let marker = "BeautySaloon TEST CLOUD";
         let customer = create_customer_tx(
-            &connection,
+            &mut connection,
             CustomerInput {
                 first_name: "BeautySaloon".into(),
                 last_name: "TEST CLOUD".into(),
@@ -5358,7 +6609,7 @@ mod tests {
         )
         .expect("synthetic customer");
         let staff = create_staff_tx(
-            &connection,
+            &mut connection,
             StaffInput {
                 first_name: "BeautySaloon".into(),
                 last_name: Some("TEST CLOUD".into()),
@@ -5378,7 +6629,7 @@ mod tests {
         )
         .expect("synthetic category");
         let service = create_service_tx(
-            &connection,
+            &mut connection,
             ServiceInput {
                 category_id: category.id,
                 name: "BeautySaloon TEST CLOUD".into(),
@@ -5994,7 +7245,7 @@ mod tests {
         let (customer, staff, service) = seed_core(&mut connection);
         let category_id = service.category_id.clone();
         let second_service = create_service_tx(
-            &connection,
+            &mut connection,
             ServiceInput {
                 category_id: category_id.clone(),
                 name: "Ek Bakim".into(),
@@ -6045,7 +7296,7 @@ mod tests {
             75
         );
         update_service_tx(
-            &connection,
+            &mut connection,
             &service.id,
             ServiceInput {
                 category_id: category_id.clone(),
@@ -6408,7 +7659,7 @@ mod tests {
         let (customer, staff, service) = seed_core(&mut connection);
         configure_daily_hours(&mut connection, &staff.id);
         let long_service = create_service_tx(
-            &connection,
+            &mut connection,
             ServiceInput {
                 category_id: service.category_id.clone(),
                 name: "Uzun Bakim".into(),
