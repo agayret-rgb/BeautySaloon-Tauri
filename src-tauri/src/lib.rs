@@ -22,7 +22,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 mod services;
 
-const CORE_SCHEMA_VERSION: i64 = 17;
+const CORE_SCHEMA_VERSION: i64 = 18;
 const ISTANBUL_OFFSET_MINUTES: i64 = 180;
 const APPOINTMENT_STATUS_CANCELLED: &str = "cancelled";
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -61,6 +61,7 @@ enum AuditEntityType {
     Service,
     Appointment,
     AppointmentService,
+    BusinessProfile,
 }
 
 impl AuditEntityType {
@@ -71,6 +72,7 @@ impl AuditEntityType {
             Self::Service => "service",
             Self::Appointment => "appointment",
             Self::AppointmentService => "appointment_service",
+            Self::BusinessProfile => "business_profile",
         }
     }
 }
@@ -208,6 +210,33 @@ pub struct CustomerInput {
     notes: Option<String>,
     whatsapp_reminder_enabled: Option<bool>,
     whatsapp_consent_confirmed: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BusinessProfile {
+    business_name: String,
+    phone: Option<String>,
+    email: Option<String>,
+    address: Option<String>,
+    currency_code: String,
+    theme_key: String,
+    logo_data: Option<Vec<u8>>,
+    logo_mime_type: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BusinessProfileInput {
+    business_name: String,
+    phone: Option<String>,
+    email: Option<String>,
+    address: Option<String>,
+    currency_code: String,
+    theme_key: String,
+    logo_data: Option<Vec<u8>>,
+    logo_mime_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -712,11 +741,40 @@ fn migrate_core(connection: &Connection) -> Result<(), AppError> {
     migrate_v15_service_pricing(connection)?;
     migrate_v16_scheduling_schema(connection)?;
     migrate_v17_archive_and_audit_schema(connection)?;
+    migrate_v18_business_profile_schema(connection)?;
     connection.execute(
         "UPDATE app_meta SET schema_version = ?1 WHERE schema_version < ?1",
         params![CORE_SCHEMA_VERSION],
     )?;
     Ok(())
+}
+
+fn migrate_v18_business_profile_schema(connection: &Connection) -> Result<(), AppError> {
+    if read_schema_version(connection)? >= 18 {
+        return Ok(());
+    }
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE IF NOT EXISTS business_profile (
+               id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
+               business_name TEXT NOT NULL DEFAULT '',
+               phone TEXT NULL,
+               email TEXT NULL,
+               address TEXT NULL,
+               currency_code TEXT NOT NULL DEFAULT 'TRY' CHECK (currency_code GLOB '[A-Z][A-Z][A-Z]'),
+               theme_key TEXT NOT NULL DEFAULT 'default' CHECK (length(trim(theme_key)) > 0 AND length(theme_key) <= 64),
+               logo_data BLOB NULL,
+               logo_mime_type TEXT NULL,
+               updated_at TEXT NOT NULL,
+               CHECK ((logo_data IS NULL AND logo_mime_type IS NULL) OR (logo_data IS NOT NULL AND logo_mime_type IS NOT NULL))
+             );
+             INSERT INTO business_profile (id, business_name, phone, email, address, currency_code, theme_key, logo_data, logo_mime_type, updated_at)
+             VALUES (1, '', NULL, NULL, NULL, 'TRY', 'default', NULL, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             ON CONFLICT(id) DO NOTHING;
+             COMMIT;",
+        )
+        .map_err(Into::into)
 }
 
 fn migrate_v16_scheduling_schema(connection: &Connection) -> Result<(), AppError> {
@@ -930,6 +988,178 @@ fn optional_text(value: Option<String>, max: usize) -> Result<Option<String>, Ap
         }
         None => Ok(None),
     }
+}
+
+fn normalize_business_name(value: &str) -> Result<String, AppError> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() > 160 {
+        return Err(AppError::Validation("businessName length".to_string()));
+    }
+    Ok(normalized)
+}
+
+fn normalize_business_email(value: Option<String>) -> Result<Option<String>, AppError> {
+    let email = optional_text(value, 254)?;
+    if let Some(email) = &email {
+        let Some((local, domain)) = email.rsplit_once('@') else {
+            return Err(AppError::Validation("business email invalid".to_string()));
+        };
+        if local.is_empty()
+            || domain.is_empty()
+            || !domain.contains('.')
+            || email.chars().any(char::is_whitespace)
+        {
+            return Err(AppError::Validation("business email invalid".to_string()));
+        }
+    }
+    Ok(email)
+}
+
+fn normalize_currency_code(value: &str) -> Result<String, AppError> {
+    let normalized = value.trim().to_ascii_uppercase();
+    if normalized.len() != 3 || !normalized.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return Err(AppError::Validation("currencyCode invalid".to_string()));
+    }
+    Ok(normalized)
+}
+
+fn validate_theme_key(value: &str) -> Result<String, AppError> {
+    let normalized = value.trim();
+    if normalized == "default" {
+        Ok(normalized.to_string())
+    } else {
+        Err(AppError::Validation("themeKey invalid".to_string()))
+    }
+}
+
+fn normalize_business_logo(
+    logo_data: Option<Vec<u8>>,
+    logo_mime_type: Option<String>,
+) -> Result<(Option<Vec<u8>>, Option<String>), AppError> {
+    const MAX_LOGO_BYTES: usize = 3 * 1024 * 1024;
+    match (
+        logo_data,
+        logo_mime_type.map(|mime| mime.trim().to_ascii_lowercase()),
+    ) {
+        (None, None) => Ok((None, None)),
+        (Some(data), Some(mime)) => {
+            if data.is_empty() || data.len() > MAX_LOGO_BYTES {
+                return Err(AppError::Validation("logoData invalid".to_string()));
+            }
+            if !matches!(mime.as_str(), "image/png" | "image/jpeg" | "image/webp") {
+                return Err(AppError::Validation("logoMimeType invalid".to_string()));
+            }
+            Ok((Some(data), Some(mime)))
+        }
+        _ => Err(AppError::Validation(
+            "logo data and mime must match".to_string(),
+        )),
+    }
+}
+
+fn business_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BusinessProfile> {
+    Ok(BusinessProfile {
+        business_name: row.get(0)?,
+        phone: row.get(1)?,
+        email: row.get(2)?,
+        address: row.get(3)?,
+        currency_code: row.get(4)?,
+        theme_key: row.get(5)?,
+        logo_data: row.get(6)?,
+        logo_mime_type: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn ensure_business_profile_row(connection: &Connection) -> Result<(), AppError> {
+    connection.execute(
+        "INSERT INTO business_profile (id, business_name, phone, email, address, currency_code, theme_key, logo_data, logo_mime_type, updated_at)
+         VALUES (1, '', NULL, NULL, NULL, 'TRY', 'default', NULL, NULL, ?1)
+         ON CONFLICT(id) DO NOTHING",
+        params![now_iso()],
+    )?;
+    Ok(())
+}
+
+fn load_business_profile(connection: &Connection) -> Result<BusinessProfile, AppError> {
+    ensure_business_profile_row(connection)?;
+    connection
+        .query_row(
+            "SELECT business_name, phone, email, address, currency_code, theme_key, logo_data, logo_mime_type, updated_at
+             FROM business_profile WHERE id=1",
+            [],
+            business_profile_from_row,
+        )
+        .map_err(Into::into)
+}
+
+fn update_business_profile_tx(
+    connection: &mut Connection,
+    input: BusinessProfileInput,
+) -> Result<BusinessProfile, AppError> {
+    let business_name = normalize_business_name(&input.business_name)?;
+    let phone = optional_text(input.phone, 32)?;
+    let email = normalize_business_email(input.email)?;
+    let address = optional_text(input.address, 500)?;
+    let currency_code = normalize_currency_code(&input.currency_code)?;
+    let theme_key = validate_theme_key(&input.theme_key)?;
+    let (logo_data, logo_mime_type) =
+        normalize_business_logo(input.logo_data, input.logo_mime_type)?;
+    let tx = connection.transaction()?;
+    ensure_business_profile_row(&tx)?;
+    let current = load_business_profile(&tx)?;
+    let mut changed_fields = Vec::new();
+    if current.business_name != business_name {
+        changed_fields.push("business_name");
+    }
+    if current.phone != phone {
+        changed_fields.push("phone");
+    }
+    if current.email != email {
+        changed_fields.push("email");
+    }
+    if current.address != address {
+        changed_fields.push("address");
+    }
+    if current.currency_code != currency_code {
+        changed_fields.push("currency_code");
+    }
+    if current.theme_key != theme_key {
+        changed_fields.push("theme_key");
+    }
+    if current.logo_data != logo_data || current.logo_mime_type != logo_mime_type {
+        changed_fields.push("logo");
+    }
+    if changed_fields.is_empty() {
+        drop(tx);
+        return Ok(current);
+    }
+    tx.execute(
+        "UPDATE business_profile
+         SET business_name=?1, phone=?2, email=?3, address=?4, currency_code=?5, theme_key=?6,
+             logo_data=?7, logo_mime_type=?8, updated_at=?9
+         WHERE id=1",
+        params![
+            business_name,
+            phone,
+            email,
+            address,
+            currency_code,
+            theme_key,
+            logo_data,
+            logo_mime_type,
+            now_iso()
+        ],
+    )?;
+    append_audit_event(
+        &tx,
+        AuditEntityType::BusinessProfile,
+        "1",
+        AuditAction::Update,
+        Some(AuditMetadata::ChangedFields(&changed_fields)),
+    )?;
+    tx.commit()?;
+    load_business_profile(connection)
 }
 
 fn normalize_phone(value: Option<&str>, required: bool) -> Result<Option<String>, AppError> {
@@ -2966,6 +3196,21 @@ fn app_health(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<AppHe
 }
 
 #[tauri::command]
+fn get_business_profile(state: tauri::State<'_, AppState>) -> Result<BusinessProfile, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    load_business_profile(&connection)
+}
+
+#[tauri::command]
+fn update_business_profile(
+    input: BusinessProfileInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<BusinessProfile, AppError> {
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    update_business_profile_tx(&mut connection, input)
+}
+
+#[tauri::command]
 fn customer_create(
     input: CustomerInput,
     state: tauri::State<'_, AppState>,
@@ -3959,6 +4204,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_health,
+            get_business_profile,
+            update_business_profile,
             customer_create,
             customer_update,
             customer_set_active,
@@ -4108,6 +4355,19 @@ mod tests {
         replace_staff_working_hours(connection, staff_id, intervals).expect("daily hours");
     }
 
+    fn business_profile_input() -> BusinessProfileInput {
+        BusinessProfileInput {
+            business_name: String::new(),
+            phone: None,
+            email: None,
+            address: None,
+            currency_code: "TRY".into(),
+            theme_key: "default".into(),
+            logo_data: None,
+            logo_mime_type: None,
+        }
+    }
+
     fn audit_actions(
         connection: &Connection,
         entity_type: &str,
@@ -4157,6 +4417,7 @@ mod tests {
             "staff_working_hours",
             "staff_time_off",
             "audit_log",
+            "business_profile",
         ] {
             let count: i64 = connection
                 .query_row(
@@ -4205,6 +4466,247 @@ mod tests {
             )
             .expect("initialized_at");
         assert_eq!(initialized_at, "2026-08-24T00:00:00.000Z");
+    }
+
+    #[test]
+    fn business_profile_domain_enforces_single_row_and_safe_validation() {
+        let (_temp, mut connection) = open_temp();
+        let default_profile = load_business_profile(&connection).expect("default profile");
+        assert_eq!(default_profile.business_name, "");
+        assert_eq!(default_profile.currency_code, "TRY");
+        assert_eq!(default_profile.theme_key, "default");
+        assert_eq!(default_profile.phone, None);
+        assert_eq!(default_profile.email, None);
+        assert_eq!(default_profile.address, None);
+        assert_eq!(default_profile.logo_data, None);
+        assert_eq!(default_profile.logo_mime_type, None);
+
+        let mut input = business_profile_input();
+        input.business_name = "  Ada   Salon  ".into();
+        input.phone = Some("+90 555 111 22 33".into());
+        input.email = Some("owner@example.test".into());
+        input.address = Some("  Ataturk  Cad.  1  ".into());
+        input.currency_code = "try".into();
+        input.logo_data = Some(vec![1, 2, 3]);
+        input.logo_mime_type = Some("image/png".into());
+        let updated = update_business_profile_tx(&mut connection, input).expect("valid update");
+        assert_eq!(updated.business_name, "Ada Salon");
+        assert_eq!(updated.phone.as_deref(), Some("+90 555 111 22 33"));
+        assert_eq!(updated.email.as_deref(), Some("owner@example.test"));
+        assert_eq!(updated.address.as_deref(), Some("Ataturk Cad. 1"));
+        assert_eq!(updated.currency_code, "TRY");
+        assert_eq!(updated.logo_mime_type.as_deref(), Some("image/png"));
+
+        let mut blank_input = business_profile_input();
+        blank_input.business_name = "  \t  ".into();
+        blank_input.phone = Some("   ".into());
+        blank_input.email = Some("   ".into());
+        blank_input.address = Some("   ".into());
+        let blank_profile = update_business_profile_tx(&mut connection, blank_input)
+            .expect("blank optional values");
+        assert_eq!(blank_profile.business_name, "");
+        assert_eq!(blank_profile.phone, None);
+        assert_eq!(blank_profile.email, None);
+        assert_eq!(blank_profile.address, None);
+        assert_eq!(blank_profile.logo_data, None);
+        assert_eq!(blank_profile.logo_mime_type, None);
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM business_profile", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("single profile row"),
+            1
+        );
+
+        let mut contact_input = business_profile_input();
+        contact_input.phone = Some("+90 555 111 22 33".into());
+        contact_input.email = Some("owner@example.test".into());
+        contact_input.address = Some("Ataturk Cad. 1".into());
+        let valid_contact_profile =
+            update_business_profile_tx(&mut connection, contact_input).expect("valid contacts");
+        assert_eq!(
+            valid_contact_profile.phone.as_deref(),
+            Some("+90 555 111 22 33")
+        );
+        assert_eq!(
+            valid_contact_profile.email.as_deref(),
+            Some("owner@example.test")
+        );
+        assert_eq!(
+            valid_contact_profile.address.as_deref(),
+            Some("Ataturk Cad. 1")
+        );
+
+        let mut lowercase_currency = business_profile_input();
+        lowercase_currency.currency_code = "try".into();
+        let normalized_currency =
+            update_business_profile_tx(&mut connection, lowercase_currency).expect("lowercase TRY");
+        assert_eq!(normalized_currency.currency_code, "TRY");
+        let before_invalid = load_business_profile(&connection).expect("profile before invalid");
+        for invalid_currency in ["TR", "123", "TRYX"] {
+            let mut invalid_input = business_profile_input();
+            invalid_input.currency_code = invalid_currency.into();
+            assert!(update_business_profile_tx(&mut connection, invalid_input).is_err());
+            assert_eq!(
+                load_business_profile(&connection).expect("profile after invalid currency"),
+                before_invalid
+            );
+        }
+        let mut invalid_theme = business_profile_input();
+        invalid_theme.theme_key = "custom-css".into();
+        assert!(update_business_profile_tx(&mut connection, invalid_theme).is_err());
+        assert_eq!(
+            load_business_profile(&connection).expect("profile after invalid theme"),
+            before_invalid
+        );
+
+        for mime in ["image/png", "image/jpeg", "image/webp"] {
+            let mut logo_input = business_profile_input();
+            logo_input.logo_data = Some(vec![1, 2, 3]);
+            logo_input.logo_mime_type = Some(mime.into());
+            let logo_profile =
+                update_business_profile_tx(&mut connection, logo_input).expect("valid logo");
+            assert_eq!(logo_profile.logo_mime_type.as_deref(), Some(mime));
+        }
+        let profile_before_invalid_logo =
+            load_business_profile(&connection).expect("profile before logo");
+        let mut unsupported_logo = business_profile_input();
+        unsupported_logo.logo_data = Some(vec![1]);
+        unsupported_logo.logo_mime_type = Some("image/svg+xml".into());
+        assert!(update_business_profile_tx(&mut connection, unsupported_logo).is_err());
+        let mut missing_mime = business_profile_input();
+        missing_mime.logo_data = Some(vec![1]);
+        assert!(update_business_profile_tx(&mut connection, missing_mime).is_err());
+        let mut missing_data = business_profile_input();
+        missing_data.logo_mime_type = Some("image/png".into());
+        assert!(update_business_profile_tx(&mut connection, missing_data).is_err());
+        let mut empty_logo = business_profile_input();
+        empty_logo.logo_data = Some(Vec::new());
+        empty_logo.logo_mime_type = Some("image/png".into());
+        assert!(update_business_profile_tx(&mut connection, empty_logo).is_err());
+        let mut oversized_logo = business_profile_input();
+        oversized_logo.logo_data = Some(vec![0; 3 * 1024 * 1024 + 1]);
+        oversized_logo.logo_mime_type = Some("image/png".into());
+        assert!(update_business_profile_tx(&mut connection, oversized_logo).is_err());
+        assert_eq!(
+            load_business_profile(&connection).expect("profile after invalid logos"),
+            profile_before_invalid_logo
+        );
+
+        let mut oversized_name = business_profile_input();
+        oversized_name.business_name = "x".repeat(161);
+        assert!(update_business_profile_tx(&mut connection, oversized_name).is_err());
+        let mut oversized_phone = business_profile_input();
+        oversized_phone.phone = Some("1".repeat(33));
+        assert!(update_business_profile_tx(&mut connection, oversized_phone).is_err());
+        let mut oversized_address = business_profile_input();
+        oversized_address.address = Some("x".repeat(501));
+        assert!(update_business_profile_tx(&mut connection, oversized_address).is_err());
+        let mut invalid_email = business_profile_input();
+        invalid_email.email = Some("not-an-email".into());
+        assert!(update_business_profile_tx(&mut connection, invalid_email).is_err());
+        assert_eq!(
+            load_business_profile(&connection).expect("profile after invalid contacts"),
+            profile_before_invalid_logo
+        );
+    }
+
+    #[test]
+    fn business_profile_audit_is_private_atomic_and_deduplicated() {
+        let (_temp, mut connection) = open_temp();
+        let private_phone = "+90 555 777 88 99";
+        let private_email = "profile@example.test";
+        let private_address = "Private address must not be audited";
+        let mut input = business_profile_input();
+        input.business_name = "Profile Test".into();
+        input.phone = Some(private_phone.into());
+        input.email = Some(private_email.into());
+        input.address = Some(private_address.into());
+        input.logo_data = Some(vec![7, 8, 9]);
+        input.logo_mime_type = Some("image/png".into());
+        let updated = update_business_profile_tx(&mut connection, input.clone()).expect("update");
+        assert_eq!(updated.business_name, "Profile Test");
+        let audit = audit_actions(&connection, "business_profile", "1");
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].0, "update");
+        let metadata = audit[0].1.as_deref().expect("changed fields metadata");
+        for field in ["business_name", "phone", "email", "address", "logo"] {
+            assert!(metadata.contains(field), "missing {field}");
+        }
+        assert!(!metadata.contains(private_phone));
+        assert!(!metadata.contains(private_email));
+        assert!(!metadata.contains(private_address));
+        assert!(!metadata.contains("image/png"));
+        assert!(!metadata.contains("7,8,9"));
+
+        update_business_profile_tx(&mut connection, input.clone()).expect("same-value no-op");
+        let mut normalized_same_value = input.clone();
+        normalized_same_value.currency_code = "try".into();
+        update_business_profile_tx(&mut connection, normalized_same_value)
+            .expect("normalized same-value no-op");
+        assert_eq!(audit_actions(&connection, "business_profile", "1").len(), 1);
+
+        let profile_before_invalid =
+            load_business_profile(&connection).expect("profile before invalid");
+        let mut invalid = input.clone();
+        invalid.currency_code = "X".into();
+        assert!(update_business_profile_tx(&mut connection, invalid).is_err());
+        assert_eq!(
+            load_business_profile(&connection).expect("profile after invalid"),
+            profile_before_invalid
+        );
+        assert_eq!(audit_actions(&connection, "business_profile", "1").len(), 1);
+
+        connection
+            .execute_batch(
+                "CREATE TRIGGER business_profile_audit_test_failure
+                 BEFORE INSERT ON audit_log
+                 BEGIN SELECT RAISE(ABORT, 'BUSINESS_PROFILE_AUDIT_TEST_FAILURE'); END;",
+            )
+            .expect("audit failure trigger");
+        let mut failing_update = input;
+        failing_update.business_name = "Must Roll Back".into();
+        assert!(update_business_profile_tx(&mut connection, failing_update).is_err());
+        connection
+            .execute_batch("DROP TRIGGER business_profile_audit_test_failure;")
+            .expect("drop audit failure trigger");
+        assert_eq!(
+            load_business_profile(&connection).expect("profile after audit failure"),
+            profile_before_invalid
+        );
+        assert_eq!(audit_actions(&connection, "business_profile", "1").len(), 1);
+    }
+
+    #[test]
+    fn business_profile_tauri_dtos_use_typed_camel_case_fields() {
+        let input: BusinessProfileInput = serde_json::from_value(serde_json::json!({
+            "businessName": "Test",
+            "phone": null,
+            "email": null,
+            "address": null,
+            "currencyCode": "TRY",
+            "themeKey": "default",
+            "logoData": null,
+            "logoMimeType": null
+        }))
+        .expect("typed input");
+        assert_eq!(input.business_name, "Test");
+        let output = serde_json::to_value(BusinessProfile {
+            business_name: "Test".into(),
+            phone: None,
+            email: None,
+            address: None,
+            currency_code: "TRY".into(),
+            theme_key: "default".into(),
+            logo_data: None,
+            logo_mime_type: None,
+            updated_at: "2026-08-31T00:00:00.000Z".into(),
+        })
+        .expect("typed output");
+        assert!(output.get("businessName").is_some());
+        assert!(output.get("currencyCode").is_some());
+        assert!(output.get("logoData").is_some());
+        assert!(output.get("logoMimeType").is_some());
     }
 
     #[test]
@@ -5751,7 +6253,7 @@ mod tests {
         ).expect("v13 fixture");
         drop(old);
         let connection = open_database(&path).expect("migrate v13");
-        assert_eq!(read_schema_version(&connection).expect("version"), 17);
+        assert_eq!(read_schema_version(&connection).expect("version"), 18);
         assert_eq!(
             connection
                 .query_row(
@@ -5832,7 +6334,7 @@ mod tests {
         let reopened = open_database(&path).expect("restart safe");
         assert_eq!(
             read_schema_version(&reopened).expect("version after restart"),
-            17
+            18
         );
         assert!(integrity_check(&reopened).expect("integrity after restart"));
     }
@@ -5887,7 +6389,7 @@ mod tests {
         };
 
         let connection = open_database(&path).expect("migrate v16");
-        assert_eq!(read_schema_version(&connection).expect("schema"), 17);
+        assert_eq!(read_schema_version(&connection).expect("schema"), 18);
         assert_eq!(
             (
                 connection
@@ -6010,8 +6512,178 @@ mod tests {
         assert!(integrity_check(&connection).expect("integrity"));
         drop(connection);
         let reopened = open_database(&path).expect("restart safe");
-        assert_eq!(read_schema_version(&reopened).expect("reopened schema"), 17);
+        assert_eq!(read_schema_version(&reopened).expect("reopened schema"), 18);
         assert!(integrity_check(&reopened).expect("reopened integrity"));
+    }
+
+    #[test]
+    fn migrates_v17_to_single_business_profile_without_changing_business_history() {
+        let temp = tempdir().expect("temp");
+        let path = temp.path().join("v17.db");
+        let (customer_id, staff_id, service_id, appointment_id, counts) = {
+            let mut v17 = open_database(&path).expect("create v17-shaped fixture");
+            let (customer, staff, service) = seed_core(&mut v17);
+            let appointment = create_appointment_tx(
+                &mut v17,
+                appointment_input(
+                    &customer.id,
+                    &staff.id,
+                    "2036-11-03",
+                    "10:00",
+                    vec![service.id.clone()],
+                    "planned",
+                ),
+            )
+            .expect("fixture appointment");
+            let counts = (
+                v17.query_row("SELECT COUNT(*) FROM customers", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("customer count"),
+                v17.query_row("SELECT COUNT(*) FROM staff", [], |row| row.get::<_, i64>(0))
+                    .expect("staff count"),
+                v17.query_row("SELECT COUNT(*) FROM services", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("service count"),
+                v17.query_row("SELECT COUNT(*) FROM appointments", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("appointment count"),
+                v17.query_row("SELECT COUNT(*) FROM appointment_services", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("appointment service count"),
+            );
+            v17.execute_batch(
+                "DROP TABLE business_profile;
+                 UPDATE app_meta SET schema_version=17;",
+            )
+            .expect("make v17 fixture");
+            (customer.id, staff.id, service.id, appointment.id, counts)
+        };
+
+        let connection = open_database(&path).expect("migrate v17");
+        assert_eq!(read_schema_version(&connection).expect("schema"), 18);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT business_name, phone, email, address, currency_code, theme_key,
+                            logo_data IS NULL, logo_mime_type IS NULL
+                     FROM business_profile WHERE id=1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, bool>(6)?,
+                            row.get::<_, bool>(7)?,
+                        ))
+                    },
+                )
+                .expect("default profile"),
+            (
+                String::new(),
+                None,
+                None,
+                None,
+                "TRY".to_string(),
+                "default".to_string(),
+                true,
+                true,
+            )
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM business_profile", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("one profile"),
+            1
+        );
+        assert_eq!(
+            (
+                connection
+                    .query_row("SELECT COUNT(*) FROM customers", [], |row| row
+                        .get::<_, i64>(0))
+                    .expect("customer count"),
+                connection
+                    .query_row("SELECT COUNT(*) FROM staff", [], |row| row.get::<_, i64>(0))
+                    .expect("staff count"),
+                connection
+                    .query_row("SELECT COUNT(*) FROM services", [], |row| row
+                        .get::<_, i64>(0))
+                    .expect("service count"),
+                connection
+                    .query_row("SELECT COUNT(*) FROM appointments", [], |row| row
+                        .get::<_, i64>(0))
+                    .expect("appointment count"),
+                connection
+                    .query_row("SELECT COUNT(*) FROM appointment_services", [], |row| row
+                        .get::<_, i64>(
+                        0
+                    ))
+                    .expect("appointment service count"),
+            ),
+            counts
+        );
+        for (table, id) in [
+            ("customers", customer_id.as_str()),
+            ("staff", staff_id.as_str()),
+            ("services", service_id.as_str()),
+            ("appointments", appointment_id.as_str()),
+        ] {
+            let exists: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE id=?1"),
+                    params![id],
+                    |row| row.get(0),
+                )
+                .expect("preserved id");
+            assert_eq!(exists, 1, "{table}");
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM appointment_services WHERE appointment_id=?1 AND service_id=?2",
+                    params![appointment_id, service_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("preserved foreign key"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("foreign key check"),
+            0
+        );
+        assert!(integrity_check(&connection).expect("integrity"));
+        drop(connection);
+        let reopened = open_database(&path).expect("restart safe");
+        assert_eq!(read_schema_version(&reopened).expect("reopened schema"), 18);
+        assert_eq!(
+            reopened
+                .query_row("SELECT COUNT(*) FROM business_profile", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("reopened profile"),
+            1
+        );
+        assert!(integrity_check(&reopened).expect("reopened integrity"));
+        drop(reopened);
+        let reopened_again = open_database(&path).expect("second startup safe");
+        assert_eq!(
+            reopened_again
+                .query_row("SELECT COUNT(*) FROM business_profile", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("second profile"),
+            1
+        );
     }
 
     #[test]
