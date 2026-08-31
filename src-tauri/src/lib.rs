@@ -1,5 +1,5 @@
 use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -360,6 +360,55 @@ pub struct AppointmentSummary {
     service_names: Vec<String>,
     services: Vec<AppointmentServiceSnapshot>,
     updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerHistoryCustomer {
+    customer_id: String,
+    name: String,
+    phone: Option<String>,
+    is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerHistoryAppointment {
+    appointment_id: String,
+    local_date: String,
+    local_time: String,
+    status: String,
+    staff_id: String,
+    staff_display_name: String,
+    services: Vec<AppointmentServiceSnapshot>,
+    total_charged_minor: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerHistoryPage {
+    customer: CustomerHistoryCustomer,
+    appointments: Vec<CustomerHistoryAppointment>,
+    limit: i64,
+    offset: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepeatBookingSeedService {
+    service_id: String,
+    service_name_snapshot: String,
+    is_eligible: bool,
+    unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepeatBookingSeed {
+    customer_id: String,
+    customer_display_name: String,
+    staff_id: Option<String>,
+    services: Vec<RepeatBookingSeedService>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2591,6 +2640,199 @@ fn list_appointment_services(
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+fn history_local_date_time(start_at_utc: &str) -> Result<(String, String), AppError> {
+    let utc = chrono::DateTime::parse_from_rfc3339(start_at_utc)
+        .map_err(|_| AppError::Database("appointment start timestamp".to_string()))?
+        .with_timezone(&Utc);
+    let local = utc + Duration::minutes(ISTANBUL_OFFSET_MINUTES);
+    Ok((
+        local.format("%Y-%m-%d").to_string(),
+        local.format("%H:%M").to_string(),
+    ))
+}
+
+fn load_customer_history(
+    connection: &Connection,
+    customer_id: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<CustomerHistoryPage, AppError> {
+    let customer = get_customer(connection, customer_id)?
+        .ok_or_else(|| AppError::NotFound("CUSTOMER_NOT_FOUND".to_string()))?;
+    let limit = limit.clamp(1, 100);
+    let offset = offset.max(0);
+    let mut appointments_statement = connection.prepare(
+        "SELECT a.id, a.start_at_utc, a.status, a.staff_id,
+                st.first_name || COALESCE(' ' || st.last_name, '') AS staff_display_name
+         FROM appointments a
+         INNER JOIN staff st ON st.id=a.staff_id
+         WHERE a.customer_id=?1
+         ORDER BY a.start_at_utc DESC, a.id DESC
+         LIMIT ?2 OFFSET ?3",
+    )?;
+    let appointment_rows =
+        appointments_statement.query_map(params![customer_id, limit, offset], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+    let appointments = appointment_rows.collect::<Result<Vec<_>, _>>()?;
+    if appointments.is_empty() {
+        return Ok(CustomerHistoryPage {
+            customer: CustomerHistoryCustomer {
+                customer_id: customer.id,
+                name: format!("{} {}", customer.first_name, customer.last_name),
+                phone: customer.phone,
+                is_active: customer.is_active,
+            },
+            appointments: Vec::new(),
+            limit,
+            offset,
+        });
+    }
+
+    let appointment_ids: Vec<&str> = appointments.iter().map(|(id, ..)| id.as_str()).collect();
+    let placeholders = std::iter::repeat("?")
+        .take(appointment_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut services_statement = connection.prepare(&format!(
+        "SELECT appointment_id, service_id, service_name_snapshot, duration_minutes_snapshot,
+                listed_price_snapshot_minor, charged_price_minor, sort_order
+         FROM appointment_services
+         WHERE appointment_id IN ({placeholders})
+         ORDER BY appointment_id ASC, sort_order ASC"
+    ))?;
+    let service_rows = services_statement.query_map(params_from_iter(appointment_ids), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            AppointmentServiceSnapshot {
+                service_id: row.get(1)?,
+                service_name_snapshot: row.get(2)?,
+                duration_minutes_snapshot: row.get(3)?,
+                listed_price_snapshot_minor: row.get(4)?,
+                charged_price_minor: row.get(5)?,
+                sort_order: row.get(6)?,
+            },
+        ))
+    })?;
+    let mut services_by_appointment: HashMap<String, Vec<AppointmentServiceSnapshot>> =
+        HashMap::new();
+    for service_row in service_rows {
+        let (appointment_id, snapshot) = service_row?;
+        services_by_appointment
+            .entry(appointment_id)
+            .or_default()
+            .push(snapshot);
+    }
+    let appointments = appointments
+        .into_iter()
+        .map(
+            |(appointment_id, start_at_utc, status, staff_id, staff_display_name)| {
+                let (local_date, local_time) = history_local_date_time(&start_at_utc)?;
+                let services = services_by_appointment
+                    .remove(&appointment_id)
+                    .unwrap_or_default();
+                let total_charged_minor = services
+                    .iter()
+                    .map(|service| service.charged_price_minor)
+                    .sum();
+                Ok(CustomerHistoryAppointment {
+                    appointment_id,
+                    local_date,
+                    local_time,
+                    status,
+                    staff_id,
+                    staff_display_name,
+                    services,
+                    total_charged_minor,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>, AppError>>()?;
+    Ok(CustomerHistoryPage {
+        customer: CustomerHistoryCustomer {
+            customer_id: customer.id,
+            name: format!("{} {}", customer.first_name, customer.last_name),
+            phone: customer.phone,
+            is_active: customer.is_active,
+        },
+        appointments,
+        limit,
+        offset,
+    })
+}
+
+fn load_repeat_booking_seed(
+    connection: &Connection,
+    customer_id: &str,
+    source_appointment_id: &str,
+) -> Result<RepeatBookingSeed, AppError> {
+    let customer = get_customer(connection, customer_id)?
+        .ok_or_else(|| AppError::NotFound("CUSTOMER_NOT_FOUND".to_string()))?;
+    let source = connection
+        .query_row(
+            "SELECT customer_id, staff_id FROM appointments WHERE id=?1",
+            params![source_appointment_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| AppError::NotFound("APPOINTMENT_NOT_FOUND".to_string()))?;
+    if source.0 != customer_id {
+        return Err(AppError::Conflict(
+            "APPOINTMENT_CUSTOMER_MISMATCH".to_string(),
+        ));
+    }
+    if !customer.is_active {
+        return Err(AppError::Conflict(
+            "CUSTOMER_REACTIVATION_REQUIRED".to_string(),
+        ));
+    }
+    let staff_id = get_staff(connection, &source.1)?.and_then(|staff| {
+        if staff.is_active {
+            Some(staff.id)
+        } else {
+            None
+        }
+    });
+    let mut statement = connection.prepare(
+        "SELECT aps.service_id, aps.service_name_snapshot, s.is_active, c.is_active
+         FROM appointment_services aps
+         INNER JOIN services s ON s.id=aps.service_id
+         INNER JOIN service_categories c ON c.id=s.category_id
+         WHERE aps.appointment_id=?1
+         ORDER BY aps.sort_order ASC",
+    )?;
+    let rows = statement.query_map(params![source_appointment_id], |row| {
+        let service_active = row.get::<_, i64>(2)? != 0;
+        let category_active = row.get::<_, i64>(3)? != 0;
+        let unavailable_reason = if !service_active {
+            Some("service_inactive".to_string())
+        } else if !category_active {
+            Some("service_category_inactive".to_string())
+        } else {
+            None
+        };
+        Ok(RepeatBookingSeedService {
+            service_id: row.get(0)?,
+            service_name_snapshot: row.get(1)?,
+            is_eligible: unavailable_reason.is_none(),
+            unavailable_reason,
+        })
+    })?;
+    let services = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(RepeatBookingSeed {
+        customer_id: customer.id,
+        customer_display_name: format!("{} {}", customer.first_name, customer.last_name),
+        staff_id,
+        services,
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceStatistic {
@@ -3290,6 +3532,32 @@ fn customer_search(
         customer_from_row,
     )?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+#[tauri::command]
+fn customer_history(
+    customer_id: String,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    state: tauri::State<'_, AppState>,
+) -> Result<CustomerHistoryPage, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    load_customer_history(
+        &connection,
+        &customer_id,
+        limit.unwrap_or(20),
+        offset.unwrap_or(0),
+    )
+}
+
+#[tauri::command]
+fn get_repeat_booking_seed(
+    customer_id: String,
+    source_appointment_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<RepeatBookingSeed, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    load_repeat_booking_seed(&connection, &customer_id, &source_appointment_id)
 }
 
 #[tauri::command]
@@ -4212,6 +4480,8 @@ pub fn run() {
             customer_archive,
             customer_reactivate,
             customer_search,
+            customer_history,
+            get_repeat_booking_seed,
             staff_create,
             staff_update,
             staff_set_active,
@@ -4707,6 +4977,443 @@ mod tests {
         assert!(output.get("currencyCode").is_some());
         assert!(output.get("logoData").is_some());
         assert!(output.get("logoMimeType").is_some());
+    }
+
+    #[test]
+    fn repeat_booking_seed_is_read_only_snapshot_named_and_eligibility_aware() {
+        let (_temp, mut connection) = open_temp();
+        let (customer, staff, service) = seed_core(&mut connection);
+        update_service_tx(
+            &mut connection,
+            &service.id,
+            ServiceInput {
+                category_id: service.category_id.clone(),
+                name: service.name.clone(),
+                duration_minutes: service.duration_minutes,
+                default_price_minor: Some(100_000),
+                is_active: Some(true),
+            },
+        )
+        .expect("set default price");
+        let second_service = create_service_tx(
+            &mut connection,
+            ServiceInput {
+                category_id: service.category_id.clone(),
+                name: "Historical Add-on".into(),
+                duration_minutes: Some(45),
+                default_price_minor: Some(200_000),
+                is_active: Some(true),
+            },
+        )
+        .expect("second service");
+        set_staff_services_tx(
+            &mut connection,
+            &staff.id,
+            vec![service.id.clone(), second_service.id.clone()],
+        )
+        .expect("staff services");
+        let source = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2025-02-01",
+                "10:00",
+                vec![service.id.clone(), second_service.id.clone()],
+                "completed",
+            ),
+        )
+        .expect("source appointment");
+        set_appointment_service_charged_price(&mut connection, &source.id, &service.id, 75_000)
+            .expect("historical discount");
+        let other_customer = create_customer_tx(
+            &mut connection,
+            CustomerInput {
+                first_name: "Other".into(),
+                last_name: "Customer".into(),
+                phone: None,
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: None,
+                whatsapp_consent_confirmed: None,
+            },
+        )
+        .expect("other customer");
+
+        let before_seed_counts = (
+            connection
+                .query_row("SELECT COUNT(*) FROM appointments", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("appointment count"),
+            connection
+                .query_row("SELECT COUNT(*) FROM appointment_services", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("appointment service count"),
+            connection
+                .query_row("SELECT COUNT(*) FROM audit_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("audit count"),
+            connection
+                .query_row("SELECT COUNT(*) FROM google_calendar_outbox", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("google outbox count"),
+            connection
+                .query_row("SELECT COUNT(*) FROM reminder_cloud_outbox", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("cloud outbox count"),
+        );
+        let seed = load_repeat_booking_seed(&connection, &customer.id, &source.id).expect("seed");
+        assert_eq!(seed.customer_id, customer.id);
+        assert_eq!(seed.customer_display_name, "Ayse Yilmaz");
+        assert_eq!(seed.staff_id.as_deref(), Some(staff.id.as_str()));
+        assert_eq!(seed.services.len(), 2);
+        assert_eq!(seed.services[0].service_name_snapshot, "Klasik Bakim");
+        assert!(seed.services.iter().all(|service| service.is_eligible));
+        let seed_json = serde_json::to_value(&seed).expect("seed json");
+        assert!(seed_json.get("listedPriceSnapshotMinor").is_none());
+        assert!(seed_json.get("chargedPriceMinor").is_none());
+        assert!(seed_json.get("durationMinutesSnapshot").is_none());
+        assert!(load_repeat_booking_seed(&connection, &other_customer.id, &source.id).is_err());
+        assert!(load_repeat_booking_seed(&connection, &customer.id, "missing").is_err());
+        assert_eq!(
+            (
+                connection
+                    .query_row("SELECT COUNT(*) FROM appointments", [], |row| row
+                        .get::<_, i64>(0))
+                    .expect("appointment count after seed"),
+                connection
+                    .query_row("SELECT COUNT(*) FROM appointment_services", [], |row| row
+                        .get::<_, i64>(
+                        0
+                    ))
+                    .expect("appointment service count after seed"),
+                connection
+                    .query_row("SELECT COUNT(*) FROM audit_log", [], |row| row
+                        .get::<_, i64>(0))
+                    .expect("audit count after seed"),
+                connection
+                    .query_row("SELECT COUNT(*) FROM google_calendar_outbox", [], |row| row
+                        .get::<_, i64>(0))
+                    .expect("google outbox count after seed"),
+                connection
+                    .query_row("SELECT COUNT(*) FROM reminder_cloud_outbox", [], |row| row
+                        .get::<_, i64>(
+                        0
+                    ))
+                    .expect("cloud outbox count after seed"),
+            ),
+            before_seed_counts
+        );
+
+        update_service_tx(
+            &mut connection,
+            &service.id,
+            ServiceInput {
+                category_id: service.category_id.clone(),
+                name: "Renamed Current Service".into(),
+                duration_minutes: Some(60),
+                default_price_minor: Some(999_000),
+                is_active: Some(true),
+            },
+        )
+        .expect("rename service");
+        deactivate_service(&mut connection, &service.id).expect("inactive service");
+        deactivate_staff(&mut connection, &staff.id).expect("inactive staff");
+        let inactive_seed =
+            load_repeat_booking_seed(&connection, &customer.id, &source.id).expect("inactive seed");
+        assert_eq!(inactive_seed.staff_id, None);
+        let inactive_service = inactive_seed
+            .services
+            .iter()
+            .find(|item| item.service_id == service.id)
+            .expect("historical inactive service");
+        assert_eq!(inactive_service.service_name_snapshot, "Klasik Bakim");
+        assert!(!inactive_service.is_eligible);
+        assert_eq!(
+            inactive_service.unavailable_reason.as_deref(),
+            Some("service_inactive")
+        );
+        archive_customer(&mut connection, &customer.id).expect("archive customer");
+        assert!(load_repeat_booking_seed(&connection, &customer.id, &source.id).is_err());
+    }
+
+    #[test]
+    fn customer_history_is_paginated_snapshot_based_and_includes_archived_customers() {
+        let (_temp, mut connection) = open_temp();
+        let (customer, staff, service) = seed_core(&mut connection);
+        let no_history_customer = create_customer_tx(
+            &mut connection,
+            CustomerInput {
+                first_name: "No".into(),
+                last_name: "History".into(),
+                phone: None,
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: None,
+                whatsapp_consent_confirmed: None,
+            },
+        )
+        .expect("no history customer");
+        assert!(load_customer_history(&connection, "missing", 20, 0).is_err());
+        assert!(
+            load_customer_history(&connection, &no_history_customer.id, 20, 0)
+                .expect("empty history")
+                .appointments
+                .is_empty()
+        );
+
+        update_service_tx(
+            &mut connection,
+            &service.id,
+            ServiceInput {
+                category_id: service.category_id.clone(),
+                name: service.name.clone(),
+                duration_minutes: service.duration_minutes,
+                default_price_minor: Some(100_000),
+                is_active: Some(true),
+            },
+        )
+        .expect("set service price");
+        let second_service = create_service_tx(
+            &mut connection,
+            ServiceInput {
+                category_id: service.category_id.clone(),
+                name: "History Extra".into(),
+                duration_minutes: Some(45),
+                default_price_minor: Some(200_000),
+                is_active: Some(true),
+            },
+        )
+        .expect("second service");
+        set_staff_services_tx(
+            &mut connection,
+            &staff.id,
+            vec![service.id.clone(), second_service.id.clone()],
+        )
+        .expect("staff services");
+
+        let planned = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2025-01-02",
+                "09:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("planned");
+        let completed = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2025-01-02",
+                "10:00",
+                vec![service.id.clone()],
+                "completed",
+            ),
+        )
+        .expect("completed");
+        let no_show = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2025-01-02",
+                "11:00",
+                vec![service.id.clone()],
+                "no_show",
+            ),
+        )
+        .expect("no show");
+        let cancelled = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2025-01-02",
+                "12:00",
+                vec![service.id.clone()],
+                "cancelled",
+            ),
+        )
+        .expect("cancelled");
+        let multi_service = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2025-01-02",
+                "13:00",
+                vec![service.id.clone(), second_service.id.clone()],
+                "completed",
+            ),
+        )
+        .expect("multi service");
+        let second_staff = create_staff_tx(
+            &mut connection,
+            StaffInput {
+                first_name: "History".into(),
+                last_name: Some("Staff".into()),
+                phone: None,
+                specialty_note: None,
+                color_key: "teal".into(),
+                is_active: Some(true),
+            },
+        )
+        .expect("second staff");
+        set_staff_services_tx(&mut connection, &second_staff.id, vec![service.id.clone()])
+            .expect("second staff service");
+        let tie_one = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2025-01-02",
+                "15:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("first tie");
+        let tie_two = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &second_staff.id,
+                "2025-01-02",
+                "15:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("second tie");
+        let other_customer = create_customer_tx(
+            &mut connection,
+            CustomerInput {
+                first_name: "Other".into(),
+                last_name: "Customer".into(),
+                phone: None,
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: None,
+                whatsapp_consent_confirmed: None,
+            },
+        )
+        .expect("other customer");
+        let other_appointment = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &other_customer.id,
+                &staff.id,
+                "2025-01-03",
+                "09:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("other appointment");
+
+        let history = load_customer_history(&connection, &customer.id, 20, 0).expect("history");
+        assert_eq!(history.customer.customer_id, customer.id);
+        assert!(history.customer.is_active);
+        assert_eq!(history.appointments.len(), 7);
+        assert!(!history
+            .appointments
+            .iter()
+            .any(|appointment| appointment.appointment_id == other_appointment.id));
+        let statuses: HashSet<&str> = history
+            .appointments
+            .iter()
+            .map(|appointment| appointment.status.as_str())
+            .collect();
+        for status in ["planned", "completed", "no_show", "cancelled"] {
+            assert!(statuses.contains(status), "missing {status}");
+        }
+        let multi = history
+            .appointments
+            .iter()
+            .find(|appointment| appointment.appointment_id == multi_service.id)
+            .expect("multi-service history");
+        assert_eq!(multi.services.len(), 2);
+        assert_eq!(multi.total_charged_minor, 300_000);
+        assert_eq!(multi.services[0].listed_price_snapshot_minor, 100_000);
+        assert_eq!(multi.services[1].charged_price_minor, 200_000);
+        assert!(!multi.staff_display_name.is_empty());
+
+        let tie_ids: Vec<&str> = history
+            .appointments
+            .iter()
+            .filter(|appointment| {
+                appointment.local_date == "2025-01-02" && appointment.local_time == "15:00"
+            })
+            .map(|appointment| appointment.appointment_id.as_str())
+            .collect();
+        let mut expected_tie_ids = vec![tie_one.id.as_str(), tie_two.id.as_str()];
+        expected_tie_ids.sort_by(|left, right| right.cmp(left));
+        assert_eq!(tie_ids, expected_tie_ids);
+
+        let first_page =
+            load_customer_history(&connection, &customer.id, 2, 0).expect("first page");
+        let next_page = load_customer_history(&connection, &customer.id, 2, 2).expect("next page");
+        assert_eq!(first_page.appointments.len(), 2);
+        assert_eq!(next_page.appointments.len(), 2);
+        assert!(first_page.appointments.iter().all(|first| !next_page
+            .appointments
+            .iter()
+            .any(|next| next.appointment_id == first.appointment_id)));
+
+        let multi_before = multi.services.clone();
+        update_service_tx(
+            &mut connection,
+            &service.id,
+            ServiceInput {
+                category_id: service.category_id.clone(),
+                name: "Renamed Service".into(),
+                duration_minutes: Some(60),
+                default_price_minor: Some(999_000),
+                is_active: Some(true),
+            },
+        )
+        .expect("change current service");
+        deactivate_service(&mut connection, &service.id).expect("deactivate service");
+        deactivate_staff(&mut connection, &staff.id).expect("deactivate staff");
+        archive_customer(&mut connection, &customer.id).expect("archive customer");
+        let archived_history =
+            load_customer_history(&connection, &customer.id, 20, 0).expect("archived history");
+        assert!(!archived_history.customer.is_active);
+        assert_eq!(
+            archived_history
+                .appointments
+                .iter()
+                .find(|appointment| appointment.appointment_id == multi_service.id)
+                .expect("historical multi")
+                .services,
+            multi_before
+        );
+        assert!(create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &other_customer.id,
+                &staff.id,
+                "2025-01-03",
+                "10:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .is_err());
+        assert_eq!(planned.status, "planned");
+        assert_eq!(completed.status, "completed");
+        assert_eq!(no_show.status, "no_show");
+        assert_eq!(cancelled.status, "cancelled");
     }
 
     #[test]
@@ -8573,6 +9280,72 @@ mod tests {
             APPOINTMENT_STATUS_CANCELLED
         );
         assert_eq!(other_appointment.staff_id, other_staff.id);
+    }
+
+    #[test]
+    fn customer_history_uses_bounded_customer_page_and_batched_snapshots() {
+        let (_temp, mut connection) = open_temp();
+        let (customer, staff, service) = seed_core(&mut connection);
+        let now = now_iso();
+        let tx = connection
+            .transaction()
+            .expect("history fixture transaction");
+        for index in 0..5_000 {
+            let appointment_id = format!("history-page-{index:05}");
+            tx.execute(
+                "INSERT INTO appointments (id, customer_id, staff_id, start_at_utc, end_at_utc, total_duration_minutes, status, note, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, '2025-01-01T00:00:00.000Z', '2025-01-01T00:30:00.000Z', 30, 'planned', NULL, ?4, ?4)",
+                params![appointment_id, customer.id, staff.id, now],
+            )
+            .expect("history appointment");
+            tx.execute(
+                "INSERT INTO appointment_services (appointment_id, service_id, service_name_snapshot, duration_minutes_snapshot, listed_price_snapshot_minor, charged_price_minor, sort_order, created_at)
+                 VALUES (?1, ?2, 'History Snapshot', 30, 0, 0, 0, ?3)",
+                params![appointment_id, service.id, now],
+            )
+            .expect("history snapshot");
+        }
+        tx.commit().expect("history fixture commit");
+
+        let mut plan_statement = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT a.id, a.start_at_utc, a.status, a.staff_id
+                 FROM appointments a
+                 WHERE a.customer_id=?1
+                 ORDER BY a.start_at_utc DESC, a.id DESC
+                 LIMIT ?2 OFFSET ?3",
+            )
+            .expect("history plan");
+        let plan = plan_statement
+            .query_map(params![customer.id, 25_i64, 4_975_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("history plan rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("history plan collect");
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("appointments_customer_id_idx")),
+            "history plan did not use customer index: {plan:?}"
+        );
+
+        let page = load_customer_history(&connection, &customer.id, 25, 4_975)
+            .expect("bounded history page");
+        assert_eq!(page.appointments.len(), 25);
+        assert_eq!(page.limit, 25);
+        assert_eq!(page.offset, 4_975);
+        assert!(page
+            .appointments
+            .iter()
+            .all(|appointment| appointment.services.len() == 1));
+        assert!(load_customer_history(&connection, &customer.id, 25, 5_000)
+            .expect("empty next page")
+            .appointments
+            .is_empty());
+        let seed = load_repeat_booking_seed(&connection, &customer.id, "history-page-00000")
+            .expect("bounded repeat seed");
+        assert_eq!(seed.services.len(), 1);
     }
 
     #[test]
