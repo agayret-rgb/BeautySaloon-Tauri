@@ -9,8 +9,8 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 use tauri::{AppHandle, Manager};
 use thiserror::Error;
@@ -25,6 +25,9 @@ mod services;
 const CORE_SCHEMA_VERSION: i64 = 18;
 const ISTANBUL_OFFSET_MINUTES: i64 = 180;
 const APPOINTMENT_STATUS_CANCELLED: &str = "cancelled";
+const AUTOMATIC_BACKUP_INTERVAL: StdDuration = StdDuration::from_secs(15 * 60);
+const SHUTDOWN_BACKUP_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const SHUTDOWN_BACKUP_POLL_INTERVAL: StdDuration = StdDuration::from_millis(25);
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Error)]
@@ -158,6 +161,104 @@ fn append_audit_event(
 pub struct AppState {
     database_path: PathBuf,
     sqlite: Mutex<Connection>,
+    backup_coordinator: Arc<BackupCoordinator>,
+}
+
+#[derive(Debug, Default)]
+struct BackupCoordinator {
+    current_change_generation: AtomicU64,
+    last_successfully_backed_up_generation: AtomicU64,
+    automatic_backup_running: AtomicBool,
+    automatic_backup_registered: AtomicBool,
+    restore_in_progress: AtomicBool,
+    backup_operation_lock: Mutex<()>,
+}
+
+impl BackupCoordinator {
+    fn mark_business_change(&self) {
+        self.current_change_generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.current_change_generation.load(Ordering::Acquire)
+    }
+
+    fn backed_up_generation(&self) -> u64 {
+        self.last_successfully_backed_up_generation
+            .load(Ordering::Acquire)
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.current_generation() > self.backed_up_generation()
+    }
+
+    fn begin_automatic_backup(&self) -> Option<u64> {
+        if self.restore_in_progress.load(Ordering::Acquire)
+            || !self.is_dirty()
+            || self
+                .automatic_backup_running
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return None;
+        }
+        Some(self.current_generation())
+    }
+
+    fn finish_automatic_backup(&self, captured_generation: u64, succeeded: bool) {
+        if succeeded {
+            self.last_successfully_backed_up_generation
+                .fetch_max(captured_generation, Ordering::AcqRel);
+        }
+        self.automatic_backup_running
+            .store(false, Ordering::Release);
+    }
+
+    fn register_automatic_backup_loop(&self) -> bool {
+        self.automatic_backup_registered
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn wait_for_automatic_backup_slot(
+        &self,
+        timeout: StdDuration,
+    ) -> Result<Option<u64>, AppError> {
+        let started = Instant::now();
+        loop {
+            if let Some(captured_generation) = self.begin_automatic_backup() {
+                return Ok(Some(captured_generation));
+            }
+            if !self.is_dirty() {
+                return Ok(None);
+            }
+            if started.elapsed() >= timeout {
+                return Err(AppError::Database(
+                    "AUTOMATIC_BACKUP_SHUTDOWN_TIMEOUT".to_string(),
+                ));
+            }
+            std::thread::sleep(SHUTDOWN_BACKUP_POLL_INTERVAL);
+        }
+    }
+
+    fn begin_restore(&self) -> bool {
+        self.restore_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn finish_restore(&self, restored_generation: u64) {
+        self.current_change_generation
+            .store(restored_generation, Ordering::Release);
+        self.last_successfully_backed_up_generation
+            .store(restored_generation, Ordering::Release);
+        self.restore_in_progress.store(false, Ordering::Release);
+    }
+
+    fn abort_restore(&self) {
+        self.restore_in_progress.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -461,6 +562,12 @@ pub struct DatabaseCleanSummary {
     cleaned_at_utc: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataFolderSummary {
+    path: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfirmedInput {
@@ -515,6 +622,47 @@ fn data_paths(root: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, PathBu
         exports_dir,
         settings_dir,
     ))
+}
+
+fn business_data_directory(database_path: &Path) -> Result<PathBuf, AppError> {
+    let root = database_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| AppError::AppDataPath("business data path invalid".to_string()))?;
+    fs::create_dir_all(root)?;
+    Ok(root.to_path_buf())
+}
+
+fn open_business_data_directory(database_path: &Path) -> Result<DataFolderSummary, AppError> {
+    let directory = business_data_directory(database_path)?;
+    #[cfg(windows)]
+    {
+        let operation = wide_null("open");
+        let target = wide_null(&directory.display().to_string());
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if !shell_execute_succeeded(result as isize) {
+            return Err(AppError::Database("DATA_FOLDER_OPEN_FAILED".to_string()));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let status = Command::new("xdg-open").arg(&directory).status()?;
+        if !status.success() {
+            return Err(AppError::Database("DATA_FOLDER_OPEN_FAILED".to_string()));
+        }
+    }
+    Ok(DataFolderSummary {
+        path: directory.display().to_string(),
+    })
 }
 
 fn open_database(path: &Path) -> Result<Connection, AppError> {
@@ -1455,12 +1603,15 @@ fn replace_staff_working_hours(
             return Err(AppError::Conflict("STAFF_WORKING_HOURS_OVERLAP".into()));
         }
     }
+    if list_staff_working_hours(connection, staff_id)? == ordered {
+        return Ok(());
+    }
     let tx = connection.transaction()?;
     tx.execute(
         "DELETE FROM staff_working_hours WHERE staff_id=?1",
         params![staff_id],
     )?;
-    for item in intervals {
+    for item in ordered {
         tx.execute("INSERT INTO staff_working_hours (id,staff_id,weekday,start_minute,end_minute) VALUES (?1,?2,?3,?4,?5)", params![new_uuid(),staff_id,item.weekday,item.start_minute,item.end_minute])?;
     }
     tx.commit()?;
@@ -1604,11 +1755,17 @@ fn update_staff_time_off(
     time_off_id: &str,
     input: StaffTimeOffInput,
 ) -> Result<StaffTimeOff, AppError> {
-    if get_staff_time_off(connection, staff_id, time_off_id)?.is_none() {
-        return Err(AppError::NotFound("STAFF_TIME_OFF_NOT_FOUND".into()));
-    }
+    let existing = get_staff_time_off(connection, staff_id, time_off_id)?
+        .ok_or_else(|| AppError::NotFound("STAFF_TIME_OFF_NOT_FOUND".into()))?;
     validate_staff_time_off_input(&input)?;
     ensure_staff_time_off_has_no_conflict(connection, staff_id, &input, Some(time_off_id))?;
+    if existing.local_date == input.local_date
+        && existing.full_day == input.full_day
+        && existing.start_minute == input.start_minute
+        && existing.end_minute == input.end_minute
+    {
+        return Ok(existing);
+    }
     connection.execute(
         "UPDATE staff_time_off
          SET local_date=?3, full_day=?4, start_minute=?5, end_minute=?6
@@ -2114,10 +2271,9 @@ fn set_staff_services_tx(
 ) -> Result<Vec<String>, AppError> {
     get_staff(connection, staff_id)?
         .ok_or_else(|| AppError::NotFound("STAFF_NOT_FOUND".to_string()))?;
-    let tx = connection.transaction()?;
     let unique = unique_preserve_order(service_ids);
     for service_id in &unique {
-        let service = get_service(&tx, service_id)?
+        let service = get_service(connection, service_id)?
             .ok_or_else(|| AppError::NotFound("SERVICE_NOT_FOUND".to_string()))?;
         if service.availability_status == "inactive"
             || service.availability_status == "category_inactive"
@@ -2125,6 +2281,20 @@ fn set_staff_services_tx(
             return Err(AppError::Validation("SERVICE_NOT_ASSIGNABLE".to_string()));
         }
     }
+    let mut existing = {
+        let mut statement = connection.prepare(
+            "SELECT service_id FROM staff_services WHERE staff_id=?1 ORDER BY service_id ASC",
+        )?;
+        let rows = statement.query_map(params![staff_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let mut requested = unique.clone();
+    existing.sort();
+    requested.sort();
+    if existing == requested {
+        return Ok(unique);
+    }
+    let tx = connection.transaction()?;
     tx.execute(
         "DELETE FROM staff_services WHERE staff_id = ?1",
         params![staff_id],
@@ -2909,8 +3079,33 @@ fn get_appointment(connection: &Connection, id: &str) -> Result<AppointmentSumma
         .ok_or_else(|| AppError::NotFound("APPOINTMENT_NOT_FOUND".to_string()))
 }
 
-fn backup_destination(database_path: &Path, kind: &str) -> Result<PathBuf, AppError> {
-    let backup_dir = database_path
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackupKind {
+    Automatic,
+    Safety,
+    Manual,
+}
+
+impl BackupKind {
+    fn directory_name(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Safety => "safety",
+            Self::Manual => "manual",
+        }
+    }
+
+    fn retention_limit(self) -> Option<usize> {
+        match self {
+            Self::Automatic => Some(7),
+            Self::Safety => Some(3),
+            Self::Manual => None,
+        }
+    }
+}
+
+fn backup_root(database_path: &Path) -> PathBuf {
+    database_path
         .parent()
         .and_then(Path::parent)
         .map(|root| root.join("backups"))
@@ -2919,59 +3114,443 @@ fn backup_destination(database_path: &Path, kind: &str) -> Result<PathBuf, AppEr
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
                 .join("backups")
-        });
-    fs::create_dir_all(&backup_dir)?;
-    Ok(backup_dir.join(format!("salon-{kind}-{}.db", timestamp_for_file())))
+        })
+}
+
+fn backup_directory(database_path: &Path, kind: BackupKind) -> Result<PathBuf, AppError> {
+    let directory = backup_root(database_path).join(kind.directory_name());
+    fs::create_dir_all(&directory)?;
+    Ok(directory)
+}
+
+fn backup_file_name(kind: BackupKind) -> String {
+    let sequence = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "beautysaloon-{}-{}-{sequence:08x}.sqlite",
+        kind.directory_name(),
+        timestamp_for_file()
+    )
+}
+
+fn temporary_backup_path(destination: &Path) -> PathBuf {
+    let sequence = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    PathBuf::from(format!("{}.tmp-{sequence:08x}", destination.display()))
 }
 
 fn sanitize_machine_bound_state(database_path: &Path) -> Result<bool, AppError> {
-    let connection = Connection::open(database_path)?;
+    let mut connection = Connection::open(database_path)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
-    connection.execute("DELETE FROM secure_secrets", [])?;
-    connection.execute(
-        "UPDATE google_calendar_settings SET sync_enabled=0, account_email=NULL, updated_at_utc=?1 WHERE id=1",
+    let tx = connection.transaction()?;
+    tx.execute("DELETE FROM secure_secrets", [])?;
+    tx.execute(
+        "UPDATE google_calendar_settings
+         SET sync_enabled=0, client_id=NULL, calendar_id='primary', account_email=NULL, updated_at_utc=?1
+         WHERE id=1",
         params![now_iso()],
     )?;
-    connection.execute(
-        "UPDATE cloud_reminder_settings SET cloud_mode_enabled=0, updated_at_utc=?1 WHERE id=1",
+    tx.execute(
+        "UPDATE cloud_reminder_settings
+         SET cloud_mode_enabled=0, project_url=NULL, publishable_key=NULL, updated_at_utc=?1
+         WHERE id=1",
         params![now_iso()],
     )?;
-    connection.execute(
-        "UPDATE whatsapp_settings SET is_enabled=0, automatic_reminder_enabled=0, updated_at=?1 WHERE id=1",
+    tx.execute(
+        "UPDATE whatsapp_settings
+         SET is_enabled=0, phone_number_id=NULL, template_name=NULL, automatic_reminder_enabled=0, updated_at=?1
+         WHERE id=1",
         params![now_iso()],
     )?;
+    tx.commit()?;
     if !integrity_check(&connection)? {
         return Err(AppError::Database("BACKUP_INTEGRITY_FAILED".to_string()));
     }
     Ok(true)
 }
 
-fn create_sanitized_backup(
+fn validate_backup_snapshot(database_path: &Path) -> Result<(), AppError> {
+    let connection = Connection::open(database_path)?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    if !integrity_check(&connection)? {
+        return Err(AppError::Database("BACKUP_INTEGRITY_FAILED".to_string()));
+    }
+    if read_schema_version(&connection)? != CORE_SCHEMA_VERSION {
+        return Err(AppError::Database(
+            "BACKUP_SCHEMA_VERSION_INVALID".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_and_publish_backup(temporary_path: &Path, destination: &Path) -> Result<(), AppError> {
+    let result = validate_backup_snapshot(temporary_path).and_then(|_| {
+        fs::rename(temporary_path, destination)?;
+        Ok(())
+    });
+    if result.is_err() {
+        let _ = fs::remove_file(temporary_path);
+    }
+    result
+}
+
+fn enforce_backup_retention(directory: &Path, kind: BackupKind) -> Result<(), AppError> {
+    let Some(limit) = kind.retention_limit() else {
+        return Ok(());
+    };
+    let prefix = format!("beautysaloon-{}-", kind.directory_name());
+    let mut snapshots = fs::read_dir(directory)?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            (path.is_file() && name.starts_with(&prefix) && name.ends_with(".sqlite"))
+                .then_some(path)
+        })
+        .collect::<Vec<_>>();
+    snapshots.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
+    for snapshot in snapshots.into_iter().skip(limit) {
+        fs::remove_file(snapshot)?;
+    }
+    Ok(())
+}
+
+fn create_database_backup(
     connection: &Connection,
     database_path: &Path,
-    kind: &str,
+    kind: BackupKind,
 ) -> Result<DatabaseBackupSummary, AppError> {
+    if !database_path.is_file() {
+        return Err(AppError::Database("BACKUP_SOURCE_MISSING".to_string()));
+    }
     if !integrity_check(connection)? {
         return Err(AppError::Database("SOURCE_INTEGRITY_FAILED".to_string()));
     }
-    let backup_path = backup_destination(database_path, kind)?;
-    let sql = format!("VACUUM INTO '{}';", sql_path_literal(&backup_path));
-    connection.execute_batch(&sql)?;
-    let removed = sanitize_machine_bound_state(&backup_path)?;
+
+    let directory = backup_directory(database_path, kind)?;
+    let destination = directory.join(backup_file_name(kind));
+    let temporary_path = temporary_backup_path(&destination);
+    let result: Result<bool, AppError> = (|| {
+        let sql = format!("VACUUM INTO '{}';", sql_path_literal(&temporary_path));
+        connection.execute_batch(&sql)?;
+        let machine_bound_secrets_removed = sanitize_machine_bound_state(&temporary_path)?;
+        validate_and_publish_backup(&temporary_path, &destination)?;
+        Ok(machine_bound_secrets_removed)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    let machine_bound_secrets_removed = result?;
+
+    if enforce_backup_retention(&directory, kind).is_err() {
+        eprintln!("BACKUP_RETENTION_WARNING");
+    }
+
     Ok(DatabaseBackupSummary {
         database_path: database_path.display().to_string(),
-        backup_path: backup_path.display().to_string(),
+        backup_path: destination.display().to_string(),
         integrity: "ok".to_string(),
-        machine_bound_secrets_removed: removed,
+        machine_bound_secrets_removed,
         created_at_utc: now_iso(),
     })
+}
+
+fn automatic_backup_tick_with<F>(
+    coordinator: &BackupCoordinator,
+    create_backup: F,
+) -> Result<bool, AppError>
+where
+    F: FnOnce() -> Result<(), AppError>,
+{
+    let Some(captured_generation) = coordinator.begin_automatic_backup() else {
+        return Ok(false);
+    };
+    let result = create_backup();
+    coordinator.finish_automatic_backup(captured_generation, result.is_ok());
+    result.map(|_| true)
+}
+
+fn automatic_backup_tick(
+    coordinator: &BackupCoordinator,
+    database_path: &Path,
+) -> Result<bool, AppError> {
+    let Ok(_operation) = coordinator.backup_operation_lock.try_lock() else {
+        return Ok(false);
+    };
+    automatic_backup_tick_with(coordinator, || {
+        let connection = Connection::open(database_path)?;
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        create_database_backup(&connection, database_path, BackupKind::Automatic)?;
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn shutdown_automatic_backup_with<F>(
+    coordinator: &BackupCoordinator,
+    timeout: StdDuration,
+    create_backup: F,
+) -> Result<bool, AppError>
+where
+    F: FnOnce() -> Result<(), AppError>,
+{
+    let Some(captured_generation) = coordinator.wait_for_automatic_backup_slot(timeout)? else {
+        return Ok(false);
+    };
+    let result = create_backup();
+    coordinator.finish_automatic_backup(captured_generation, result.is_ok());
+    result.map(|_| true)
+}
+
+fn shutdown_automatic_backup(
+    coordinator: Arc<BackupCoordinator>,
+    database_path: PathBuf,
+) -> Result<bool, AppError> {
+    let Some(captured_generation) =
+        coordinator.wait_for_automatic_backup_slot(SHUTDOWN_BACKUP_WAIT_TIMEOUT)?
+    else {
+        return Ok(false);
+    };
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker_coordinator = coordinator.clone();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let _operation = worker_coordinator
+                .backup_operation_lock
+                .lock()
+                .expect("backup operation mutex poisoned");
+            let connection = Connection::open(&database_path)?;
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+            connection.pragma_update(None, "foreign_keys", "ON")?;
+            create_database_backup(&connection, &database_path, BackupKind::Automatic)?;
+            Ok(())
+        })();
+        worker_coordinator.finish_automatic_backup(captured_generation, result.is_ok());
+        let _ = sender.send(result);
+    });
+    match receiver.recv_timeout(SHUTDOWN_BACKUP_WAIT_TIMEOUT) {
+        Ok(result) => result.map(|_| true),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(AppError::Database(
+            "AUTOMATIC_BACKUP_SHUTDOWN_TIMEOUT".to_string(),
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(AppError::Database(
+            "AUTOMATIC_BACKUP_SHUTDOWN_WORKER_FAILED".to_string(),
+        )),
+    }
+}
+
+fn start_automatic_backup_coordinator(database_path: PathBuf, coordinator: Arc<BackupCoordinator>) {
+    if !coordinator.register_automatic_backup_loop() {
+        return;
+    }
+    std::thread::spawn(move || loop {
+        std::thread::sleep(AUTOMATIC_BACKUP_INTERVAL);
+        if automatic_backup_tick(&coordinator, &database_path).is_err() {
+            eprintln!("AUTOMATIC_BACKUP_WARNING");
+        }
+    });
+}
+
+fn run_business_mutation<T>(
+    state: &AppState,
+    operation: impl FnOnce(&mut Connection) -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    let changes_before = connection.total_changes();
+    let result = operation(&mut connection);
+    if result.is_ok() && connection.total_changes() > changes_before {
+        state.backup_coordinator.mark_business_change();
+    }
+    result
+}
+
+fn foreign_key_check_clean(connection: &Connection) -> Result<bool, AppError> {
+    let violations: i64 =
+        connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    Ok(violations == 0)
+}
+
+#[derive(Debug)]
+struct MachineSecret {
+    key: String,
+    value: Vec<u8>,
+    provider: String,
+    created_at: String,
+    updated_at: String,
+}
+
+fn capture_machine_secrets(connection: &Connection) -> Result<Vec<MachineSecret>, AppError> {
+    let mut statement = connection.prepare(
+        "SELECT secret_key, encrypted_value, encryption_provider, created_at, updated_at FROM secure_secrets",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(MachineSecret {
+            key: row.get(0)?,
+            value: row.get(1)?,
+            provider: row.get(2)?,
+            created_at: row.get(3)?,
+            updated_at: row.get(4)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn restore_machine_secrets(
+    connection: &mut Connection,
+    secrets: &[MachineSecret],
+) -> Result<(), AppError> {
+    let tx = connection.transaction()?;
+    tx.execute("DELETE FROM secure_secrets", [])?;
+    for secret in secrets {
+        tx.execute(
+            "INSERT INTO secure_secrets (secret_key, encrypted_value, encryption_provider, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![secret.key, secret.value, secret.provider, secret.created_at, secret.updated_at],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn restore_working_path(database_path: &Path, label: &str) -> Result<PathBuf, AppError> {
+    let directory = database_path
+        .parent()
+        .ok_or_else(|| AppError::Database("RESTORE_DATABASE_PATH_INVALID".into()))?
+        .join("restore-work");
+    fs::create_dir_all(&directory)?;
+    Ok(directory.join(format!(
+        "{label}-{}-{:08x}.sqlite",
+        timestamp_for_file(),
+        ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )))
+}
+
+fn prepare_restore_candidate(
+    candidate_path: &Path,
+    database_path: &Path,
+) -> Result<PathBuf, AppError> {
+    if !candidate_path.is_file() {
+        return Err(AppError::NotFound("RESTORE_CANDIDATE_NOT_FOUND".into()));
+    }
+    let candidate = Connection::open(candidate_path)
+        .map_err(|_| AppError::Validation("RESTORE_CANDIDATE_INVALID".into()))?;
+    if !integrity_check(&candidate)? || !foreign_key_check_clean(&candidate)? {
+        return Err(AppError::Validation("RESTORE_CANDIDATE_INVALID".into()));
+    }
+    let schema_version = read_schema_version(&candidate)
+        .map_err(|_| AppError::Validation("RESTORE_CANDIDATE_INVALID".into()))?;
+    if !(1..=CORE_SCHEMA_VERSION).contains(&schema_version) {
+        return Err(AppError::Validation(
+            "RESTORE_CANDIDATE_SCHEMA_UNSUPPORTED".into(),
+        ));
+    }
+    let prepared = restore_working_path(database_path, "candidate")?;
+    let sql = format!("VACUUM INTO '{}';", sql_path_literal(&prepared));
+    candidate.execute_batch(&sql)?;
+    drop(candidate);
+    let migrated = open_database(&prepared)?;
+    if read_schema_version(&migrated)? != CORE_SCHEMA_VERSION
+        || !integrity_check(&migrated)?
+        || !foreign_key_check_clean(&migrated)?
+    {
+        let _ = fs::remove_file(&prepared);
+        return Err(AppError::Validation("RESTORE_CANDIDATE_INVALID".into()));
+    }
+    drop(migrated);
+    sanitize_machine_bound_state(&prepared)?;
+    validate_backup_snapshot(&prepared)?;
+    Ok(prepared)
+}
+
+fn remove_sqlite_sidecars(database_path: &Path) -> Result<(), AppError> {
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{}", database_path.display(), suffix));
+        if sidecar.exists() {
+            fs::remove_file(sidecar)?;
+        }
+    }
+    Ok(())
+}
+
+fn swap_prepared_database(prepared: &Path, database_path: &Path) -> Result<PathBuf, AppError> {
+    let previous = restore_working_path(database_path, "previous")?;
+    remove_sqlite_sidecars(database_path)?;
+    fs::rename(database_path, &previous)?;
+    if let Err(error) = fs::rename(prepared, database_path) {
+        let _ = fs::rename(&previous, database_path);
+        return Err(error.into());
+    }
+    Ok(previous)
+}
+
+fn restore_database_from_candidate(
+    state: &AppState,
+    candidate_path: &Path,
+) -> Result<(), AppError> {
+    let prepared = prepare_restore_candidate(candidate_path, &state.database_path)?;
+    if !state.backup_coordinator.begin_restore() {
+        let _ = fs::remove_file(&prepared);
+        return Err(AppError::Conflict("RESTORE_IN_PROGRESS".into()));
+    }
+    let result = (|| {
+        let _operation = state
+            .backup_coordinator
+            .backup_operation_lock
+            .lock()
+            .expect("backup operation mutex poisoned");
+        let mut active = state.sqlite.lock().expect("sqlite mutex poisoned");
+        let machine_secrets = capture_machine_secrets(&active)?;
+        let safety = create_database_backup(&active, &state.database_path, BackupKind::Safety)?;
+        let placeholder = Connection::open_in_memory()?;
+        let old_connection = std::mem::replace(&mut *active, placeholder);
+        old_connection
+            .close()
+            .map_err(|(_, error)| AppError::Sqlite(error))?;
+        let previous = swap_prepared_database(&prepared, &state.database_path)?;
+        match open_database(&state.database_path) {
+            Ok(mut restored)
+                if integrity_check(&restored)?
+                    && foreign_key_check_clean(&restored)?
+                    && read_schema_version(&restored)? == CORE_SCHEMA_VERSION =>
+            {
+                restore_machine_secrets(&mut restored, &machine_secrets)?;
+                *active = restored;
+                let _ = fs::remove_file(previous);
+                Ok(())
+            }
+            _ => {
+                let recovery = prepare_restore_candidate(
+                    Path::new(&safety.backup_path),
+                    &state.database_path,
+                )?;
+                let _ = fs::remove_file(&state.database_path);
+                let _ = remove_sqlite_sidecars(&state.database_path);
+                fs::rename(&recovery, &state.database_path)?;
+                let mut recovered = open_database(&state.database_path)?;
+                restore_machine_secrets(&mut recovered, &machine_secrets)?;
+                *active = recovered;
+                let _ = fs::remove_file(previous);
+                Err(AppError::Database("RESTORE_ROLLED_BACK".into()))
+            }
+        }
+    })();
+    if result.is_ok() {
+        state.backup_coordinator.finish_restore(0);
+    } else {
+        state.backup_coordinator.abort_restore();
+    }
+    if result.is_err() {
+        let _ = fs::remove_file(&prepared);
+    }
+    result
 }
 
 fn clean_database_in_place(
     connection: &mut Connection,
     database_path: &Path,
 ) -> Result<DatabaseCleanSummary, AppError> {
-    let safety = create_sanitized_backup(connection, database_path, "pre-clean")?;
+    let safety = create_database_backup(connection, database_path, BackupKind::Safety)?;
     let tx = connection.transaction()?;
     for table in [
         "reminder_cloud_outbox",
@@ -3448,8 +4027,9 @@ fn update_business_profile(
     input: BusinessProfileInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<BusinessProfile, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    update_business_profile_tx(&mut connection, input)
+    run_business_mutation(&state, |connection| {
+        update_business_profile_tx(connection, input)
+    })
 }
 
 #[tauri::command]
@@ -3457,8 +4037,7 @@ fn customer_create(
     input: CustomerInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<Customer, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    create_customer_tx(&mut connection, input)
+    run_business_mutation(&state, |connection| create_customer_tx(connection, input))
 }
 
 #[tauri::command]
@@ -3467,8 +4046,9 @@ fn customer_update(
     input: CustomerInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<Customer, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    update_customer_tx(&mut connection, &id, input)
+    run_business_mutation(&state, |connection| {
+        update_customer_tx(connection, &id, input)
+    })
 }
 
 #[tauri::command]
@@ -3477,14 +4057,14 @@ fn customer_set_active(
     is_active: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<Customer, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    set_customer_active(&mut connection, &id, is_active)
+    run_business_mutation(&state, |connection| {
+        set_customer_active(connection, &id, is_active)
+    })
 }
 
 #[tauri::command]
 fn customer_archive(id: String, state: tauri::State<'_, AppState>) -> Result<Customer, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    archive_customer(&mut connection, &id)
+    run_business_mutation(&state, |connection| archive_customer(connection, &id))
 }
 
 #[tauri::command]
@@ -3492,8 +4072,7 @@ fn customer_reactivate(
     id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Customer, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    reactivate_customer(&mut connection, &id)
+    run_business_mutation(&state, |connection| reactivate_customer(connection, &id))
 }
 
 #[tauri::command]
@@ -3562,8 +4141,7 @@ fn get_repeat_booking_seed(
 
 #[tauri::command]
 fn staff_create(input: StaffInput, state: tauri::State<'_, AppState>) -> Result<Staff, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    create_staff_tx(&mut connection, input)
+    run_business_mutation(&state, |connection| create_staff_tx(connection, input))
 }
 
 #[tauri::command]
@@ -3572,8 +4150,7 @@ fn staff_update(
     input: StaffInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<Staff, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    update_staff_tx(&mut connection, &id, input)
+    run_business_mutation(&state, |connection| update_staff_tx(connection, &id, input))
 }
 
 #[tauri::command]
@@ -3582,20 +4159,19 @@ fn staff_set_active(
     is_active: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<Staff, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    set_staff_active(&mut connection, &id, is_active)
+    run_business_mutation(&state, |connection| {
+        set_staff_active(connection, &id, is_active)
+    })
 }
 
 #[tauri::command]
 fn staff_deactivate(id: String, state: tauri::State<'_, AppState>) -> Result<Staff, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    deactivate_staff(&mut connection, &id)
+    run_business_mutation(&state, |connection| deactivate_staff(connection, &id))
 }
 
 #[tauri::command]
 fn staff_reactivate(id: String, state: tauri::State<'_, AppState>) -> Result<Staff, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    reactivate_staff(&mut connection, &id)
+    run_business_mutation(&state, |connection| reactivate_staff(connection, &id))
 }
 
 #[tauri::command]
@@ -3622,8 +4198,9 @@ fn staff_set_services(
     service_ids: Vec<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<String>, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    set_staff_services_tx(&mut connection, &staff_id, service_ids)
+    run_business_mutation(&state, |connection| {
+        set_staff_services_tx(connection, &staff_id, service_ids)
+    })
 }
 
 #[tauri::command]
@@ -3641,8 +4218,9 @@ fn staff_working_hours_set(
     intervals: Vec<StaffWorkingHour>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    replace_staff_working_hours(&mut connection, &staff_id, intervals)
+    run_business_mutation(&state, |connection| {
+        replace_staff_working_hours(connection, &staff_id, intervals)
+    })
 }
 
 #[tauri::command]
@@ -3669,8 +4247,9 @@ fn staff_time_off_add(
     input: StaffTimeOffInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<StaffTimeOff, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    add_staff_time_off(&mut connection, &staff_id, input)
+    run_business_mutation(&state, |connection| {
+        add_staff_time_off(connection, &staff_id, input)
+    })
 }
 
 #[tauri::command]
@@ -3680,8 +4259,9 @@ fn staff_time_off_update(
     input: StaffTimeOffInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<StaffTimeOff, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    update_staff_time_off(&mut connection, &staff_id, &time_off_id, input)
+    run_business_mutation(&state, |connection| {
+        update_staff_time_off(connection, &staff_id, &time_off_id, input)
+    })
 }
 
 #[tauri::command]
@@ -3690,8 +4270,9 @@ fn staff_time_off_remove(
     time_off_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    remove_staff_time_off(&mut connection, &staff_id, &time_off_id)
+    run_business_mutation(&state, |connection| {
+        remove_staff_time_off(connection, &staff_id, &time_off_id)
+    })
 }
 
 #[tauri::command]
@@ -3699,8 +4280,7 @@ fn service_category_create(
     input: CategoryInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<ServiceCategory, AppError> {
-    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    create_category_tx(&connection, input)
+    run_business_mutation(&state, |connection| create_category_tx(connection, input))
 }
 
 #[tauri::command]
@@ -3708,8 +4288,7 @@ fn service_create(
     input: ServiceInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<ServiceItem, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    create_service_tx(&mut connection, input)
+    run_business_mutation(&state, |connection| create_service_tx(connection, input))
 }
 
 #[tauri::command]
@@ -3718,8 +4297,9 @@ fn service_update(
     input: ServiceInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<ServiceItem, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    update_service_tx(&mut connection, &id, input)
+    run_business_mutation(&state, |connection| {
+        update_service_tx(connection, &id, input)
+    })
 }
 
 #[tauri::command]
@@ -3728,8 +4308,9 @@ fn service_set_active(
     is_active: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<ServiceItem, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    set_service_active(&mut connection, &id, is_active)
+    run_business_mutation(&state, |connection| {
+        set_service_active(connection, &id, is_active)
+    })
 }
 
 #[tauri::command]
@@ -3737,8 +4318,7 @@ fn service_deactivate(
     id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<ServiceItem, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    deactivate_service(&mut connection, &id)
+    run_business_mutation(&state, |connection| deactivate_service(connection, &id))
 }
 
 #[tauri::command]
@@ -3746,8 +4326,7 @@ fn service_reactivate(
     id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<ServiceItem, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    reactivate_service(&mut connection, &id)
+    run_business_mutation(&state, |connection| reactivate_service(connection, &id))
 }
 
 #[tauri::command]
@@ -3765,8 +4344,9 @@ fn appointment_create(
     input: AppointmentInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppointmentSummary, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    create_appointment_tx(&mut connection, input)
+    run_business_mutation(&state, |connection| {
+        create_appointment_tx(connection, input)
+    })
 }
 
 #[tauri::command]
@@ -3775,8 +4355,9 @@ fn appointment_update(
     input: AppointmentInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppointmentSummary, AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    update_appointment_tx(&mut connection, &id, input)
+    run_business_mutation(&state, |connection| {
+        update_appointment_tx(connection, &id, input)
+    })
 }
 
 #[tauri::command]
@@ -3786,13 +4367,14 @@ fn appointment_service_set_charged_price(
     charged_price_minor: i64,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), AppError> {
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    set_appointment_service_charged_price(
-        &mut connection,
-        &appointment_id,
-        &service_id,
-        charged_price_minor,
-    )
+    run_business_mutation(&state, |connection| {
+        set_appointment_service_charged_price(
+            connection,
+            &appointment_id,
+            &service_id,
+            charged_price_minor,
+        )
+    })
 }
 
 #[tauri::command]
@@ -3827,11 +4409,39 @@ fn appointment_list_by_date(
 }
 
 #[tauri::command]
-fn database_create_backup(
-    state: tauri::State<'_, AppState>,
-) -> Result<DatabaseBackupSummary, AppError> {
-    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    create_sanitized_backup(&connection, &state.database_path, "manual")
+async fn database_create_backup(app: AppHandle) -> Result<DatabaseBackupSummary, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _operation = state
+            .backup_coordinator
+            .backup_operation_lock
+            .lock()
+            .expect("backup operation mutex poisoned");
+        let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+        create_database_backup(&connection, &state.database_path, BackupKind::Manual)
+    })
+    .await
+    .map_err(|_| AppError::Database("MANUAL_BACKUP_WORKER_FAILED".to_string()))?
+}
+
+#[tauri::command]
+async fn database_restore_backup(backup_path: String, app: AppHandle) -> Result<(), AppError> {
+    if backup_path.trim().is_empty() {
+        return Err(AppError::Validation(
+            "RESTORE_CANDIDATE_PATH_REQUIRED".to_string(),
+        ));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        restore_database_from_candidate(&state, Path::new(&backup_path))
+    })
+    .await
+    .map_err(|_| AppError::Database("RESTORE_WORKER_FAILED".to_string()))?
+}
+
+#[tauri::command]
+fn open_data_folder(state: tauri::State<'_, AppState>) -> Result<DataFolderSummary, AppError> {
+    open_business_data_directory(&state.database_path)
 }
 
 #[tauri::command]
@@ -3844,8 +4454,9 @@ fn database_clean_start(
             "CLEAN_REQUIRES_CONFIRMATION".to_string(),
         ));
     }
-    let mut connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    clean_database_in_place(&mut connection, &state.database_path)
+    run_business_mutation(&state, |connection| {
+        clean_database_in_place(connection, &state.database_path)
+    })
 }
 
 #[tauri::command]
@@ -4455,15 +5066,18 @@ fn cloud_process_outbox(
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .setup(|app| {
             let root = app_data_root(app.handle())?;
             let (database_path, _, _, _, _) = data_paths(&root)?;
             let sqlite = open_database(&database_path)?;
+            let backup_coordinator = Arc::new(BackupCoordinator::default());
             app.manage(AppState {
-                database_path,
+                database_path: database_path.clone(),
                 sqlite: Mutex::new(sqlite),
+                backup_coordinator: backup_coordinator.clone(),
             });
+            start_automatic_backup_coordinator(database_path, backup_coordinator);
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
@@ -4509,6 +5123,8 @@ pub fn run() {
             service_statistics,
             appointment_list_by_date,
             database_create_backup,
+            database_restore_backup,
+            open_data_folder,
             database_clean_start,
             google_sync_pending_mock,
             reminder_reconcile_all_mock,
@@ -4529,8 +5145,21 @@ pub fn run() {
             cloud_disconnect,
             cloud_process_outbox
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running BeautySaloon");
+        .build(tauri::generate_context!())
+        .expect("error while building BeautySaloon");
+    app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+            let state = app_handle.state::<AppState>();
+            if shutdown_automatic_backup(
+                state.backup_coordinator.clone(),
+                state.database_path.clone(),
+            )
+            .is_err()
+            {
+                eprintln!("AUTOMATIC_BACKUP_SHUTDOWN_WARNING");
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -5650,6 +6279,26 @@ mod tests {
         assert!(settings_dir.is_dir());
     }
 
+    #[test]
+    fn business_data_directory_is_canonical_and_read_only() {
+        let temp = tempdir().expect("tempdir");
+        let (database_path, _, _, _, _) = data_paths(temp.path()).expect("paths");
+        let mut connection = open_database(&database_path).expect("open");
+        let (customer, _, _) = seed_core(&mut connection);
+        let resolved = business_data_directory(&database_path).expect("data directory");
+        assert_eq!(resolved, temp.path());
+        assert_ne!(
+            resolved,
+            std::env::current_exe()
+                .expect("current exe")
+                .parent()
+                .expect("exe directory")
+        );
+        assert!(get_customer(&connection, &customer.id)
+            .expect("customer")
+            .is_some());
+    }
+
     fn future_local_slot(hours_from_now: i64) -> (String, String) {
         let local = Utc::now()
             + Duration::minutes(ISTANBUL_OFFSET_MINUTES)
@@ -5662,12 +6311,15 @@ mod tests {
     }
 
     #[test]
-    fn backup_clean_restore_and_corrupt_guard_sanitize_machine_bound_state() {
+    fn backup_snapshot_is_consistent_sanitized_and_preserves_business_data() {
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("database").join("salon-foundation.db");
         fs::create_dir_all(db_path.parent().expect("db parent")).expect("db dir");
         let mut connection = open_database(&db_path).expect("open");
         let (customer, _staff, _service) = seed_core(&mut connection);
+        let source_customer_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM customers", [], |row| row.get(0))
+            .expect("source customer count");
         connection
             .execute(
                 "INSERT INTO secure_secrets (secret_key, encrypted_value, encryption_provider, created_at, updated_at)
@@ -5676,10 +6328,17 @@ mod tests {
             )
             .expect("secret");
         connection
-            .execute("UPDATE google_calendar_settings SET sync_enabled=1, account_email='owner@example.test' WHERE id=1", [])
+            .execute("UPDATE google_calendar_settings SET sync_enabled=1, client_id='desktop-client', calendar_id='test-calendar', account_email='owner@example.test' WHERE id=1", [])
             .expect("google on");
+        connection
+            .execute("UPDATE cloud_reminder_settings SET cloud_mode_enabled=1, project_url='https://project.supabase.co', publishable_key='publishable-test-key-which-is-long-enough' WHERE id=1", [])
+            .expect("cloud on");
+        connection
+            .execute("UPDATE whatsapp_settings SET is_enabled=1, phone_number_id='phone-id', template_name='template', automatic_reminder_enabled=1 WHERE id=1", [])
+            .expect("whatsapp on");
 
-        let backup = create_sanitized_backup(&connection, &db_path, "manual").expect("backup");
+        let backup =
+            create_database_backup(&connection, &db_path, BackupKind::Manual).expect("backup");
         let backup_connection = Connection::open(&backup.backup_path).expect("backup open");
         let secret_count: i64 = backup_connection
             .query_row("SELECT COUNT(*) FROM secure_secrets", [], |row| row.get(0))
@@ -5691,8 +6350,35 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("google");
+        let google_config_count: i64 = backup_connection
+            .query_row("SELECT COUNT(*) FROM google_calendar_settings WHERE client_id IS NOT NULL OR calendar_id <> 'primary' OR account_email IS NOT NULL", [], |row| row.get(0))
+            .expect("google config");
+        let cloud_config_count: i64 = backup_connection
+            .query_row("SELECT COUNT(*) FROM cloud_reminder_settings WHERE cloud_mode_enabled <> 0 OR project_url IS NOT NULL OR publishable_key IS NOT NULL", [], |row| row.get(0))
+            .expect("cloud config");
+        let whatsapp_config_count: i64 = backup_connection
+            .query_row("SELECT COUNT(*) FROM whatsapp_settings WHERE is_enabled <> 0 OR phone_number_id IS NOT NULL OR template_name IS NOT NULL OR automatic_reminder_enabled <> 0", [], |row| row.get(0))
+            .expect("whatsapp config");
+        let backup_customer_count: i64 = backup_connection
+            .query_row("SELECT COUNT(*) FROM customers", [], |row| row.get(0))
+            .expect("backup customer count");
         assert_eq!(secret_count, 0);
         assert_eq!(google_enabled, 0);
+        assert_eq!(google_config_count, 0);
+        assert_eq!(cloud_config_count, 0);
+        assert_eq!(whatsapp_config_count, 0);
+        assert_eq!(backup_customer_count, source_customer_count);
+        assert_eq!(
+            read_schema_version(&backup_connection).expect("backup schema"),
+            CORE_SCHEMA_VERSION
+        );
+        assert!(integrity_check(&backup_connection).expect("backup integrity"));
+        drop(backup_connection);
+
+        let source_secret_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM secure_secrets", [], |row| row.get(0))
+            .expect("source secret count");
+        assert_eq!(source_secret_count, 1, "backup must not mutate source data");
 
         clean_database_in_place(&mut connection, &db_path).expect("clean");
         let customer_count: i64 = connection
@@ -5711,6 +6397,452 @@ mod tests {
         let corrupt_path = temp.path().join("corrupt.db");
         fs::write(&corrupt_path, b"not sqlite").expect("corrupt write");
         assert!(restore_database_file_for_tests(&db_path, &corrupt_path).is_err());
+    }
+
+    #[test]
+    fn backup_retention_only_prunes_recognized_owned_snapshots_after_publish() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("database").join("salon-foundation.db");
+        fs::create_dir_all(db_path.parent().expect("db parent")).expect("db dir");
+        let mut connection = open_database(&db_path).expect("open");
+        seed_core(&mut connection);
+
+        let automatic_dir =
+            backup_directory(&db_path, BackupKind::Automatic).expect("automatic dir");
+        let unrelated = automatic_dir.join("keep-me.txt");
+        fs::write(&unrelated, b"unrelated").expect("unrelated file");
+        for _ in 0..8 {
+            create_database_backup(&connection, &db_path, BackupKind::Automatic)
+                .expect("automatic backup");
+        }
+        let automatic_count = fs::read_dir(&automatic_dir)
+            .expect("automatic read")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("sqlite")
+            })
+            .count();
+        assert_eq!(automatic_count, 7);
+        assert!(unrelated.exists());
+
+        let safety_dir = backup_directory(&db_path, BackupKind::Safety).expect("safety dir");
+        for _ in 0..4 {
+            create_database_backup(&connection, &db_path, BackupKind::Safety)
+                .expect("safety backup");
+        }
+        let safety_count = fs::read_dir(&safety_dir)
+            .expect("safety read")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("sqlite")
+            })
+            .count();
+        assert_eq!(safety_count, 3);
+
+        let first_manual = create_database_backup(&connection, &db_path, BackupKind::Manual)
+            .expect("manual backup");
+        let second_manual = create_database_backup(&connection, &db_path, BackupKind::Manual)
+            .expect("manual backup");
+        assert_ne!(first_manual.backup_path, second_manual.backup_path);
+        assert!(Path::new(&first_manual.backup_path).is_file());
+        assert!(Path::new(&second_manual.backup_path).is_file());
+    }
+
+    #[test]
+    fn failed_backup_publish_or_destination_setup_leaves_no_final_snapshot() {
+        let temp = tempdir().expect("tempdir");
+        let temp_snapshot = temp.path().join("snapshot.tmp");
+        let destination = temp.path().join("published.sqlite");
+        fs::write(&temp_snapshot, b"not sqlite").expect("bad temp snapshot");
+        assert!(validate_and_publish_backup(&temp_snapshot, &destination).is_err());
+        assert!(!temp_snapshot.exists());
+        assert!(!destination.exists());
+
+        let blocked_root = temp.path().join("blocked");
+        let blocked_db = blocked_root.join("database").join("salon-foundation.db");
+        fs::create_dir_all(blocked_db.parent().expect("blocked parent")).expect("blocked db dir");
+        let mut blocked_connection = open_database(&blocked_db).expect("blocked open");
+        let (customer, _staff, _service) = seed_core(&mut blocked_connection);
+        fs::write(blocked_root.join("backups"), b"not a directory").expect("blocked backups");
+        assert!(
+            create_database_backup(&blocked_connection, &blocked_db, BackupKind::Automatic)
+                .is_err()
+        );
+        assert!(get_customer(&blocked_connection, &customer.id)
+            .expect("customer")
+            .is_some());
+    }
+
+    #[test]
+    fn automatic_backup_coordinator_tracks_generations_retries_and_avoids_duplicate_ticks() {
+        let coordinator = BackupCoordinator::default();
+        assert!(coordinator.register_automatic_backup_loop());
+        assert!(!coordinator.register_automatic_backup_loop());
+        assert!(!coordinator.is_dirty());
+        assert!(!automatic_backup_tick_with(&coordinator, || Ok(())).expect("clean tick"));
+
+        coordinator.mark_business_change();
+        assert_eq!(coordinator.current_generation(), 1);
+        assert!(coordinator.is_dirty());
+        assert!(automatic_backup_tick_with(&coordinator, || Ok(())).expect("dirty tick"));
+        assert!(!coordinator.is_dirty());
+        assert!(!automatic_backup_tick_with(&coordinator, || Ok(())).expect("clean tick"));
+
+        coordinator.mark_business_change();
+        assert!(automatic_backup_tick_with(&coordinator, || {
+            Err(AppError::Database("TEST_BACKUP_FAILURE".into()))
+        })
+        .is_err());
+        assert!(coordinator.is_dirty(), "failed backup must remain dirty");
+        assert!(automatic_backup_tick_with(&coordinator, || Ok(())).expect("retry"));
+        assert!(!coordinator.is_dirty());
+
+        coordinator.mark_business_change();
+        assert!(automatic_backup_tick_with(&coordinator, || {
+            assert!(
+                !automatic_backup_tick_with(&coordinator, || Ok(())).expect("overlap tick"),
+                "a running snapshot must suppress overlapping ticks"
+            );
+            coordinator.mark_business_change();
+            Ok(())
+        })
+        .expect("concurrent mutation snapshot"));
+        assert!(
+            coordinator.is_dirty(),
+            "a mutation during snapshot must remain for the next tick"
+        );
+        assert!(automatic_backup_tick_with(&coordinator, || Ok(())).expect("next tick"));
+        assert!(!coordinator.is_dirty());
+    }
+
+    #[test]
+    fn automatic_backup_tick_creates_one_owned_snapshot_only_after_business_change() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("database").join("salon-foundation.db");
+        fs::create_dir_all(db_path.parent().expect("db parent")).expect("db dir");
+        let mut connection = open_database(&db_path).expect("open");
+        seed_core(&mut connection);
+        let coordinator = BackupCoordinator::default();
+
+        assert!(!automatic_backup_tick(&coordinator, &db_path).expect("clean tick"));
+        coordinator.mark_business_change();
+        assert!(automatic_backup_tick(&coordinator, &db_path).expect("dirty tick"));
+        assert!(!automatic_backup_tick(&coordinator, &db_path).expect("second clean tick"));
+
+        let automatic_dir =
+            backup_directory(&db_path, BackupKind::Automatic).expect("automatic dir");
+        let snapshot_count = fs::read_dir(automatic_dir)
+            .expect("backup dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("sqlite")
+            })
+            .count();
+        assert_eq!(snapshot_count, 1);
+    }
+
+    #[test]
+    fn shutdown_backup_is_dirty_aware_bounded_and_generation_safe() {
+        let coordinator = Arc::new(BackupCoordinator::default());
+        let calls = AtomicU64::new(0);
+        assert!(
+            !shutdown_automatic_backup_with(&coordinator, StdDuration::from_millis(1), || {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            })
+            .expect("clean shutdown")
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        coordinator.mark_business_change();
+        assert!(
+            shutdown_automatic_backup_with(&coordinator, StdDuration::from_millis(1), || {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            })
+            .expect("dirty shutdown")
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert!(!coordinator.is_dirty());
+
+        coordinator.mark_business_change();
+        assert!(
+            shutdown_automatic_backup_with(&coordinator, StdDuration::from_millis(1), || {
+                Err(AppError::Database("TEST_FINAL_BACKUP_FAILURE".into()))
+            })
+            .is_err()
+        );
+        assert!(
+            coordinator.is_dirty(),
+            "failed final backup must remain dirty"
+        );
+        assert!(
+            shutdown_automatic_backup_with(&coordinator, StdDuration::from_millis(1), || {
+                Ok(())
+            })
+            .expect("final retry")
+        );
+        assert!(!coordinator.is_dirty());
+
+        coordinator.mark_business_change();
+        let periodic_generation = coordinator
+            .begin_automatic_backup()
+            .expect("periodic backup starts");
+        coordinator.finish_automatic_backup(periodic_generation, true);
+        assert!(
+            !shutdown_automatic_backup_with(&coordinator, StdDuration::from_millis(1), || {
+                panic!("covered periodic generation must suppress final backup")
+            })
+            .expect("covered shutdown")
+        );
+
+        coordinator.mark_business_change();
+        let periodic_generation = coordinator
+            .begin_automatic_backup()
+            .expect("periodic backup starts");
+        coordinator.mark_business_change();
+        coordinator.finish_automatic_backup(periodic_generation, true);
+        assert!(
+            shutdown_automatic_backup_with(&coordinator, StdDuration::from_millis(1), || Ok(()))
+                .expect("remaining generation final backup")
+        );
+        assert!(!coordinator.is_dirty());
+
+        coordinator.mark_business_change();
+        let running_generation = coordinator
+            .begin_automatic_backup()
+            .expect("periodic backup starts");
+        let periodic_coordinator = coordinator.clone();
+        let completion = std::thread::spawn(move || {
+            std::thread::sleep(StdDuration::from_millis(5));
+            periodic_coordinator.finish_automatic_backup(running_generation, true);
+        });
+        assert!(!shutdown_automatic_backup_with(
+            &coordinator,
+            StdDuration::from_millis(100),
+            || { panic!("completed periodic backup must prevent duplicate final snapshot") }
+        )
+        .expect("periodic completion"));
+        completion.join().expect("periodic join");
+
+        coordinator.mark_business_change();
+        let running_generation = coordinator
+            .begin_automatic_backup()
+            .expect("periodic backup starts");
+        assert!(
+            shutdown_automatic_backup_with(&coordinator, StdDuration::from_millis(1), || {
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(coordinator.is_dirty(), "timeout must not clear dirty state");
+        coordinator.finish_automatic_backup(running_generation, false);
+    }
+
+    #[test]
+    fn shutdown_backup_uses_automatic_snapshot_sanitization_and_retention() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("database").join("salon-foundation.db");
+        fs::create_dir_all(db_path.parent().expect("db parent")).expect("db dir");
+        let mut connection = open_database(&db_path).expect("open");
+        seed_core(&mut connection);
+        connection
+            .execute(
+                "INSERT INTO secure_secrets (secret_key, encrypted_value, encryption_provider, created_at, updated_at)
+                 VALUES ('shutdown-session', x'01', 'test', ?1, ?1)",
+                params![now_iso()],
+            )
+            .expect("session");
+        let coordinator = Arc::new(BackupCoordinator::default());
+        coordinator.mark_business_change();
+
+        assert!(
+            shutdown_automatic_backup(coordinator.clone(), db_path.clone())
+                .expect("shutdown backup")
+        );
+        assert!(!coordinator.is_dirty());
+        assert!(!shutdown_automatic_backup(coordinator, db_path.clone()).expect("clean shutdown"));
+        let automatic_dir =
+            backup_directory(&db_path, BackupKind::Automatic).expect("automatic dir");
+        let snapshots = fs::read_dir(automatic_dir)
+            .expect("backup dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("sqlite"))
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = Connection::open(&snapshots[0]).expect("snapshot");
+        let copied_secrets: i64 = snapshot
+            .query_row("SELECT COUNT(*) FROM secure_secrets", [], |row| row.get(0))
+            .expect("snapshot secrets");
+        assert_eq!(copied_secrets, 0);
+        let source_secrets: i64 = connection
+            .query_row("SELECT COUNT(*) FROM secure_secrets", [], |row| row.get(0))
+            .expect("source secrets");
+        assert_eq!(
+            source_secrets, 1,
+            "shutdown backup must not change source DB"
+        );
+    }
+
+    #[test]
+    fn restore_prepares_candidate_creates_safety_backup_and_preserves_machine_secrets() {
+        let temp = tempdir().expect("tempdir");
+        let live_path = temp.path().join("database").join("salon-foundation.db");
+        let candidate_path = temp.path().join("candidate.sqlite");
+        fs::create_dir_all(live_path.parent().expect("live parent")).expect("live dir");
+        let mut live = open_database(&live_path).expect("live open");
+        let (live_customer, _, _) = seed_core(&mut live);
+        live.execute(
+            "INSERT INTO secure_secrets (secret_key, encrypted_value, encryption_provider, created_at, updated_at)
+             VALUES ('machine-session', x'0102', 'test', ?1, ?1)",
+            params![now_iso()],
+        )
+        .expect("machine secret");
+        let mut candidate = open_database(&candidate_path).expect("candidate open");
+        let (candidate_customer, _, _) = seed_core(&mut candidate);
+        assert_ne!(live_customer.id, candidate_customer.id);
+        drop(candidate);
+        let state = AppState {
+            database_path: live_path.clone(),
+            sqlite: Mutex::new(live),
+            backup_coordinator: Arc::new(BackupCoordinator::default()),
+        };
+
+        restore_database_from_candidate(&state, &candidate_path).expect("restore");
+        let restored = state.sqlite.lock().expect("restored lock");
+        assert!(get_customer(&restored, &candidate_customer.id)
+            .expect("candidate customer")
+            .is_some());
+        assert!(get_customer(&restored, &live_customer.id)
+            .expect("live customer")
+            .is_none());
+        assert!(integrity_check(&restored).expect("integrity"));
+        assert!(foreign_key_check_clean(&restored).expect("foreign keys"));
+        let secret_count: i64 = restored
+            .query_row("SELECT COUNT(*) FROM secure_secrets", [], |row| row.get(0))
+            .expect("machine secrets preserved");
+        assert_eq!(secret_count, 1);
+        drop(restored);
+        let safety_count =
+            fs::read_dir(backup_directory(&live_path, BackupKind::Safety).expect("safety dir"))
+                .expect("safety backups")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry.path().extension().and_then(|value| value.to_str()) == Some("sqlite")
+                })
+                .count();
+        assert_eq!(safety_count, 1);
+    }
+
+    #[test]
+    fn restore_rejects_invalid_or_newer_candidates_without_touching_live_database() {
+        let temp = tempdir().expect("tempdir");
+        let live_path = temp.path().join("database").join("salon-foundation.db");
+        let corrupt_path = temp.path().join("corrupt.sqlite");
+        let newer_path = temp.path().join("newer.sqlite");
+        fs::create_dir_all(live_path.parent().expect("live parent")).expect("live dir");
+        let mut live = open_database(&live_path).expect("live open");
+        let (live_customer, _, _) = seed_core(&mut live);
+        let state = AppState {
+            database_path: live_path,
+            sqlite: Mutex::new(live),
+            backup_coordinator: Arc::new(BackupCoordinator::default()),
+        };
+
+        fs::write(&corrupt_path, b"not sqlite").expect("corrupt candidate");
+        assert!(restore_database_from_candidate(&state, &corrupt_path).is_err());
+
+        let newer = open_database(&newer_path).expect("newer open");
+        newer
+            .execute(
+                "UPDATE app_meta SET schema_version = ?1",
+                params![CORE_SCHEMA_VERSION + 1],
+            )
+            .expect("future schema");
+        drop(newer);
+        assert!(restore_database_from_candidate(&state, &newer_path).is_err());
+
+        let active = state.sqlite.lock().expect("live lock");
+        assert!(get_customer(&active, &live_customer.id)
+            .expect("live customer")
+            .is_some());
+        assert!(integrity_check(&active).expect("live integrity"));
+        assert!(foreign_key_check_clean(&active).expect("live foreign keys"));
+    }
+
+    #[test]
+    fn business_mutation_wrapper_marks_only_committed_business_changes() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("database").join("salon-foundation.db");
+        fs::create_dir_all(db_path.parent().expect("db parent")).expect("db dir");
+        let coordinator = Arc::new(BackupCoordinator::default());
+        let state = AppState {
+            database_path: db_path.clone(),
+            sqlite: Mutex::new(open_database(&db_path).expect("open")),
+            backup_coordinator: coordinator.clone(),
+        };
+
+        assert!(run_business_mutation(&state, |_| {
+            Err::<(), AppError>(AppError::Validation("TEST_INVALID_MUTATION".into()))
+        })
+        .is_err());
+        assert_eq!(coordinator.current_generation(), 0);
+
+        let customer = run_business_mutation(&state, |connection| {
+            create_customer_tx(
+                connection,
+                CustomerInput {
+                    first_name: "Backup".into(),
+                    last_name: "Test".into(),
+                    phone: None,
+                    email: None,
+                    notes: None,
+                    whatsapp_reminder_enabled: None,
+                    whatsapp_consent_confirmed: None,
+                },
+            )
+        })
+        .expect("business create");
+        assert_eq!(coordinator.current_generation(), 1);
+
+        run_business_mutation(&state, |connection| {
+            update_customer_tx(
+                connection,
+                &customer.id,
+                CustomerInput {
+                    first_name: customer.first_name.clone(),
+                    last_name: customer.last_name.clone(),
+                    phone: customer.phone.clone(),
+                    email: customer.email.clone(),
+                    notes: customer.notes.clone(),
+                    whatsapp_reminder_enabled: Some(customer.whatsapp_reminder_enabled),
+                    whatsapp_consent_confirmed: Some(customer.whatsapp_consent_confirmed),
+                },
+            )
+        })
+        .expect("business no-op");
+        assert_eq!(
+            coordinator.current_generation(),
+            1,
+            "no-op must not become dirty"
+        );
+
+        state
+            .sqlite
+            .lock()
+            .expect("sqlite")
+            .execute(
+                "INSERT INTO secure_secrets (secret_key, encrypted_value, encryption_provider, created_at, updated_at)
+                 VALUES ('test-session', x'01', 'test', ?1, ?1)",
+                params![now_iso()],
+            )
+            .expect("session write");
+        assert_eq!(
+            coordinator.current_generation(),
+            1,
+            "session state is not a business dirty signal"
+        );
     }
 
     #[test]
@@ -7721,14 +8853,20 @@ mod tests {
         archive_customer(&mut connection, &customer.id).expect("archive no-op");
         reactivate_customer(&mut connection, &customer.id).expect("reactivate");
         let customer_audit = audit_actions(&connection, "customer", &customer.id);
+        let mut customer_actions = customer_audit
+            .iter()
+            .map(|(action, _)| action.as_str())
+            .collect::<Vec<_>>();
+        customer_actions.sort_unstable();
         assert_eq!(
-            customer_audit
-                .iter()
-                .map(|(action, _)| action.as_str())
-                .collect::<Vec<_>>(),
-            vec!["create", "update", "archive", "reactivate"]
+            customer_actions,
+            vec!["archive", "create", "reactivate", "update"]
         );
-        let customer_metadata = customer_audit[1].1.as_deref().expect("update metadata");
+        let customer_metadata = customer_audit
+            .iter()
+            .find(|(action, _)| action == "update")
+            .and_then(|(_, metadata)| metadata.as_deref())
+            .expect("update metadata");
         assert!(customer_metadata.contains("changed_fields"));
         assert!(customer_metadata.contains("phone"));
         assert!(customer_metadata.contains("email"));
@@ -7739,21 +8877,33 @@ mod tests {
 
         deactivate_staff(&mut connection, &staff.id).expect("deactivate staff");
         reactivate_staff(&mut connection, &staff.id).expect("reactivate staff");
+        let mut staff_actions = audit_actions(&connection, "staff", &staff.id)
+            .into_iter()
+            .map(|(action, _)| action)
+            .collect::<Vec<_>>();
+        staff_actions.sort_unstable();
         assert_eq!(
-            audit_actions(&connection, "staff", &staff.id)
-                .iter()
-                .map(|(action, _)| action.as_str())
-                .collect::<Vec<_>>(),
-            vec!["create", "deactivate", "reactivate"]
+            staff_actions,
+            vec![
+                "create".to_string(),
+                "deactivate".to_string(),
+                "reactivate".to_string()
+            ]
         );
         deactivate_service(&mut connection, &service.id).expect("deactivate service");
         reactivate_service(&mut connection, &service.id).expect("reactivate service");
+        let mut service_actions = audit_actions(&connection, "service", &service.id)
+            .into_iter()
+            .map(|(action, _)| action)
+            .collect::<Vec<_>>();
+        service_actions.sort_unstable();
         assert_eq!(
-            audit_actions(&connection, "service", &service.id)
-                .iter()
-                .map(|(action, _)| action.as_str())
-                .collect::<Vec<_>>(),
-            vec!["create", "deactivate", "reactivate"]
+            service_actions,
+            vec![
+                "create".to_string(),
+                "deactivate".to_string(),
+                "reactivate".to_string()
+            ]
         );
 
         let appointment = create_appointment_tx(
