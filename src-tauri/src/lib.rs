@@ -342,6 +342,13 @@ pub struct BusinessProfileInput {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OnboardingState {
+    pub needs_onboarding: bool,
+    pub next_step: u8,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Staff {
     id: String,
     first_name: String,
@@ -1288,6 +1295,50 @@ fn load_business_profile(connection: &Connection) -> Result<BusinessProfile, App
             business_profile_from_row,
         )
         .map_err(Into::into)
+}
+
+fn onboarding_state_from_counts(
+    business_name: &str,
+    customer_count: i64,
+    appointment_count: i64,
+    staff_count: i64,
+    service_count: i64,
+) -> OnboardingState {
+    let has_business_history = customer_count > 0 || appointment_count > 0;
+    if business_name.trim().is_empty() {
+        return OnboardingState {
+            needs_onboarding: !has_business_history && staff_count == 0 && service_count == 0,
+            next_step: 1,
+        };
+    }
+    if has_business_history || (staff_count > 0 && service_count > 0) {
+        return OnboardingState {
+            needs_onboarding: false,
+            next_step: 4,
+        };
+    }
+    OnboardingState {
+        needs_onboarding: true,
+        next_step: if staff_count == 0 { 2 } else { 3 },
+    }
+}
+
+fn load_onboarding_state(connection: &Connection) -> Result<OnboardingState, AppError> {
+    let profile = load_business_profile(connection)?;
+    let customer_count =
+        connection.query_row("SELECT COUNT(*) FROM customers", [], |row| row.get(0))?;
+    let appointment_count =
+        connection.query_row("SELECT COUNT(*) FROM appointments", [], |row| row.get(0))?;
+    let staff_count = connection.query_row("SELECT COUNT(*) FROM staff", [], |row| row.get(0))?;
+    let service_count =
+        connection.query_row("SELECT COUNT(*) FROM services", [], |row| row.get(0))?;
+    Ok(onboarding_state_from_counts(
+        &profile.business_name,
+        customer_count,
+        appointment_count,
+        staff_count,
+        service_count,
+    ))
 }
 
 fn update_business_profile_tx(
@@ -2810,6 +2861,45 @@ fn list_appointment_services(
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+fn list_appointment_services_batched(
+    connection: &Connection,
+    appointment_ids: &[String],
+) -> Result<HashMap<String, Vec<AppointmentServiceSnapshot>>, AppError> {
+    if appointment_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = std::iter::repeat("?")
+        .take(appointment_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut statement = connection.prepare(&format!(
+        "SELECT appointment_id, service_id, service_name_snapshot, duration_minutes_snapshot,
+                listed_price_snapshot_minor, charged_price_minor, sort_order
+         FROM appointment_services
+         WHERE appointment_id IN ({placeholders})
+         ORDER BY appointment_id ASC, sort_order ASC"
+    ))?;
+    let rows = statement.query_map(params_from_iter(appointment_ids.iter()), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            AppointmentServiceSnapshot {
+                service_id: row.get(1)?,
+                service_name_snapshot: row.get(2)?,
+                duration_minutes_snapshot: row.get(3)?,
+                listed_price_snapshot_minor: row.get(4)?,
+                charged_price_minor: row.get(5)?,
+                sort_order: row.get(6)?,
+            },
+        ))
+    })?;
+    let mut grouped = HashMap::<String, Vec<AppointmentServiceSnapshot>>::new();
+    for row in rows {
+        let (appointment_id, snapshot) = row?;
+        grouped.entry(appointment_id).or_default().push(snapshot);
+    }
+    Ok(grouped)
+}
+
 fn history_local_date_time(start_at_utc: &str) -> Result<(String, String), AppError> {
     let utc = chrono::DateTime::parse_from_rfc3339(start_at_utc)
         .map_err(|_| AppError::Database("appointment start timestamp".to_string()))?
@@ -3934,7 +4024,7 @@ fn list_appointments_between(
         sql.push_str(" AND a.id = :id");
         params_map.insert(":id", value.to_string());
     }
-    sql.push_str(" ORDER BY a.start_at_utc ASC LIMIT :limit");
+    sql.push_str(" ORDER BY a.start_at_utc ASC, a.id ASC LIMIT :limit");
     params_map.insert(":limit", limit.to_string());
     let named: Vec<(&str, &dyn rusqlite::ToSql)> = params_map
         .iter()
@@ -3957,8 +4047,15 @@ fn list_appointments_between(
             row.get::<_, String>("updated_at")?,
         ))
     })?;
-    let mut output = Vec::new();
-    for row in rows {
+    let appointment_rows = rows.collect::<Result<Vec<_>, _>>()?;
+    let appointment_ids = appointment_rows
+        .iter()
+        .map(|row| row.0.clone())
+        .collect::<Vec<_>>();
+    let mut services_by_appointment =
+        list_appointment_services_batched(connection, &appointment_ids)?;
+    let mut output = Vec::with_capacity(appointment_rows.len());
+    for row in appointment_rows {
         let (
             id,
             customer_id,
@@ -3972,8 +4069,8 @@ fn list_appointments_between(
             customer_phone,
             staff_name,
             updated_at,
-        ) = row?;
-        let services = list_appointment_services(connection, &id)?;
+        ) = row;
+        let services = services_by_appointment.remove(&id).unwrap_or_default();
         let service_names = services
             .iter()
             .map(|item| item.service_name_snapshot.clone())
@@ -4020,6 +4117,12 @@ fn app_health(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<AppHe
 fn get_business_profile(state: tauri::State<'_, AppState>) -> Result<BusinessProfile, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     load_business_profile(&connection)
+}
+
+#[tauri::command]
+fn get_onboarding_state(state: tauri::State<'_, AppState>) -> Result<OnboardingState, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    load_onboarding_state(&connection)
 }
 
 #[tauri::command]
@@ -4204,6 +4307,19 @@ fn staff_set_services(
 }
 
 #[tauri::command]
+fn staff_services_list(
+    staff_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<String>, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    let mut statement = connection.prepare(
+        "SELECT service_id FROM staff_services WHERE staff_id=?1 ORDER BY service_id ASC",
+    )?;
+    let rows = statement.query_map(params![staff_id], |row| row.get(0))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+#[tauri::command]
 fn staff_working_hours_list(
     staff_id: String,
     state: tauri::State<'_, AppState>,
@@ -4281,6 +4397,31 @@ fn service_category_create(
     state: tauri::State<'_, AppState>,
 ) -> Result<ServiceCategory, AppError> {
     run_business_mutation(&state, |connection| create_category_tx(connection, input))
+}
+
+#[tauri::command]
+fn service_category_list(
+    status: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<ServiceCategory>, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    let status_sql = match status.as_deref().unwrap_or("active") {
+        "inactive" => "WHERE is_active=0",
+        "all" => "",
+        _ => "WHERE is_active=1",
+    };
+    let mut statement = connection.prepare(&format!(
+        "SELECT id, name, sort_order, is_active FROM service_categories {status_sql} ORDER BY sort_order ASC, name COLLATE NOCASE ASC"
+    ))?;
+    let rows = statement.query_map([], |row| {
+        Ok(ServiceCategory {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            sort_order: row.get(2)?,
+            is_active: row.get::<_, i64>(3)? == 1,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 #[tauri::command]
@@ -4405,6 +4546,32 @@ fn appointment_list_by_date(
         None,
         None,
         limit.unwrap_or(100).clamp(1, 500),
+    )
+}
+
+#[tauri::command]
+fn appointment_list_by_date_range(
+    start_date: String,
+    end_date: String,
+    limit: Option<i64>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<AppointmentSummary>, AppError> {
+    if end_date < start_date {
+        return Err(AppError::Validation(
+            "APPOINTMENT_DATE_RANGE_INVALID".to_string(),
+        ));
+    }
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    let start = local_to_utc(&start_date, "00:00")?;
+    let end = local_to_utc(&end_date, "00:00")? + Duration::days(1);
+    list_appointments_between(
+        &connection,
+        Some(&utc_iso(start)),
+        Some(&utc_iso(end)),
+        None,
+        None,
+        None,
+        limit.unwrap_or(500).clamp(1, 500),
     )
 }
 
@@ -5067,6 +5234,7 @@ fn cloud_process_outbox(
 
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let root = app_data_root(app.handle())?;
             let (database_path, _, _, _, _) = data_paths(&root)?;
@@ -5086,6 +5254,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_health,
+            get_onboarding_state,
             get_business_profile,
             update_business_profile,
             customer_create,
@@ -5103,6 +5272,7 @@ pub fn run() {
             staff_reactivate,
             staff_list,
             staff_set_services,
+            staff_services_list,
             staff_working_hours_list,
             staff_working_hours_set,
             staff_schedule_is_unrestricted,
@@ -5111,6 +5281,7 @@ pub fn run() {
             staff_time_off_update,
             staff_time_off_remove,
             service_category_create,
+            service_category_list,
             service_create,
             service_update,
             service_set_active,
@@ -5122,6 +5293,7 @@ pub fn run() {
             appointment_service_set_charged_price,
             service_statistics,
             appointment_list_by_date,
+            appointment_list_by_date_range,
             database_create_backup,
             database_restore_backup,
             open_data_folder,
@@ -5508,6 +5680,27 @@ mod tests {
             load_business_profile(&connection).expect("profile after invalid contacts"),
             profile_before_invalid_logo
         );
+    }
+
+    #[test]
+    fn onboarding_state_uses_all_business_rows_and_resumes_only_incomplete_setup() {
+        let fresh = onboarding_state_from_counts("", 0, 0, 0, 0);
+        assert!(fresh.needs_onboarding);
+        assert_eq!(fresh.next_step, 1);
+
+        let archived_or_inactive_history = onboarding_state_from_counts("", 1, 0, 0, 0);
+        assert!(!archived_or_inactive_history.needs_onboarding);
+
+        let after_business = onboarding_state_from_counts("Salon", 0, 0, 0, 0);
+        assert!(after_business.needs_onboarding);
+        assert_eq!(after_business.next_step, 2);
+
+        let after_staff = onboarding_state_from_counts("Salon", 0, 0, 1, 0);
+        assert!(after_staff.needs_onboarding);
+        assert_eq!(after_staff.next_step, 3);
+
+        let complete = onboarding_state_from_counts("Salon", 0, 0, 1, 1);
+        assert!(!complete.needs_onboarding);
     }
 
     #[test]
@@ -6303,6 +6496,10 @@ mod tests {
         let local = Utc::now()
             + Duration::minutes(ISTANBUL_OFFSET_MINUTES)
             + Duration::hours(hours_from_now);
+        if chrono::Timelike::hour(&local) >= 23 {
+            let next_day = local + Duration::days(1);
+            return (next_day.date_naive().format("%Y-%m-%d").to_string(), "10:00".into());
+        }
         let minute = (chrono::Timelike::minute(&local) / 5) * 5;
         (
             local.date_naive().format("%Y-%m-%d").to_string(),
