@@ -720,6 +720,7 @@ export function App() {
     setLocalDate(todayLocalDate());
     setLocalStartTime("10:00");
     setFormError("");
+    setFormNotice("");
   }, []);
 
   const openBooking = useCallback(
@@ -1076,6 +1077,27 @@ export function App() {
     setStaffPhone("");
     setStaffSpecialtyNote("");
   }, []);
+
+  const navigateToRoot = useCallback(
+    (item: (typeof navigationItems)[number]) => {
+      setBookingOpen(false);
+      resetBooking();
+      setEditingAppointment(null);
+      setEditError("");
+      setCustomerHistory(null);
+      setHistoryError("");
+      setHistoryOffset(0);
+      setHistoryHasMore(false);
+      resetServiceForm();
+      resetStaffForm();
+      setStaffDetail(null);
+      setEditingTimeOffId(null);
+      setRestoreConfirming(false);
+      setRestoreCandidate(null);
+      setActiveItem(item);
+    },
+    [resetBooking, resetServiceForm, resetStaffForm],
+  );
 
   const beginStaffEdit = useCallback((item: Staff) => {
     setEditingStaff(item);
@@ -1786,7 +1808,7 @@ export function App() {
               className={
                 item === activeItem ? "nav-item is-active" : "nav-item"
               }
-              onClick={() => setActiveItem(item)}
+              onClick={() => navigateToRoot(item)}
             >
               {item}
             </button>

@@ -178,6 +178,9 @@ describe("New appointment flow", () => {
       inactiveService,
     ]);
     api.listActiveStaff.mockResolvedValue([activeStaff, inactiveStaff]);
+    api.listServices.mockResolvedValue([activeService]);
+    api.listServiceCategories.mockResolvedValue([]);
+    api.listStaff.mockResolvedValue([activeStaff]);
     api.searchCustomers.mockResolvedValue([existingCustomer]);
     api.createCustomer.mockResolvedValue({
       id: "customer-new",
@@ -242,6 +245,20 @@ describe("New appointment flow", () => {
     expect(screen.getByLabelText(/Telefon/)).toBeInTheDocument();
     expect(screen.getByRole("group", { name: "Hizmet" })).toBeInTheDocument();
     fireEvent.click(screen.getAllByRole("button", { name: "Vazgeç" })[0]);
+    expect(
+      screen.queryByRole("heading", { name: "Yeni Randevu" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["Müşteriler", "Müşteriler"],
+    ["Takvim", "Randevu takvimi"],
+    ["Hizmetler", "Hizmetler"],
+    ["Personel", "Personel"],
+  ])("leaves the booking draft for the %s root screen", async (item, region) => {
+    await openForm();
+    fireEvent.click(screen.getByRole("button", { name: item }));
+    expect(await screen.findByRole("region", { name: region })).toBeInTheDocument();
     expect(
       screen.queryByRole("heading", { name: "Yeni Randevu" }),
     ).not.toBeInTheDocument();
@@ -768,6 +785,19 @@ describe("Customer list, history and repeat booking", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Tamamlandı")).toBeInTheDocument();
     expect(api.getCustomerHistory).toHaveBeenCalledWith("customer-1", 10, 0);
+  });
+
+  it("leaves customer detail for the selected root screen", async () => {
+    await openCustomers();
+    fireEvent.click(await screen.findByRole("button", { name: /Ayşe Yılmaz/ }));
+    await screen.findByRole("heading", { name: "Randevu Geçmişi" });
+    fireEvent.click(screen.getByRole("button", { name: "Takvim" }));
+    expect(
+      await screen.findByRole("region", { name: "Randevu takvimi" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Randevu Geçmişi" }),
+    ).not.toBeInTheDocument();
   });
 
   it("loads the next bounded history page only when requested", async () => {
