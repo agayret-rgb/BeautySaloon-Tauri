@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "BeautySaloon",
-  "version": "0.1.0",
+  "version": "1.1.0",
   "identifier": "com.beautysaloon.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -26,7 +26,12 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
-    "icon": ["icons/icon.ico"]
+    "targets": "nsis",
+    "icon": ["icons/icon.ico"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   }
 }

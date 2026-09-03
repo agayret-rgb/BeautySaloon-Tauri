@@ -672,12 +672,62 @@ fn open_business_data_directory(database_path: &Path) -> Result<DataFolderSummar
     })
 }
 
-fn open_database(path: &Path) -> Result<Connection, AppError> {
+fn initialize_database_at(path: &Path) -> Result<Connection, AppError> {
     let connection = Connection::open(path)?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     migrate_core(&connection)?;
     Ok(connection)
+}
+
+fn open_database(path: &Path) -> Result<Connection, AppError> {
+    initialize_database_at(path)
+}
+
+#[cfg(test)]
+fn normalize_rehearsal_path(path: &Path) -> Result<PathBuf, AppError> {
+    if let Ok(canonical) = path.canonicalize() {
+        return Ok(canonical);
+    }
+    if let Some(parent) = path.parent() {
+        if let Ok(parent_c) = parent.canonicalize() {
+            if let Some(file_name) = path.file_name() {
+                return Ok(parent_c.join(file_name));
+            }
+        }
+    }
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .map_err(AppError::Io)
+    }
+}
+
+#[cfg(test)]
+fn initialize_explicit_migration_rehearsal(
+    rehearsal_path: Option<&Path>,
+    forbidden_canonical_path: Option<&Path>,
+) -> Result<Connection, AppError> {
+    let rehearsal_path = rehearsal_path
+        .ok_or_else(|| AppError::Validation("MIGRATION_REHEARSAL_PATH_REQUIRED".into()))?;
+    let forbidden_canonical_path = forbidden_canonical_path.ok_or_else(|| {
+        AppError::Validation("MIGRATION_REHEARSAL_FORBIDDEN_PATH_REQUIRED".into())
+    })?;
+
+    let canonical_rehearsal = normalize_rehearsal_path(rehearsal_path)?;
+    let canonical_forbidden = normalize_rehearsal_path(forbidden_canonical_path)?;
+
+    if canonical_rehearsal.to_string_lossy().to_lowercase()
+        == canonical_forbidden.to_string_lossy().to_lowercase()
+    {
+        return Err(AppError::Validation(
+            "MIGRATION_REHEARSAL_CANONICAL_PATH_FORBIDDEN".into(),
+        ));
+    }
+
+    initialize_database_at(rehearsal_path)
 }
 
 fn migrate_core(connection: &Connection) -> Result<(), AppError> {
@@ -1000,18 +1050,59 @@ fn migrate_v17_archive_and_audit_schema(connection: &Connection) -> Result<(), A
     if read_schema_version(connection)? >= 17 {
         return Ok(());
     }
-    connection
-        .execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE IF NOT EXISTS audit_log (
+    let audit_columns = table_columns(connection, "audit_log")?;
+    let legacy_audit = !audit_columns.is_empty() && !audit_columns.contains("occurred_at");
+
+    if legacy_audit
+        && ![
+            "id",
+            "entity_type",
+            "entity_id",
+            "action",
+            "occurred_at_utc",
+        ]
+        .iter()
+        .all(|column| audit_columns.contains(*column))
+    {
+        return Err(AppError::Database(
+            "AUDIT_LOG_LEGACY_SCHEMA_UNSUPPORTED".to_string(),
+        ));
+    }
+
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<(), AppError> {
+        if legacy_audit {
+            connection.execute_batch(
+                "DROP TRIGGER IF EXISTS audit_log_append_only_update;
+                 DROP TRIGGER IF EXISTS audit_log_append_only_delete;
+                 ALTER TABLE audit_log RENAME TO audit_log_legacy_v13;",
+            )?;
+        }
+
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS audit_log (
                id TEXT PRIMARY KEY NOT NULL,
                occurred_at TEXT NOT NULL,
                entity_type TEXT NOT NULL CHECK (length(trim(entity_type)) > 0 AND length(entity_type) <= 64),
                entity_id TEXT NOT NULL CHECK (length(trim(entity_id)) > 0 AND length(entity_id) <= 128),
                action TEXT NOT NULL CHECK (length(trim(action)) > 0 AND length(action) <= 64),
                metadata_json TEXT NULL
-             );
-             CREATE INDEX IF NOT EXISTS audit_log_occurred_at_idx ON audit_log (occurred_at DESC, id DESC);
+             );",
+        )?;
+
+        if legacy_audit {
+            // The legacy summary was unrestricted free text, so retain only the
+            // structured history fields in the privacy-safe audit contract.
+            connection.execute_batch(
+                "INSERT INTO audit_log (id, occurred_at, entity_type, entity_id, action, metadata_json)
+                 SELECT CAST(id AS TEXT), occurred_at_utc, entity_type, entity_id, action, NULL
+                 FROM audit_log_legacy_v13;
+                 DROP TABLE audit_log_legacy_v13;",
+            )?;
+        }
+
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS audit_log_occurred_at_idx ON audit_log (occurred_at DESC, id DESC);
              CREATE INDEX IF NOT EXISTS audit_log_entity_occurred_at_idx ON audit_log (entity_type, entity_id, occurred_at DESC, id DESC);
              CREATE TRIGGER IF NOT EXISTS audit_log_append_only_update
              BEFORE UPDATE ON audit_log
@@ -1022,10 +1113,21 @@ fn migrate_v17_archive_and_audit_schema(connection: &Connection) -> Result<(), A
              BEFORE DELETE ON audit_log
              BEGIN
                SELECT RAISE(ABORT, 'AUDIT_LOG_APPEND_ONLY');
-             END;
-             COMMIT;",
-        )
-        .map_err(Into::into)
+             END;",
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            connection.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK;");
+            Err(error)
+        }
+    }
 }
 
 fn migrate_v15_service_pricing(connection: &Connection) -> Result<(), AppError> {
@@ -6498,7 +6600,10 @@ mod tests {
             + Duration::hours(hours_from_now);
         if chrono::Timelike::hour(&local) >= 23 {
             let next_day = local + Duration::days(1);
-            return (next_day.date_naive().format("%Y-%m-%d").to_string(), "10:00".into());
+            return (
+                next_day.date_naive().format("%Y-%m-%d").to_string(),
+                "10:00".into(),
+            );
         }
         let minute = (chrono::Timelike::minute(&local) / 5) * 5;
         (
@@ -8282,13 +8387,23 @@ mod tests {
                whatsapp_consent_recorded_at TEXT, notes TEXT, is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
              CREATE UNIQUE INDEX customers_phone_unique_idx ON customers(phone);
              CREATE INDEX customers_active_name_idx ON customers(is_active, last_name, first_name);
+             CREATE TABLE audit_log (
+               id INTEGER PRIMARY KEY,
+               entity_type TEXT NOT NULL,
+               entity_id TEXT NOT NULL,
+               action TEXT NOT NULL,
+               occurred_at_utc TEXT NOT NULL,
+               summary TEXT NOT NULL
+             );
+             CREATE INDEX audit_log_entity_idx ON audit_log(entity_type, entity_id, occurred_at_utc DESC);
              CREATE TABLE appointments (id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, staff_id TEXT NOT NULL, start_at_utc TEXT NOT NULL, end_at_utc TEXT NOT NULL, total_duration_minutes INTEGER NOT NULL, status TEXT NOT NULL, note TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY (customer_id) REFERENCES customers(id));
              INSERT INTO customers VALUES ('c-1','Ada','Test','5551112233',NULL,1,0,NULL,'keep',1,'2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z');
              INSERT INTO customers VALUES ('c-2','Bora','Test','5551112244','b@example.test',0,0,NULL,NULL,1,'2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z');
+             INSERT INTO audit_log VALUES (7,'customer','c-1','create','2026-01-01T00:00:00.000Z','legacy summary');
              INSERT INTO appointments VALUES ('a-1','c-1','staff-1','2026-02-01T07:00:00.000Z','2026-02-01T08:00:00.000Z',60,'planned',NULL,'2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z');",
         ).expect("v13 fixture");
         drop(old);
-        let connection = open_database(&path).expect("migrate v13");
+        let connection = initialize_database_at(&path).expect("migrate explicit v13 path");
         assert_eq!(read_schema_version(&connection).expect("version"), 18);
         assert_eq!(
             connection
@@ -8319,9 +8434,40 @@ mod tests {
             connection
                 .query_row("SELECT COUNT(*) FROM audit_log", [], |row| row
                     .get::<_, i64>(0))
-                .expect("audit empty"),
-            0
+                .expect("migrated audit count"),
+            1
         );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT id, occurred_at, entity_type, entity_id, action, metadata_json FROM audit_log",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                        ))
+                    },
+                )
+                .expect("preserved legacy audit row"),
+            (
+                "7".into(),
+                "2026-01-01T00:00:00.000Z".into(),
+                "customer".into(),
+                "c-1".into(),
+                "create".into(),
+                None,
+            )
+        );
+        let audit_columns = table_columns(&connection, "audit_log").expect("audit columns");
+        assert!(audit_columns.contains("occurred_at"));
+        assert!(audit_columns.contains("metadata_json"));
+        assert!(!audit_columns.contains("occurred_at_utc"));
+        assert!(!audit_columns.contains("summary"));
         assert_eq!(
             connection
                 .query_row("SELECT COUNT(*) FROM customers", [], |row| row
@@ -8367,12 +8513,212 @@ mod tests {
             .expect("old table absent");
         assert_eq!(tables, 0);
         drop(connection);
-        let reopened = open_database(&path).expect("restart safe");
+        let reopened = initialize_database_at(&path).expect("restart safe");
         assert_eq!(
             read_schema_version(&reopened).expect("version after restart"),
             18
         );
         assert!(integrity_check(&reopened).expect("integrity after restart"));
+    }
+
+    #[test]
+    fn migration_rehearsal_helper_contract() {
+        let temp = tempdir().expect("temp dir");
+        let temp_db = temp.path().join("rehearsal.db");
+        let forbidden_db = temp.path().join("forbidden_live.db");
+
+        let err = initialize_explicit_migration_rehearsal(None, Some(&forbidden_db)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            AppError::Validation("MIGRATION_REHEARSAL_PATH_REQUIRED".into()).to_string()
+        );
+
+        let err = initialize_explicit_migration_rehearsal(Some(&temp_db), None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            AppError::Validation("MIGRATION_REHEARSAL_FORBIDDEN_PATH_REQUIRED".into()).to_string()
+        );
+
+        let err =
+            initialize_explicit_migration_rehearsal(Some(&temp_db), Some(&temp_db)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            AppError::Validation("MIGRATION_REHEARSAL_CANONICAL_PATH_FORBIDDEN".into()).to_string()
+        );
+
+        let connection =
+            initialize_explicit_migration_rehearsal(Some(&temp_db), Some(&forbidden_db))
+                .expect("explicit rehearsal succeeds");
+        assert_eq!(read_schema_version(&connection).expect("schema"), 18);
+        assert!(integrity_check(&connection).expect("integrity"));
+    }
+
+    #[test]
+    #[ignore = "requires explicit rehearsal and forbidden paths"]
+    fn offline_v13_to_v18_migration_rehearsal_explicit_path() {
+        let rehearsal_path = std::env::var_os("BEAUTYSALOON_REHEARSAL_DB_PATH")
+            .map(PathBuf::from)
+            .expect("BEAUTYSALOON_REHEARSAL_DB_PATH is required");
+        let forbidden_path = std::env::var_os("BEAUTYSALOON_FORBIDDEN_CANONICAL_PATH")
+            .map(PathBuf::from)
+            .expect("BEAUTYSALOON_FORBIDDEN_CANONICAL_PATH is required");
+
+        // 1. Verify initial schema is 13 on the temp work copy before migration
+        let (c_cust, c_staff, c_svc, c_appt, c_asvc, cust_ids, appt_ids) = {
+            let pre_conn = Connection::open_with_flags(
+                &rehearsal_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .expect("open rehearsal copy pre-migration");
+            assert_eq!(
+                read_schema_version(&pre_conn).expect("initial schema"),
+                13,
+                "rehearsal copy must start at schema 13"
+            );
+            assert!(integrity_check(&pre_conn).expect("pre integrity"));
+            assert_eq!(
+                pre_conn
+                    .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .expect("pre fk"),
+                0
+            );
+
+            let cust: i64 = pre_conn
+                .query_row("SELECT COUNT(*) FROM customers", [], |r| r.get(0))
+                .expect("cust");
+            let staff: i64 = pre_conn
+                .query_row("SELECT COUNT(*) FROM staff", [], |r| r.get(0))
+                .expect("staff");
+            let svc: i64 = pre_conn
+                .query_row("SELECT COUNT(*) FROM services", [], |r| r.get(0))
+                .expect("svc");
+            let appt: i64 = pre_conn
+                .query_row("SELECT COUNT(*) FROM appointments", [], |r| r.get(0))
+                .expect("appt");
+            let asvc: i64 = pre_conn
+                .query_row("SELECT COUNT(*) FROM appointment_services", [], |r| {
+                    r.get(0)
+                })
+                .expect("asvc");
+
+            let c_ids = {
+                let mut stmt = pre_conn
+                    .prepare("SELECT id FROM customers ORDER BY id")
+                    .expect("stmt cust");
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .expect("query cust");
+                rows.collect::<Result<Vec<_>, _>>().expect("collect cust")
+            };
+
+            let a_ids = {
+                let mut stmt = pre_conn
+                    .prepare("SELECT id FROM appointments ORDER BY id")
+                    .expect("stmt appt");
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .expect("query appt");
+                rows.collect::<Result<Vec<_>, _>>().expect("collect appt")
+            };
+
+            (cust, staff, svc, appt, asvc, c_ids, a_ids)
+        };
+
+        // 2. Run explicit rehearsal migration
+        let connection =
+            initialize_explicit_migration_rehearsal(Some(&rehearsal_path), Some(&forbidden_path))
+                .expect("rehearsal migration succeeds");
+
+        assert_eq!(read_schema_version(&connection).expect("schema 18"), 18);
+        assert!(integrity_check(&connection).expect("migrated integrity"));
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .expect("migrated fk"),
+            0
+        );
+
+        // Verify counts preserved
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM customers", [], |r| r.get::<_, i64>(0))
+                .expect("cust count"),
+            c_cust
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM staff", [], |r| r.get::<_, i64>(0))
+                .expect("staff count"),
+            c_staff
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM services", [], |r| r.get::<_, i64>(0))
+                .expect("svc count"),
+            c_svc
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM appointments", [], |r| r
+                    .get::<_, i64>(0))
+                .expect("appt count"),
+            c_appt
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM appointment_services", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .expect("asvc count"),
+            c_asvc
+        );
+
+        // Verify IDs preserved
+        let post_c_ids = {
+            let mut stmt = connection
+                .prepare("SELECT id FROM customers ORDER BY id")
+                .expect("stmt post cust");
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query post cust");
+            rows.collect::<Result<Vec<_>, _>>()
+                .expect("collect post cust")
+        };
+        assert_eq!(post_c_ids, cust_ids);
+
+        let post_a_ids = {
+            let mut stmt = connection
+                .prepare("SELECT id FROM appointments ORDER BY id")
+                .expect("stmt post appt");
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query post appt");
+            rows.collect::<Result<Vec<_>, _>>()
+                .expect("collect post appt")
+        };
+        assert_eq!(post_a_ids, appt_ids);
+
+        drop(connection);
+
+        // 3. Reopen / second run
+        let reopened =
+            initialize_explicit_migration_rehearsal(Some(&rehearsal_path), Some(&forbidden_path))
+                .expect("reopen migration succeeds");
+        assert_eq!(read_schema_version(&reopened).expect("reopen schema"), 18);
+        assert!(integrity_check(&reopened).expect("reopen integrity"));
+        assert_eq!(
+            reopened
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .expect("reopen fk check"),
+            0
+        );
+        drop(reopened);
     }
 
     #[test]
