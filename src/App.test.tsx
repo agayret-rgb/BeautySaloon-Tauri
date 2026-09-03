@@ -345,7 +345,7 @@ describe("New appointment flow", () => {
     await fillRequiredFields();
     fireEvent.click(screen.getByRole("button", { name: "Randevuyu Kaydet" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Bu saat için personelin başka bir randevusu var.",
+      "Bu personelin seçilen saatte başka bir randevusu var.",
     );
     expect(screen.getByLabelText("Müşteri adı")).toHaveValue("Deniz Kaya");
     expect(screen.getByLabelText("Saat")).toHaveValue("10:00");
@@ -356,7 +356,7 @@ describe("New appointment flow", () => {
       "OUTSIDE_WORKING_HOURS",
       "Seçilen saat personelin çalışma saatleri dışında.",
     ],
-    ["STAFF_TIME_OFF", "Personel bu tarih/saatte müsait değil."],
+    ["STAFF_TIME_OFF", "Personel seçilen tarih veya saatte izinli."],
   ])("maps %s to a normal-user message", async (code, expected) => {
     api.createAppointment.mockRejectedValueOnce(new Error(code));
     await openForm();
@@ -610,9 +610,56 @@ describe("Calendar day, week and edit foundation", () => {
       screen.getByRole("button", { name: "Değişiklikleri Kaydet" }),
     );
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Personel bu tarih/saatte müsait değil.",
+      "Personel seçilen tarih veya saatte izinli.",
     );
     expect(screen.getByLabelText("Düzenle saat")).toHaveValue("13:00");
+  });
+
+  it("maps a Tauri string conflict rejection and preserves the edit draft", async () => {
+    api.updateAppointment.mockRejectedValueOnce(
+      "CONFLICT: APPOINTMENT_CONFLICT",
+    );
+    await openCalendar();
+    fireEvent.click(await screen.findByRole("button", { name: /Ayşe Yılmaz/ }));
+    await screen.findByRole("heading", { name: "Randevuyu Düzenle" });
+    fireEvent.change(screen.getByLabelText("Düzenle saat"), {
+      target: { value: "13:00" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Değişiklikleri Kaydet" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Bu personelin seçilen saatte başka bir randevusu var.",
+    );
+    expect(screen.getByLabelText("Düzenle saat")).toHaveValue("13:00");
+  });
+
+  it("maps an Error conflict rejection", async () => {
+    api.updateAppointment.mockRejectedValueOnce(
+      new Error("CONFLICT: APPOINTMENT_CONFLICT"),
+    );
+    await openCalendar();
+    fireEvent.click(await screen.findByRole("button", { name: /Ayşe Yılmaz/ }));
+    await screen.findByRole("heading", { name: "Randevuyu Düzenle" });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Değişiklikleri Kaydet" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Bu personelin seçilen saatte başka bir randevusu var.",
+    );
+  });
+
+  it("keeps an unknown Tauri rejection behind the generic message", async () => {
+    api.updateAppointment.mockRejectedValueOnce("UNEXPECTED_BACKEND_FAILURE");
+    await openCalendar();
+    fireEvent.click(await screen.findByRole("button", { name: /Ayşe Yılmaz/ }));
+    await screen.findByRole("heading", { name: "Randevuyu Düzenle" });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Değişiklikleri Kaydet" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "İşlem tamamlanamadı. Bilgileri kontrol edip tekrar deneyin.",
+    );
   });
 
   it("cancels an edit without a mutation", async () => {

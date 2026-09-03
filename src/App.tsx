@@ -171,13 +171,14 @@ function statusLabel(status: string): string {
 }
 
 function bookingErrorMessage(error: unknown): string {
-  const message = error instanceof Error ? error.message : "";
+  const message =
+    error instanceof Error ? error.message : typeof error === "string" ? error : "";
   if (message.includes("OUTSIDE_WORKING_HOURS"))
     return "Seçilen saat personelin çalışma saatleri dışında.";
   if (message.includes("STAFF_TIME_OFF"))
-    return "Personel bu tarih/saatte müsait değil.";
+    return "Personel seçilen tarih veya saatte izinli.";
   if (message.includes("APPOINTMENT_CONFLICT"))
-    return "Bu saat için personelin başka bir randevusu var.";
+    return "Bu personelin seçilen saatte başka bir randevusu var.";
   if (message.includes("STAFF_INACTIVE"))
     return "Seçilen personel artık aktif değil.";
   if (
