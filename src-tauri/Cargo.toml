@@ -15,6 +15,7 @@ path = "src/main.rs"
 test = false
 
 [build-dependencies]
+serde_json = "=1.0.143"
 tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]

@@ -29,6 +29,8 @@ const AUTOMATIC_BACKUP_INTERVAL: StdDuration = StdDuration::from_secs(15 * 60);
 const AUTOMATIC_REMINDER_INTERVAL: StdDuration = StdDuration::from_secs(15 * 60);
 const SHUTDOWN_BACKUP_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const SHUTDOWN_BACKUP_POLL_INTERVAL: StdDuration = StdDuration::from_millis(25);
+const PACKAGED_GOOGLE_RUNTIME_DEFAULT: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/google-runtime-default.json"));
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Error)]
@@ -289,10 +291,27 @@ impl BackupCoordinator {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct GoogleRuntimeConfig {
+    client_id: String,
+    calendar_id: Option<String>,
+}
+
+impl GoogleRuntimeConfig {
+    fn into_oauth_config(self) -> services::google::GoogleOAuthConfig {
+        services::google::GoogleOAuthConfig {
+            client_id: self.client_id,
+            client_secret: String::new(),
+            calendar_id: self.calendar_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LiveServicesConfig {
-    google: Option<services::google::GoogleOAuthConfig>,
+    google: Option<GoogleRuntimeConfig>,
     supabase: Option<services::supabase::SupabaseConfig>,
 }
 
@@ -4886,18 +4905,15 @@ fn auth_logout(state: tauri::State<'_, AppState>) -> Result<bool, AppError> {
 }
 
 fn load_live_services_config() -> Result<LiveServicesConfig, AppError> {
-    let mut config = read_live_services_config_file()?.unwrap_or_default();
+    let mut config = packaged_live_services_config()?;
+    merge_live_services_config(&mut config, read_live_services_config_file()?);
 
     let google_client_id = std::env::var("BEAUTYSALOON_GOOGLE_CLIENT_ID")
         .ok()
         .filter(|value| !value.trim().is_empty());
-    let google_client_secret = std::env::var("BEAUTYSALOON_GOOGLE_CLIENT_SECRET")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
     if let Some(client_id) = google_client_id {
-        config.google = Some(services::google::GoogleOAuthConfig {
+        config.google = Some(GoogleRuntimeConfig {
             client_id,
-            client_secret: google_client_secret.unwrap_or_default(),
             calendar_id: std::env::var("BEAUTYSALOON_GOOGLE_CALENDAR_ID")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
@@ -4920,14 +4936,30 @@ fn load_live_services_config() -> Result<LiveServicesConfig, AppError> {
     Ok(config)
 }
 
+fn merge_live_services_config(target: &mut LiveServicesConfig, source: Option<LiveServicesConfig>) {
+    let Some(source) = source else {
+        return;
+    };
+    if source.google.is_some() {
+        target.google = source.google;
+    }
+    if source.supabase.is_some() {
+        target.supabase = source.supabase;
+    }
+}
+
 fn read_live_services_config_file() -> Result<Option<LiveServicesConfig>, AppError> {
-    for path in live_services_config_candidates()? {
+    let mut config = LiveServicesConfig::default();
+    let mut found = false;
+    for path in live_services_config_candidates()?.into_iter().rev() {
         if path.exists() {
             let text = fs::read_to_string(path)?;
-            return parse_live_services_config(&text).map(Some);
+            let parsed = parse_live_services_config(&text)?;
+            merge_live_services_config(&mut config, Some(parsed));
+            found = true;
         }
     }
-    Ok(None)
+    Ok(found.then_some(config))
 }
 
 fn live_services_config_candidates() -> Result<Vec<PathBuf>, AppError> {
@@ -4968,9 +5000,43 @@ fn parse_live_services_config(text: &str) -> Result<LiveServicesConfig, AppError
         .map_err(|_| AppError::Validation("LIVE_SERVICE_CONFIG_INVALID".to_string()))
 }
 
+fn packaged_live_services_config() -> Result<LiveServicesConfig, AppError> {
+    parse_live_services_config(PACKAGED_GOOGLE_RUNTIME_DEFAULT)
+        .map_err(|_| AppError::Validation("GOOGLE_RUNTIME_DEFAULT_INVALID".to_string()))
+}
+
+fn provision_google_runtime_config(
+    settings_dir: &Path,
+    packaged: &LiveServicesConfig,
+) -> Result<(), AppError> {
+    if packaged.google.is_none() {
+        return Ok(());
+    }
+    let destination = settings_dir.join("live-services.json");
+    if destination.exists() {
+        return Ok(());
+    }
+    let safe_config = serde_json::json!({ "google": packaged.google });
+    let temporary = destination.with_extension("json.tmp");
+    fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(&safe_config)
+            .map_err(|_| AppError::Validation("GOOGLE_RUNTIME_DEFAULT_INVALID".to_string()))?,
+    )?;
+    fs::rename(temporary, destination)?;
+    Ok(())
+}
+
 fn google_config() -> Result<services::google::GoogleOAuthConfig, AppError> {
-    load_live_services_config()?
+    google_oauth_config(load_live_services_config()?)
+}
+
+fn google_oauth_config(
+    config: LiveServicesConfig,
+) -> Result<services::google::GoogleOAuthConfig, AppError> {
+    config
         .google
+        .map(GoogleRuntimeConfig::into_oauth_config)
         .ok_or_else(|| AppError::Validation("GOOGLE_CONFIG_MISSING".to_string()))
 }
 
@@ -5549,7 +5615,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let root = app_data_root(app.handle())?;
-            let (database_path, _, _, _, _) = data_paths(&root)?;
+            let (database_path, _, _, _, settings_dir) = data_paths(&root)?;
+            provision_google_runtime_config(&settings_dir, &packaged_live_services_config()?)?;
             let sqlite = open_database(&database_path)?;
             let backup_coordinator = Arc::new(BackupCoordinator::default());
             let reminder_coordinator = Arc::new(ReminderCoordinator::default());
@@ -5676,6 +5743,95 @@ mod tests {
         assert!(path.ends_with("com.beautysaloon.desktop/settings/live-services.json"));
         assert!(!path.to_string_lossy().contains("backups"));
         assert!(!path.to_string_lossy().contains("database"));
+    }
+
+    #[test]
+    fn packaged_google_config_bootstraps_clean_app_data_without_secrets() {
+        let temp = tempdir().expect("tempdir");
+        let settings_dir = temp.path().join("settings");
+        fs::create_dir_all(&settings_dir).expect("settings");
+        let packaged = parse_live_services_config(
+            r#"{"google":{"clientId":"packaged-client","calendarId":"primary"}}"#,
+        )
+        .expect("packaged config");
+
+        provision_google_runtime_config(&settings_dir, &packaged).expect("provision");
+        let text = fs::read_to_string(settings_dir.join("live-services.json")).expect("config");
+        let resolved = parse_live_services_config(&text).expect("resolved");
+        assert_eq!(
+            google_oauth_config(resolved)
+                .expect("Google config")
+                .client_id,
+            "packaged-client"
+        );
+        for forbidden in ["clientSecret", "refreshToken", "accessToken", "supabase"] {
+            assert!(!text.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn packaged_google_default_never_contains_machine_or_provider_secrets() {
+        let packaged: serde_json::Value =
+            serde_json::from_str(PACKAGED_GOOGLE_RUNTIME_DEFAULT).expect("packaged default");
+        let google = packaged
+            .get("google")
+            .and_then(serde_json::Value::as_object);
+        if let Some(google) = google {
+            assert!(google
+                .keys()
+                .all(|key| key == "clientId" || key == "calendarId"));
+        }
+        let text = PACKAGED_GOOGLE_RUNTIME_DEFAULT.to_ascii_lowercase();
+        for forbidden in [
+            "clientsecret",
+            "refresh",
+            "access_token",
+            "supabase",
+            "service_role",
+            "whatsapp",
+        ] {
+            assert!(!text.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn explicit_app_data_google_config_overrides_packaged_default() {
+        let mut resolved = parse_live_services_config(
+            r#"{"google":{"clientId":"packaged-client","calendarId":"primary"}}"#,
+        )
+        .expect("packaged config");
+        let app_data = parse_live_services_config(
+            r#"{"google":{"clientId":"app-data-client","calendarId":"salon-calendar"}}"#,
+        )
+        .expect("app data config");
+
+        merge_live_services_config(&mut resolved, Some(app_data));
+        let google = google_oauth_config(resolved).expect("Google config");
+        assert_eq!(google.client_id, "app-data-client");
+        assert_eq!(google.calendar_id.as_deref(), Some("salon-calendar"));
+    }
+
+    #[test]
+    fn missing_google_config_returns_the_existing_safe_error() {
+        let error = google_oauth_config(LiveServicesConfig::default()).expect_err("missing config");
+        assert!(error.to_string().contains("GOOGLE_CONFIG_MISSING"));
+    }
+
+    #[test]
+    fn disconnect_and_reconnect_do_not_remove_safe_google_runtime_config() {
+        let temp = tempdir().expect("tempdir");
+        let settings_dir = temp.path().join("settings");
+        fs::create_dir_all(&settings_dir).expect("settings");
+        let packaged = parse_live_services_config(
+            r#"{"google":{"clientId":"packaged-client","calendarId":"primary"}}"#,
+        )
+        .expect("packaged config");
+        provision_google_runtime_config(&settings_dir, &packaged).expect("provision");
+        let path = settings_dir.join("live-services.json");
+        let before = fs::read_to_string(&path).expect("config");
+
+        provision_google_runtime_config(&settings_dir, &packaged).expect("reconnect provision");
+        assert_eq!(fs::read_to_string(path).expect("config"), before);
     }
 
     #[test]
