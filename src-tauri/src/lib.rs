@@ -4289,27 +4289,42 @@ fn customer_search(
 ) -> Result<Vec<Customer>, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     let limit = limit.unwrap_or(50).clamp(1, 200);
+    find_customers(&connection, search.as_deref(), status.as_deref(), limit)
+}
+
+fn find_customers(
+    connection: &Connection,
+    search: Option<&str>,
+    status: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Customer>, AppError> {
     let status_sql = match status.as_deref().unwrap_or("active") {
         "inactive" => "is_active = 0",
         "all" => "1 = 1",
         _ => "is_active = 1",
     };
     let query = search.unwrap_or_default().to_lowercase();
-    let phone_query: String = query.chars().filter(|c| c.is_ascii_digit()).collect();
+    let phone_query: String = if query
+        .chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, ' ' | '+' | '-' | '(' | ')'))
+    {
+        query.chars().filter(|c| c.is_ascii_digit()).collect()
+    } else {
+        String::new()
+    };
+    let normalized_phone_query = phone_query.trim_start_matches("90").trim_start_matches('0');
     let mut statement = connection.prepare(&format!(
         "SELECT * FROM customers WHERE {status_sql}
-         AND (:query = '' OR lower(first_name) LIKE :like OR lower(last_name) LIKE :like OR lower(first_name || ' ' || last_name) LIKE :like OR phone LIKE :phone)
+         AND (:query = '' OR lower(first_name) LIKE :like OR lower(last_name) LIKE :like OR lower(first_name || ' ' || last_name) LIKE :like OR (:phone_query != '' AND phone LIKE :phone))
          ORDER BY last_name COLLATE NOCASE ASC, first_name COLLATE NOCASE ASC LIMIT :limit"
     ))?;
     let like = format!("%{query}%");
-    let phone = format!(
-        "%{}%",
-        phone_query.trim_start_matches("90").trim_start_matches('0')
-    );
+    let phone = format!("%{normalized_phone_query}%");
     let rows = statement.query_map(
         &[
             (":query", &query as &dyn rusqlite::ToSql),
             (":like", &like),
+            (":phone_query", &normalized_phone_query),
             (":phone", &phone),
             (":limit", &limit),
         ],
@@ -6501,17 +6516,75 @@ mod tests {
         search: &str,
         status: &str,
     ) -> Result<Vec<Customer>, AppError> {
-        let status_sql = if status == "all" {
-            "1 = 1"
-        } else {
-            "is_active = 1"
-        };
-        let like = format!("%{}%", search.to_lowercase());
-        let mut statement = connection.prepare(&format!(
-            "SELECT * FROM customers WHERE {status_sql} AND (lower(first_name) LIKE ?1 OR lower(last_name) LIKE ?1 OR phone LIKE ?1)"
-        ))?;
-        let rows = statement.query_map(params![like], customer_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        find_customers(connection, Some(search), Some(status), 5_000)
+    }
+
+    #[test]
+    fn customer_search_filters_names_and_canonical_phone_digits() {
+        let (_temp, mut connection) = open_temp();
+        let (_existing, _staff, _service) = seed_core(&mut connection);
+        let target = create_customer_tx(
+            &mut connection,
+            CustomerInput {
+                first_name: "Test".into(),
+                last_name: "Müşterisi2".into(),
+                phone: Some("05550295375".into()),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: None,
+                whatsapp_consent_confirmed: None,
+            },
+        )
+        .expect("target customer");
+        let unrelated = create_customer_tx(
+            &mut connection,
+            CustomerInput {
+                first_name: "Test Google".into(),
+                last_name: "Sync".into(),
+                phone: Some("05551112222".into()),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: None,
+                whatsapp_consent_confirmed: None,
+            },
+        )
+        .expect("unrelated customer");
+        let archived = create_customer_tx(
+            &mut connection,
+            CustomerInput {
+                first_name: "Test".into(),
+                last_name: "Müşterisi2 Arşiv".into(),
+                phone: Some("05553334444".into()),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: None,
+                whatsapp_consent_confirmed: None,
+            },
+        )
+        .expect("archived customer");
+        archive_customer(&mut connection, &archived.id).expect("archive customer");
+
+        let name_matches = customer_search_for_test(&connection, "Test Müşterisi2", "active")
+            .expect("name search");
+        assert_eq!(
+            name_matches.iter().map(|row| &row.id).collect::<Vec<_>>(),
+            vec![&target.id]
+        );
+        assert!(!name_matches.iter().any(|row| row.id == unrelated.id));
+
+        for query in ["5550295375", "05550295375"] {
+            let matches =
+                customer_search_for_test(&connection, query, "active").expect("phone search");
+            assert_eq!(
+                matches.iter().map(|row| &row.id).collect::<Vec<_>>(),
+                vec![&target.id]
+            );
+        }
+        assert!(
+            customer_search_for_test(&connection, "Müşterisi2 Arşiv", "active")
+                .expect("active search")
+                .is_empty()
+        );
     }
 
     fn staff_list_for_test(connection: &Connection) -> Result<Vec<Staff>, AppError> {

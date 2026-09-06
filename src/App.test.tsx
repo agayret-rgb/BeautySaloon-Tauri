@@ -337,6 +337,75 @@ describe("New appointment flow", () => {
     );
   });
 
+  it.each(["5551112233", "05551112233"])(
+    "passes %s phone input to the bounded customer search",
+    async (phone) => {
+      await openForm();
+      fireEvent.change(screen.getByLabelText("Müşteri adı"), {
+        target: { value: phone },
+      });
+      await waitFor(() => expect(api.searchCustomers).toHaveBeenCalledWith(phone));
+    },
+  );
+
+  it("keeps only the latest customer-search response", async () => {
+    let resolveEmpty: ((customers: Array<typeof existingCustomer>) => void) | undefined;
+    let resolveSpecific: ((customers: Array<typeof existingCustomer>) => void) | undefined;
+    const unrelated = {
+      ...existingCustomer,
+      id: "customer-google-sync",
+      firstName: "Test Google",
+      lastName: "Sync",
+    };
+    const target = {
+      ...existingCustomer,
+      id: "customer-target",
+      firstName: "Test",
+      lastName: "Müşterisi2",
+    };
+    api.searchCustomers.mockImplementation((query: string) =>
+      new Promise<Array<typeof existingCustomer>>((resolve) => {
+        if (query === "") resolveEmpty = resolve;
+        if (query === "Test Müşterisi2") resolveSpecific = resolve;
+      }),
+    );
+    await openForm();
+    fireEvent.focus(screen.getByLabelText("Müşteri adı"));
+    await waitFor(() => expect(api.searchCustomers).toHaveBeenCalledWith(""));
+    fireEvent.change(screen.getByLabelText("Müşteri adı"), {
+      target: { value: "Test Müşterisi2" },
+    });
+    await waitFor(() =>
+      expect(api.searchCustomers).toHaveBeenCalledWith("Test Müşterisi2"),
+    );
+
+    await act(async () => resolveSpecific?.([target]));
+    expect(await screen.findByRole("button", { name: /Test Müşterisi2/ })).toBeInTheDocument();
+    await act(async () => resolveEmpty?.([unrelated]));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /Test Google Sync/ })).not.toBeInTheDocument(),
+    );
+    expect(screen.getByRole("button", { name: /Test Müşterisi2/ })).toBeInTheDocument();
+  });
+
+  it("keeps booking and customer-list search state independent", async () => {
+    await openForm();
+    fireEvent.change(screen.getByLabelText("Müşteri adı"), {
+      target: { value: "Test Müşterisi2" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Müşteriler" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Çık" }));
+    expect(await screen.findByLabelText("Müşteri ara")).toHaveValue("");
+
+    fireEvent.change(screen.getByLabelText("Müşteri ara"), {
+      target: { value: "Ayşe" },
+    });
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "+ Yeni Randevu" }).at(-1)!,
+    );
+    expect(await screen.findByLabelText("Müşteri adı")).toHaveValue("");
+  });
+
   it("creates a phone-less new customer once, then creates an appointment", async () => {
     await openForm();
     await fillRequiredFields();

@@ -204,6 +204,20 @@ function customerName(customer: Customer): string {
   return [customer.firstName, customer.lastName].filter(Boolean).join(" ");
 }
 
+function customerPhoneLabel(phone: string | null): string {
+  if (!phone) return "Telefon yok";
+  const digits = phone.replace(/\D/g, "");
+  const canonical = digits.startsWith("90")
+    ? digits.slice(2)
+    : digits.startsWith("0")
+      ? digits.slice(1)
+      : digits;
+  if (/^5\d{9}$/.test(canonical)) {
+    return `0${canonical.slice(0, 3)} ${canonical.slice(3, 6)} ${canonical.slice(6, 8)} ${canonical.slice(8)}`;
+  }
+  return phone;
+}
+
 function staffName(staff: Staff): string {
   return [staff.firstName, staff.lastName].filter(Boolean).join(" ");
 }
@@ -727,6 +741,7 @@ export function App() {
   ]);
 
   useEffect(() => {
+    let current = true;
     if (
       !bookingOpen ||
       selectedCustomer ||
@@ -735,14 +750,20 @@ export function App() {
       setCustomerResults([]);
       return;
     }
+    const query = customerQuery.trim();
     const timer = window.setTimeout(() => {
-      void searchCustomers(customerQuery.trim())
-        .then((items) =>
-          setCustomerResults(items.filter((item) => item.isActive)),
-        )
-        .catch(() => setCustomerResults([]));
+      void searchCustomers(query)
+        .then((items) => {
+          if (current) setCustomerResults(items.filter((item) => item.isActive));
+        })
+        .catch(() => {
+          if (current) setCustomerResults([]);
+        });
     }, 220);
-    return () => window.clearTimeout(timer);
+    return () => {
+      current = false;
+      window.clearTimeout(timer);
+    };
   }, [bookingOpen, customerPickerOpen, customerQuery, selectedCustomer]);
 
   const resetBooking = useCallback(() => {
@@ -2020,10 +2041,14 @@ export function App() {
                 <span>Telefon (isteğe bağlı)</span>
                 <input
                   aria-label="Telefon (isteğe bağlı)"
-                  value={selectedCustomer?.phone ?? phone}
+                  value={
+                    selectedCustomer
+                      ? customerPhoneLabel(selectedCustomer.phone)
+                      : phone
+                  }
                   disabled={Boolean(selectedCustomer) || isSaving}
                   onChange={(event) => setPhone(event.target.value)}
-                  placeholder="05..."
+                  placeholder="05xx xxx xx xx"
                 />
               </label>
               {selectedCustomer && (
@@ -2056,7 +2081,7 @@ export function App() {
                         }}
                       >
                         {customerName(customer)}
-                        <span>{customer.phone ?? "Telefon yok"}</span>
+                        <span>{customerPhoneLabel(customer.phone)}</span>
                       </button>
                     </li>
                   ))}
@@ -2407,7 +2432,7 @@ export function App() {
                     </button>
                     <h2>{customerHistory.customer.name}</h2>
                     {customerHistory.customer.phone && (
-                      <p>{customerHistory.customer.phone}</p>
+                      <p>{customerPhoneLabel(customerHistory.customer.phone)}</p>
                     )}
                     <p className="customer-state">
                       {customerHistory.customer.isActive
@@ -2582,7 +2607,9 @@ export function App() {
                       >
                         <span>
                           <strong>{customerName(customer)}</strong>
-                          {customer.phone && <small>{customer.phone}</small>}
+                          {customer.phone && (
+                            <small>{customerPhoneLabel(customer.phone)}</small>
+                          )}
                         </span>
                         {!customer.isActive && (
                           <span className="status-badge status-cancelled">
