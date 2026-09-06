@@ -94,6 +94,7 @@ pub struct GoogleConnectionStatus {
 #[serde(rename_all = "camelCase")]
 pub struct GoogleOAuthConfig {
     pub client_id: String,
+    #[serde(default)]
     pub client_secret: String,
     pub calendar_id: Option<String>,
 }
@@ -154,13 +155,15 @@ pub fn exchange_auth_code(
     redirect_uri: &str,
     code: &str,
 ) -> Result<GoogleTokenSet, AppError> {
-    let body = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("code", code)
+    let mut form = url::form_urlencoded::Serializer::new(String::new());
+    form.append_pair("code", code)
         .append_pair("client_id", &config.client_id)
-        .append_pair("client_secret", &config.client_secret)
         .append_pair("redirect_uri", redirect_uri)
-        .append_pair("grant_type", "authorization_code")
-        .finish();
+        .append_pair("grant_type", "authorization_code");
+    if !config.client_secret.trim().is_empty() {
+        form.append_pair("client_secret", &config.client_secret);
+    }
+    let body = form.finish();
     let response = transport.send(HttpRequest {
         method: "POST".to_string(),
         url: GOOGLE_TOKEN_ENDPOINT.to_string(),
@@ -196,12 +199,14 @@ pub fn refresh_access_token(
     config: &GoogleOAuthConfig,
     refresh_token: &str,
 ) -> Result<String, AppError> {
-    let body = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("client_id", &config.client_id)
-        .append_pair("client_secret", &config.client_secret)
+    let mut form = url::form_urlencoded::Serializer::new(String::new());
+    form.append_pair("client_id", &config.client_id)
         .append_pair("refresh_token", refresh_token)
-        .append_pair("grant_type", "refresh_token")
-        .finish();
+        .append_pair("grant_type", "refresh_token");
+    if !config.client_secret.trim().is_empty() {
+        form.append_pair("client_secret", &config.client_secret);
+    }
+    let body = form.finish();
     let response = transport.send(HttpRequest {
         method: "POST".to_string(),
         url: GOOGLE_TOKEN_ENDPOINT.to_string(),

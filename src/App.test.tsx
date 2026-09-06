@@ -54,8 +54,10 @@ const api = vi.hoisted(() => ({
   connectGoogleCalendar: vi.fn(),
   disconnectGoogleCalendar: vi.fn(),
   getCloudConnectionStatus: vi.fn(),
+  getReminderReadiness: vi.fn(),
   requestCloudOtp: vi.fn(),
   verifyCloudOtp: vi.fn(),
+  setReminderAutomaticEnabled: vi.fn(),
   reactivateCustomer: vi.fn(),
   searchCustomers: vi.fn(),
   searchCustomersByStatus: vi.fn(),
@@ -182,6 +184,10 @@ describe("New appointment flow", () => {
     api.listServiceCategories.mockResolvedValue([]);
     api.listStaff.mockResolvedValue([activeStaff]);
     api.searchCustomers.mockResolvedValue([existingCustomer]);
+    api.getReminderReadiness.mockResolvedValue({
+      state: "disconnected",
+      automaticEnabled: false,
+    });
     api.createCustomer.mockResolvedValue({
       id: "customer-new",
       firstName: "Deniz",
@@ -421,6 +427,28 @@ describe("New appointment flow", () => {
       ),
     );
     expect(screen.getByText("Randevu kaydedildi.")).toBeInTheDocument();
+  });
+
+  it("records WhatsApp consent only after an explicit checked choice with a phone", async () => {
+    await openForm();
+    fireEvent.change(screen.getByLabelText("Müşteri adı"), {
+      target: { value: "Deniz Kaya" },
+    });
+    fireEvent.change(screen.getByLabelText("Telefon (isteğe bağlı)"), {
+      target: { value: "05551112233" },
+    });
+    fireEvent.click(
+      screen.getByLabelText(
+        "WhatsApp ile randevu hatırlatması gönderilebilir",
+      ),
+    );
+    await fillRequiredFields(false);
+    fireEvent.click(screen.getByRole("button", { name: "Randevuyu Kaydet" }));
+    await waitFor(() =>
+      expect(api.createCustomer).toHaveBeenCalledWith(
+        expect.objectContaining({ whatsappConsentConfirmed: true }),
+      ),
+    );
   });
 
   it("shows only active services and staff", async () => {
@@ -1239,6 +1267,10 @@ describe("Business and data settings", () => {
       configured: true,
       sessionPresent: false,
     });
+    api.getReminderReadiness.mockResolvedValue({
+      state: "disconnected",
+      automaticEnabled: false,
+    });
     api.requestCloudOtp.mockResolvedValue(true);
     api.verifyCloudOtp.mockResolvedValue({
       configured: true,
@@ -1523,6 +1555,44 @@ describe("Google and WhatsApp user settings", () => {
     expect(screen.getByLabelText("Hatırlatma e-postası")).toBeInTheDocument();
   });
 
+  it("explains missing installed Google configuration without exposing OAuth details", async () => {
+    api.connectGoogleCalendar.mockRejectedValueOnce(
+      "VALIDATION_ERROR: GOOGLE_CONFIG_MISSING",
+    );
+    await openSettings();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Google Takvim'e Bağlan" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Google Takvim bağlantısı bu bilgisayarda henüz yapılandırılmamış.",
+    );
+  });
+
+  it("shows a connected-but-not-ready reminder state and saves the automatic toggle", async () => {
+    api.getCloudConnectionStatus.mockResolvedValue({
+      configured: true,
+      sessionPresent: true,
+    });
+    api.getReminderReadiness.mockResolvedValue({
+      state: "connected_not_ready",
+      automaticEnabled: false,
+    });
+    api.setReminderAutomaticEnabled.mockResolvedValue({
+      state: "connected_not_ready",
+      automaticEnabled: true,
+    });
+    await openSettings();
+    expect(
+      await screen.findByText("Bağlı, ancak hatırlatmalar hazır değil"),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByLabelText("Otomatik WhatsApp hatırlatmaları"),
+    );
+    await waitFor(() =>
+      expect(api.setReminderAutomaticEnabled).toHaveBeenCalledWith(true),
+    );
+  });
+
   it("requests and verifies an email code through typed commands without storing tokens", async () => {
     api.getCloudConnectionStatus
       .mockResolvedValueOnce({ configured: true, sessionPresent: false })
@@ -1547,7 +1617,7 @@ describe("Google and WhatsApp user settings", () => {
       ),
     );
     expect(
-      await screen.findByText("WhatsApp Hatırlatmaları — Bağlı ✓"),
+      await screen.findByText("Bağlı, ancak hatırlatmalar hazır değil"),
     ).toBeInTheDocument();
     expect(screen.queryByLabelText("Doğrulama kodu")).not.toBeInTheDocument();
   });
@@ -1586,7 +1656,7 @@ describe("Google and WhatsApp user settings", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Ayarlar" }));
     expect(
-      await screen.findByText("WhatsApp Hatırlatmaları — Bağlı ✓"),
+      await screen.findByText("Bağlı, ancak hatırlatmalar hazır değil"),
     ).toBeInTheDocument();
     expect(
       screen.queryByLabelText("Hatırlatma e-postası"),

@@ -233,6 +233,11 @@ export interface CloudConnectionStatus {
   sessionPresent: boolean;
 }
 
+export interface ReminderReadinessStatus {
+  state: "disconnected" | "connected_not_ready" | "ready";
+  automaticEnabled: boolean;
+}
+
 export interface DispatcherStatus {
   paused: boolean;
   pauseReason: string | null;
@@ -513,6 +518,18 @@ export async function getCloudConnectionStatus(): Promise<CloudConnectionStatus>
   return invoke<CloudConnectionStatus>("cloud_connection_status");
 }
 
+export async function getReminderReadiness(): Promise<ReminderReadinessStatus> {
+  return invoke<ReminderReadinessStatus>("reminder_readiness");
+}
+
+export async function setReminderAutomaticEnabled(
+  enabled: boolean,
+): Promise<ReminderReadinessStatus> {
+  return invoke<ReminderReadinessStatus>("reminder_set_automatic_enabled", {
+    enabled,
+  });
+}
+
 export async function getDispatcherStatus(): Promise<DispatcherStatus> {
   return invoke<DispatcherStatus>("dispatcher_status");
 }
@@ -560,6 +577,8 @@ export const coreDataCommands = [
   "google_calendar_disconnect",
   "google_calendar_sync",
   "cloud_connection_status",
+  "reminder_readiness",
+  "reminder_set_automatic_enabled",
   "cloud_status",
   "dispatcher_status",
   "cloud_request_otp",

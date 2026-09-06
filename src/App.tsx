@@ -29,6 +29,7 @@ import {
   getBusinessProfile,
   getOnboardingState,
   getCloudConnectionStatus,
+  getReminderReadiness,
   getGoogleCalendarStatus,
   getCustomerHistory,
   getRepeatBookingSeed,
@@ -49,6 +50,7 @@ import {
   removeStaffTimeOff,
   openDataFolder,
   requestCloudOtp,
+  setReminderAutomaticEnabled,
   restoreDatabaseBackup,
   searchCustomers,
   searchCustomersByStatus,
@@ -274,6 +276,7 @@ type BookingDraft = {
   customerId: string;
   customerQuery: string;
   phone: string;
+  whatsappConsent: boolean;
   serviceIds: string[];
   staffId: string;
   localDate: string;
@@ -334,6 +337,7 @@ export function App() {
     null,
   );
   const [phone, setPhone] = useState("");
+  const [whatsappConsent, setWhatsappConsent] = useState(false);
   const [services, setServices] = useState<ServiceItem[]>([]);
   const [staff, setStaff] = useState<Staff[]>([]);
   const [serviceIds, setServiceIds] = useState<string[]>([]);
@@ -430,6 +434,12 @@ export function App() {
   const [googleError, setGoogleError] = useState("");
   const [googleNotice, setGoogleNotice] = useState("");
   const [reminderConnected, setReminderConnected] = useState(false);
+  const [reminderReadiness, setReminderReadiness] = useState<
+    "disconnected" | "connected_not_ready" | "ready"
+  >("disconnected");
+  const [automaticRemindersEnabled, setAutomaticRemindersEnabled] =
+    useState(false);
+  const [reminderSettingSaving, setReminderSettingSaving] = useState(false);
   const [reminderLoading, setReminderLoading] = useState(false);
   const [reminderEmail, setReminderEmail] = useState("");
   const [reminderCode, setReminderCode] = useState("");
@@ -666,8 +676,15 @@ export function App() {
   const loadReminderConnection = useCallback(async () => {
     setReminderLoading(true);
     try {
-      const status = await getCloudConnectionStatus();
-      setReminderConnected(status.sessionPresent);
+      const [status, readiness] = await Promise.all([
+        getCloudConnectionStatus(),
+        getReminderReadiness(),
+      ]);
+      setReminderConnected(
+        status.sessionPresent && readiness.state !== "disconnected",
+      );
+      setReminderReadiness(readiness.state);
+      setAutomaticRemindersEnabled(readiness.automaticEnabled);
     } catch {
       setReminderError("Hatırlatma bağlantısı yüklenemedi.");
     } finally {
@@ -773,6 +790,7 @@ export function App() {
     setBookingInitialDraft(null);
     setCustomerPickerOpen(false);
     setPhone("");
+    setWhatsappConsent(false);
     setServiceIds([]);
     setStaffId("");
     setLocalDate(todayLocalDate());
@@ -793,6 +811,7 @@ export function App() {
       setSelectedCustomer(customer);
       setCustomerQuery(customer ? customerName(customer) : "");
       setPhone(customer?.phone ?? "");
+      setWhatsappConsent(false);
       setServiceIds(nextServiceIds);
       setStaffId(nextStaffId);
       setLocalDate(nextLocalDate);
@@ -801,6 +820,7 @@ export function App() {
         customerId: customer?.id ?? "",
         customerQuery: customer ? customerName(customer) : "",
         phone: customer?.phone ?? "",
+        whatsappConsent: false,
         serviceIds: nextServiceIds,
         staffId: nextStaffId,
         localDate: nextLocalDate,
@@ -922,6 +942,7 @@ export function App() {
           firstName: nameParts[0],
           lastName: nameParts.slice(1).join(" "),
           phone: phone.trim() || null,
+          whatsappConsentConfirmed: whatsappConsent,
         });
         setSelectedCustomer(customer);
       }
@@ -959,6 +980,7 @@ export function App() {
     localDate,
     localStartTime,
     phone,
+    whatsappConsent,
     resetBooking,
     selectedCustomer,
     serviceIds,
@@ -1177,6 +1199,7 @@ export function App() {
     (bookingInitialDraft.customerId !== (selectedCustomer?.id ?? "") ||
       bookingInitialDraft.customerQuery !== customerQuery ||
       bookingInitialDraft.phone !== phone ||
+      bookingInitialDraft.whatsappConsent !== whatsappConsent ||
       !sameIds(bookingInitialDraft.serviceIds, serviceIds) ||
       bookingInitialDraft.staffId !== staffId ||
       bookingInitialDraft.localDate !== localDate ||
@@ -1489,12 +1512,40 @@ export function App() {
       await connectGoogleCalendar();
       await loadGoogleConnection();
       setGoogleNotice("Google Takvim'e bağlanıldı.");
-    } catch {
-      setGoogleError("Google bağlantısı tamamlanamadı.");
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "";
+      setGoogleError(
+        message.includes("GOOGLE_CONFIG_MISSING")
+          ? "Google Takvim bağlantısı bu bilgisayarda henüz yapılandırılmamış."
+          : "Google bağlantısı tamamlanamadı.",
+      );
     } finally {
       setGoogleConnecting(false);
     }
   }, [googleConnecting, loadGoogleConnection]);
+
+  const changeAutomaticReminders = useCallback(
+    async (enabled: boolean) => {
+      if (reminderSettingSaving) return;
+      setReminderSettingSaving(true);
+      setReminderError("");
+      try {
+        const status = await setReminderAutomaticEnabled(enabled);
+        setAutomaticRemindersEnabled(status.automaticEnabled);
+        setReminderReadiness(status.state);
+      } catch {
+        setReminderError("Otomatik hatırlatma ayarı güncellenemedi.");
+      } finally {
+        setReminderSettingSaving(false);
+      }
+    },
+    [reminderSettingSaving],
+  );
 
   const disconnectGoogle = useCallback(async () => {
     if (googleDisconnecting) return;
@@ -2047,10 +2098,24 @@ export function App() {
                       : phone
                   }
                   disabled={Boolean(selectedCustomer) || isSaving}
-                  onChange={(event) => setPhone(event.target.value)}
+                  onChange={(event) => {
+                    setPhone(event.target.value);
+                    if (!event.target.value.trim()) setWhatsappConsent(false);
+                  }}
                   placeholder="05xx xxx xx xx"
                 />
               </label>
+              {!selectedCustomer && (
+                <label className="archive-filter">
+                  <input
+                    type="checkbox"
+                    checked={whatsappConsent}
+                    disabled={isSaving || !phone.trim()}
+                    onChange={(event) => setWhatsappConsent(event.target.checked)}
+                  />{" "}
+                  WhatsApp ile randevu hatırlatması gönderilebilir
+                </label>
+              )}
               {selectedCustomer && (
                 <button
                   type="button"
@@ -3635,9 +3700,24 @@ export function App() {
                   Hatırlatma durumu yükleniyor...
                 </p>
               ) : reminderConnected ? (
-                <p className="connection-state">
-                  WhatsApp Hatırlatmaları — Bağlı ✓
-                </p>
+                <div className="settings-actions">
+                  <p className="connection-state">
+                    {reminderReadiness === "ready"
+                      ? "Hazır / Hatırlatmalar aktif"
+                      : "Bağlı, ancak hatırlatmalar hazır değil"}
+                  </p>
+                  <label className="archive-filter">
+                    <input
+                      type="checkbox"
+                      checked={automaticRemindersEnabled}
+                      disabled={reminderSettingSaving}
+                      onChange={(event) =>
+                        void changeAutomaticReminders(event.target.checked)
+                      }
+                    />{" "}
+                    Otomatik WhatsApp hatırlatmaları
+                  </label>
+                </div>
               ) : (
                 <div className="reminder-form">
                   <label className="form-field">

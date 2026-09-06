@@ -26,6 +26,7 @@ const CORE_SCHEMA_VERSION: i64 = 18;
 const ISTANBUL_OFFSET_MINUTES: i64 = 180;
 const APPOINTMENT_STATUS_CANCELLED: &str = "cancelled";
 const AUTOMATIC_BACKUP_INTERVAL: StdDuration = StdDuration::from_secs(15 * 60);
+const AUTOMATIC_REMINDER_INTERVAL: StdDuration = StdDuration::from_secs(15 * 60);
 const SHUTDOWN_BACKUP_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const SHUTDOWN_BACKUP_POLL_INTERVAL: StdDuration = StdDuration::from_millis(25);
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -162,6 +163,7 @@ pub struct AppState {
     database_path: PathBuf,
     sqlite: Mutex<Connection>,
     backup_coordinator: Arc<BackupCoordinator>,
+    reminder_coordinator: Arc<ReminderCoordinator>,
 }
 
 #[derive(Debug, Default)]
@@ -172,6 +174,32 @@ struct BackupCoordinator {
     automatic_backup_registered: AtomicBool,
     restore_in_progress: AtomicBool,
     backup_operation_lock: Mutex<()>,
+}
+
+#[derive(Debug, Default)]
+struct ReminderCoordinator {
+    registered: AtomicBool,
+    running: AtomicBool,
+    shutdown_sender: Mutex<Option<mpsc::Sender<()>>>,
+}
+
+impl ReminderCoordinator {
+    fn register(&self) -> bool {
+        self.registered
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn stop(&self) {
+        if let Some(sender) = self
+            .shutdown_sender
+            .lock()
+            .expect("reminder shutdown mutex poisoned")
+            .take()
+        {
+            let _ = sender.send(());
+        }
+    }
 }
 
 impl BackupCoordinator {
@@ -3433,7 +3461,7 @@ fn create_database_backup(
     let machine_bound_secrets_removed = result?;
 
     if enforce_backup_retention(&directory, kind).is_err() {
-        eprintln!("BACKUP_RETENTION_WARNING");
+        safe_diagnostic("BACKUP_RETENTION_WARNING");
     }
 
     Ok(DatabaseBackupSummary {
@@ -3537,7 +3565,7 @@ fn start_automatic_backup_coordinator(database_path: PathBuf, coordinator: Arc<B
     std::thread::spawn(move || loop {
         std::thread::sleep(AUTOMATIC_BACKUP_INTERVAL);
         if automatic_backup_tick(&coordinator, &database_path).is_err() {
-            eprintln!("AUTOMATIC_BACKUP_WARNING");
+            safe_diagnostic("AUTOMATIC_BACKUP_WARNING");
         }
     });
 }
@@ -4024,6 +4052,80 @@ fn reconcile_all_reminders_mock(connection: &Connection) -> Result<u32, AppError
         }
     }
     Ok(changed)
+}
+
+fn automatic_reminders_enabled(connection: &Connection) -> Result<bool, AppError> {
+    connection.query_row(
+        "SELECT automatic_reminder_enabled=1 AND is_enabled=1 AND phone_number_id IS NOT NULL AND template_name IS NOT NULL FROM whatsapp_settings WHERE id=1",
+        [],
+        |row| row.get(0),
+    ).map_err(Into::into)
+}
+
+fn automatic_reminder_tick(database_path: &Path) -> Result<bool, AppError> {
+    let connection = Connection::open(database_path)?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    if !automatic_reminders_enabled(&connection)? {
+        return Ok(false);
+    }
+    // Reconciliation is local-first. Cloud delivery is only attempted after the
+    // authenticated dispatcher gate below proves that the provider is operational.
+    reconcile_all_reminders_mock(&connection)?;
+    let config = match supabase_config() {
+        Ok(config) => config,
+        Err(_) => return Ok(false),
+    };
+    let protector = services::secure_store::WindowsDpapiProtector;
+    let Some(session) = services::secure_store::read_supabase_session(&connection, &protector)?
+    else {
+        return Ok(false);
+    };
+    let mut transport = services::google::ReqwestHttpTransport;
+    let dispatcher =
+        match services::reminder_cloud::read_dispatcher_status(&mut transport, &config, &session) {
+            Ok(status) => status,
+            Err(_) => return Ok(false),
+        };
+    if dispatcher.paused {
+        return Ok(false);
+    }
+    services::reminder_cloud::process_ordered_outbox(
+        &connection,
+        &mut transport,
+        &config,
+        &session,
+        25,
+    )?;
+    Ok(true)
+}
+
+fn start_automatic_reminder_coordinator(
+    database_path: PathBuf,
+    coordinator: Arc<ReminderCoordinator>,
+) {
+    if !coordinator.register() {
+        return;
+    }
+    let (sender, receiver) = mpsc::channel();
+    *coordinator
+        .shutdown_sender
+        .lock()
+        .expect("reminder shutdown mutex poisoned") = Some(sender);
+    std::thread::spawn(move || loop {
+        match receiver.recv_timeout(AUTOMATIC_REMINDER_INTERVAL) {
+            Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if coordinator
+                    .running
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    let _ = automatic_reminder_tick(&database_path);
+                    coordinator.running.store(false, Ordering::Release);
+                }
+            }
+        }
+    });
 }
 
 fn list_whatsapp_candidates_tx(
@@ -4792,10 +4894,10 @@ fn load_live_services_config() -> Result<LiveServicesConfig, AppError> {
     let google_client_secret = std::env::var("BEAUTYSALOON_GOOGLE_CLIENT_SECRET")
         .ok()
         .filter(|value| !value.trim().is_empty());
-    if let (Some(client_id), Some(client_secret)) = (google_client_id, google_client_secret) {
+    if let Some(client_id) = google_client_id {
         config.google = Some(services::google::GoogleOAuthConfig {
             client_id,
-            client_secret,
+            client_secret: google_client_secret.unwrap_or_default(),
             calendar_id: std::env::var("BEAUTYSALOON_GOOGLE_CALENDAR_ID")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
@@ -4830,6 +4932,11 @@ fn read_live_services_config_file() -> Result<Option<LiveServicesConfig>, AppErr
 
 fn live_services_config_candidates() -> Result<Vec<PathBuf>, AppError> {
     let mut candidates = Vec::new();
+    if let Some(app_data) = std::env::var_os("APPDATA") {
+        candidates.push(installed_live_services_config_path(&PathBuf::from(
+            app_data,
+        )));
+    }
     let mut add_candidates = |base: &Path| {
         candidates.push(base.join("src-tauri").join("live-services.local.json"));
         candidates.push(base.join("live-services.local.json"));
@@ -4849,6 +4956,13 @@ fn live_services_config_candidates() -> Result<Vec<PathBuf>, AppError> {
     Ok(candidates)
 }
 
+fn installed_live_services_config_path(app_data: &Path) -> PathBuf {
+    app_data
+        .join("com.beautysaloon.desktop")
+        .join("settings")
+        .join("live-services.json")
+}
+
 fn parse_live_services_config(text: &str) -> Result<LiveServicesConfig, AppError> {
     serde_json::from_str(text.trim_start_matches('\u{feff}'))
         .map_err(|_| AppError::Validation("LIVE_SERVICE_CONFIG_INVALID".to_string()))
@@ -4858,6 +4972,11 @@ fn google_config() -> Result<services::google::GoogleOAuthConfig, AppError> {
     load_live_services_config()?
         .google
         .ok_or_else(|| AppError::Validation("GOOGLE_CONFIG_MISSING".to_string()))
+}
+
+fn safe_diagnostic(marker: &str) {
+    #[cfg(debug_assertions)]
+    eprintln!("{marker}");
 }
 
 fn supabase_config() -> Result<services::supabase::SupabaseConfig, AppError> {
@@ -4915,10 +5034,10 @@ pub(crate) fn try_acquire_google_connect_guard() -> Result<ConnectInProgressGuar
 async fn google_calendar_connect(
     state: tauri::State<'_, AppState>,
 ) -> Result<GoogleConnectResult, AppError> {
-    eprintln!("GOOGLE_CONNECT_INVOKE_ENTERED");
+    safe_diagnostic("GOOGLE_CONNECT_INVOKE_ENTERED");
     let _guard = try_acquire_google_connect_guard()?;
     let config = google_config()?;
-    eprintln!("GOOGLE_CONNECT_CONFIG_OK");
+    safe_diagnostic("GOOGLE_CONNECT_CONFIG_OK");
     let database_path = state.database_path.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -4929,7 +5048,7 @@ async fn google_calendar_connect(
             "http://127.0.0.1:{}/oauth2callback",
             listener.local_addr()?.port()
         );
-        eprintln!("GOOGLE_CONNECT_LISTENER_BOUND");
+        safe_diagnostic("GOOGLE_CONNECT_LISTENER_BOUND");
         let state_token = new_uuid();
         let auth_url =
             services::google::build_google_auth_url(&config.client_id, &redirect_uri, &state_token)?;
@@ -5122,12 +5241,12 @@ fn open_system_browser(url: &str) -> Result<(), AppError> {
             )
         };
         if !shell_execute_succeeded(result as isize) {
-            eprintln!("GOOGLE_CONNECT_BROWSER_LAUNCH_FAILED");
+            safe_diagnostic("GOOGLE_CONNECT_BROWSER_LAUNCH_FAILED");
             return Err(AppError::Database(
                 "GOOGLE_BROWSER_LAUNCH_FAILED".to_string(),
             ));
         }
-        eprintln!("GOOGLE_CONNECT_BROWSER_LAUNCH_OK");
+        safe_diagnostic("GOOGLE_CONNECT_BROWSER_LAUNCH_OK");
         Ok(())
     }
     #[cfg(not(windows))]
@@ -5250,6 +5369,82 @@ fn cloud_connection_status(
     })
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReminderReadinessStatus {
+    state: String,
+    automatic_enabled: bool,
+}
+
+fn reminder_readiness_status(connection: &Connection) -> Result<ReminderReadinessStatus, AppError> {
+    let session_present = services::reminder_cloud::has_session_secret(connection)?;
+    let automatic_enabled: bool = connection.query_row(
+        "SELECT automatic_reminder_enabled=1 FROM whatsapp_settings WHERE id=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let provider_configured: bool = connection.query_row(
+        "SELECT is_enabled=1 AND phone_number_id IS NOT NULL AND template_name IS NOT NULL FROM whatsapp_settings WHERE id=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let configured = load_live_services_config()?.supabase.is_some();
+    let state = if !session_present || !configured {
+        "disconnected"
+    } else if automatic_enabled && provider_configured {
+        // Dispatcher readiness is intentionally not inferred from a local session.
+        "connected_not_ready"
+    } else {
+        "connected_not_ready"
+    };
+    Ok(ReminderReadinessStatus {
+        state: state.to_string(),
+        automatic_enabled,
+    })
+}
+
+#[tauri::command]
+fn reminder_readiness(
+    state: tauri::State<'_, AppState>,
+) -> Result<ReminderReadinessStatus, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    let mut readiness = reminder_readiness_status(&connection)?;
+    if readiness.state != "connected_not_ready" || !readiness.automatic_enabled {
+        return Ok(readiness);
+    }
+    let config = match supabase_config() {
+        Ok(config) => config,
+        Err(_) => return Ok(readiness),
+    };
+    let protector = services::secure_store::WindowsDpapiProtector;
+    let Some(session) = services::secure_store::read_supabase_session(&connection, &protector)?
+    else {
+        return Ok(readiness);
+    };
+    let mut transport = services::google::ReqwestHttpTransport;
+    if let Ok(dispatcher) =
+        services::reminder_cloud::read_dispatcher_status(&mut transport, &config, &session)
+    {
+        if !dispatcher.paused {
+            readiness.state = "ready".to_string();
+        }
+    }
+    Ok(readiness)
+}
+
+#[tauri::command]
+fn reminder_set_automatic_enabled(
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<ReminderReadinessStatus, AppError> {
+    let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+    connection.execute(
+        "UPDATE whatsapp_settings SET automatic_reminder_enabled=?1, updated_at=?2 WHERE id=1",
+        params![i64::from(enabled), now_iso()],
+    )?;
+    reminder_readiness_status(&connection)
+}
+
 #[tauri::command]
 fn cloud_status(
     state: tauri::State<'_, AppState>,
@@ -5357,12 +5552,20 @@ pub fn run() {
             let (database_path, _, _, _, _) = data_paths(&root)?;
             let sqlite = open_database(&database_path)?;
             let backup_coordinator = Arc::new(BackupCoordinator::default());
+            let reminder_coordinator = Arc::new(ReminderCoordinator::default());
             app.manage(AppState {
                 database_path: database_path.clone(),
                 sqlite: Mutex::new(sqlite),
                 backup_coordinator: backup_coordinator.clone(),
+                reminder_coordinator: reminder_coordinator.clone(),
             });
             start_automatic_backup_coordinator(database_path, backup_coordinator);
+            start_automatic_reminder_coordinator(
+                app_data_root(app.handle())?
+                    .join("database")
+                    .join("salon-foundation.db"),
+                reminder_coordinator,
+            );
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
@@ -5425,6 +5628,8 @@ pub fn run() {
             google_calendar_disconnect,
             google_calendar_sync,
             cloud_connection_status,
+            reminder_readiness,
+            reminder_set_automatic_enabled,
             cloud_status,
             dispatcher_status,
             cloud_request_otp,
@@ -5439,13 +5644,14 @@ pub fn run() {
     app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
             let state = app_handle.state::<AppState>();
+            state.reminder_coordinator.stop();
             if shutdown_automatic_backup(
                 state.backup_coordinator.clone(),
                 state.database_path.clone(),
             )
             .is_err()
             {
-                eprintln!("AUTOMATIC_BACKUP_SHUTDOWN_WARNING");
+                safe_diagnostic("AUTOMATIC_BACKUP_SHUTDOWN_WARNING");
             }
         }
     });
@@ -5461,6 +5667,23 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let connection = open_database(&temp.path().join("core.db")).expect("open db");
         (temp, connection)
+    }
+
+    #[test]
+    fn installed_google_config_path_is_stable_and_outside_business_backups() {
+        let app_data = Path::new("C:/Users/test/AppData/Roaming");
+        let path = installed_live_services_config_path(app_data);
+        assert!(path.ends_with("com.beautysaloon.desktop/settings/live-services.json"));
+        assert!(!path.to_string_lossy().contains("backups"));
+        assert!(!path.to_string_lossy().contains("database"));
+    }
+
+    #[test]
+    fn reminder_readiness_does_not_treat_a_session_as_operationally_ready() {
+        let (_temp, connection) = open_temp();
+        let status = reminder_readiness_status(&connection).expect("readiness");
+        assert_eq!(status.state, "disconnected");
+        assert!(!status.automatic_enabled);
     }
 
     fn seed_core(connection: &mut Connection) -> (Customer, Staff, ServiceItem) {
@@ -7082,6 +7305,7 @@ mod tests {
             database_path: live_path.clone(),
             sqlite: Mutex::new(live),
             backup_coordinator: Arc::new(BackupCoordinator::default()),
+            reminder_coordinator: Arc::new(ReminderCoordinator::default()),
         };
 
         restore_database_from_candidate(&state, &candidate_path).expect("restore");
@@ -7123,6 +7347,7 @@ mod tests {
             database_path: live_path,
             sqlite: Mutex::new(live),
             backup_coordinator: Arc::new(BackupCoordinator::default()),
+            reminder_coordinator: Arc::new(ReminderCoordinator::default()),
         };
 
         fs::write(&corrupt_path, b"not sqlite").expect("corrupt candidate");
@@ -7156,6 +7381,7 @@ mod tests {
             database_path: db_path.clone(),
             sqlite: Mutex::new(open_database(&db_path).expect("open")),
             backup_coordinator: coordinator.clone(),
+            reminder_coordinator: Arc::new(ReminderCoordinator::default()),
         };
 
         assert!(run_business_mutation(&state, |_| {

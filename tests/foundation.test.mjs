@@ -35,3 +35,20 @@ test("Tauri Rust boundary remains named and does not expose generic SQL", async 
   assert.doesNotMatch(source, /execute_sql/);
   assert.doesNotMatch(source, /executeSql/);
 });
+
+test("release metadata stays synchronized and Windows release uses the GUI subsystem", async () => {
+  const [packageJson, cargoToml, tauriConfig, main] = await Promise.all([
+    readFile(new URL("../package.json", import.meta.url), "utf8"),
+    readFile(new URL("../src-tauri/Cargo.toml", import.meta.url), "utf8"),
+    readFile(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"),
+    readFile(new URL("../src-tauri/src/main.rs", import.meta.url), "utf8"),
+  ]);
+  assert.match(packageJson, /"version": "1\.1\.2"/);
+  assert.match(cargoToml, /^version = "1\.1\.2"/m);
+  assert.match(tauriConfig, /"version": "1\.1\.2"/);
+  assert.match(tauriConfig, /"installMode": "currentUser"/);
+  assert.match(
+    main,
+    /cfg_attr\(all\(windows, not\(debug_assertions\)\), windows_subsystem = "windows"\)/,
+  );
+});
