@@ -264,6 +264,47 @@ describe("New appointment flow", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("keeps a dirty booking open until the user chooses to leave", async () => {
+    await openForm();
+    fireEvent.change(screen.getByLabelText("Müşteri adı"), {
+      target: { value: "Deniz Kaya" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Hizmetler" }));
+    expect(
+      await screen.findByRole("heading", { name: "Kaydedilmemiş bilgiler var." }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 1, name: "Bugün" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Yeni Randevu" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Kal" }));
+    expect(screen.getByLabelText("Müşteri adı")).toHaveValue("Deniz Kaya");
+    expect(screen.getByRole("heading", { level: 1, name: "Bugün" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Hizmetler" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Çık" }));
+    expect(await screen.findByRole("region", { name: "Hizmetler" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Yeni Randevu" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows a bounded active customer list when the name field receives focus", async () => {
+    api.searchCustomers.mockResolvedValue([
+      existingCustomer,
+      {
+        ...existingCustomer,
+        id: "customer-archived",
+        firstName: "Arşiv",
+        lastName: "Müşteri",
+        isActive: false,
+      },
+    ]);
+    await openForm();
+    fireEvent.focus(screen.getByLabelText("Müşteri adı"));
+    await waitFor(() => expect(api.searchCustomers).toHaveBeenCalledWith(""));
+    expect(await screen.findByRole("list", { name: "Müşteri sonuçları" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Ayşe Yılmaz/ })).toBeInTheDocument();
+    expect(screen.queryByText("Arşiv Müşteri")).not.toBeInTheDocument();
+  });
+
   it("searches bounded active customers and uses an existing customer id", async () => {
     await openForm();
     fireEvent.change(screen.getByLabelText("Müşteri adı"), {
@@ -284,6 +325,16 @@ describe("New appointment flow", () => {
       ),
     );
     expect(api.createCustomer).not.toHaveBeenCalled();
+  });
+
+  it("searches existing customers by phone", async () => {
+    await openForm();
+    fireEvent.change(screen.getByLabelText("Müşteri adı"), {
+      target: { value: "5551112233" },
+    });
+    await waitFor(() =>
+      expect(api.searchCustomers).toHaveBeenCalledWith("5551112233"),
+    );
   });
 
   it("creates a phone-less new customer once, then creates an appointment", async () => {
@@ -613,6 +664,28 @@ describe("Calendar day, week and edit foundation", () => {
         }),
       ),
     );
+  });
+
+  it("keeps a dirty appointment edit open until the user chooses to leave", async () => {
+    await openCalendar();
+    fireEvent.click(await screen.findByRole("button", { name: /Ayşe Yılmaz/ }));
+    await screen.findByRole("heading", { name: "Randevuyu Düzenle" });
+    fireEvent.change(screen.getByLabelText("Düzenle saat"), {
+      target: { value: "13:00" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Müşteriler" }));
+    expect(
+      await screen.findByRole("heading", { name: "Kaydedilmemiş bilgiler var." }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 1, name: "Takvim" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Kal" }));
+    expect(screen.getByLabelText("Düzenle saat")).toHaveValue("13:00");
+    fireEvent.click(screen.getByRole("button", { name: "Müşteriler" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Çık" }));
+    expect(await screen.findByRole("region", { name: "Müşteriler" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Randevuyu Düzenle" }),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps the edit draft open and maps availability failures", async () => {

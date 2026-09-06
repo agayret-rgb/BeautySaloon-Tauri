@@ -223,6 +223,12 @@ function parseMinor(value: string): number | null {
   const [whole, fraction = ""] = normalized.split(".");
   return Number(whole) * 100 + Number((fraction + "00").slice(0, 2));
 }
+function sameIds(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  const sortedLeft = [...left].sort();
+  const sortedRight = [...right].sort();
+  return sortedLeft.every((value, index) => value === sortedRight[index]);
+}
 function formatMinor(value: number, currencyCode: string): string {
   return new Intl.NumberFormat("tr-TR", {
     style: "currency",
@@ -248,6 +254,23 @@ type BookingPrefill = {
   localDate?: string;
   localStartTime?: string;
   notice?: string;
+};
+
+type BookingDraft = {
+  customerId: string;
+  customerQuery: string;
+  phone: string;
+  serviceIds: string[];
+  staffId: string;
+  localDate: string;
+  localStartTime: string;
+};
+
+type AppointmentEditDraft = {
+  localDate: string;
+  localStartTime: string;
+  staffId: string;
+  serviceIds: string[];
 };
 
 export function App() {
@@ -288,6 +311,9 @@ export function App() {
   const [historyPageLoading, setHistoryPageLoading] = useState(false);
   const [customerActionPending, setCustomerActionPending] = useState(false);
   const [bookingOpen, setBookingOpen] = useState(false);
+  const [bookingInitialDraft, setBookingInitialDraft] =
+    useState<BookingDraft | null>(null);
+  const [customerPickerOpen, setCustomerPickerOpen] = useState(false);
   const [customerQuery, setCustomerQuery] = useState("");
   const [customerResults, setCustomerResults] = useState<Customer[]>([]);
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(
@@ -303,6 +329,11 @@ export function App() {
   const [formError, setFormError] = useState("");
   const [formNotice, setFormNotice] = useState("");
   const [isSaving, setIsSaving] = useState(false);
+  const [editInitialDraft, setEditInitialDraft] =
+    useState<AppointmentEditDraft | null>(null);
+  const [pendingRootNavigation, setPendingRootNavigation] = useState<
+    (typeof navigationItems)[number] | null
+  >(null);
   const [currencyCode, setCurrencyCode] = useState("TRY");
   const [adminServices, setAdminServices] = useState<ServiceItem[]>([]);
   const [serviceCategories, setServiceCategories] = useState<ServiceCategory[]>(
@@ -696,7 +727,11 @@ export function App() {
   ]);
 
   useEffect(() => {
-    if (selectedCustomer || customerQuery.trim().length < 2) {
+    if (
+      !bookingOpen ||
+      selectedCustomer ||
+      (!customerPickerOpen && customerQuery.trim().length < 2)
+    ) {
       setCustomerResults([]);
       return;
     }
@@ -708,12 +743,14 @@ export function App() {
         .catch(() => setCustomerResults([]));
     }, 220);
     return () => window.clearTimeout(timer);
-  }, [customerQuery, selectedCustomer]);
+  }, [bookingOpen, customerPickerOpen, customerQuery, selectedCustomer]);
 
   const resetBooking = useCallback(() => {
     setCustomerQuery("");
     setCustomerResults([]);
     setSelectedCustomer(null);
+    setBookingInitialDraft(null);
+    setCustomerPickerOpen(false);
     setPhone("");
     setServiceIds([]);
     setStaffId("");
@@ -725,15 +762,30 @@ export function App() {
 
   const openBooking = useCallback(
     async (prefillDate = todayLocalDate(), prefill?: BookingPrefill) => {
+      const customer = prefill?.customer ?? null;
+      const nextServiceIds = prefill?.serviceIds ?? [];
+      const nextStaffId = prefill?.staffId ?? "";
+      const nextLocalDate = prefill?.localDate ?? prefillDate;
+      const nextLocalStartTime = prefill?.localStartTime ?? "10:00";
       setBookingOpen(true);
       setFormError("");
-      setSelectedCustomer(prefill?.customer ?? null);
-      setCustomerQuery(prefill?.customer ? customerName(prefill.customer) : "");
-      setPhone(prefill?.customer?.phone ?? "");
-      setServiceIds(prefill?.serviceIds ?? []);
-      setStaffId(prefill?.staffId ?? "");
-      setLocalDate(prefill?.localDate ?? prefillDate);
-      setLocalStartTime(prefill?.localStartTime ?? "10:00");
+      setSelectedCustomer(customer);
+      setCustomerQuery(customer ? customerName(customer) : "");
+      setPhone(customer?.phone ?? "");
+      setServiceIds(nextServiceIds);
+      setStaffId(nextStaffId);
+      setLocalDate(nextLocalDate);
+      setLocalStartTime(nextLocalStartTime);
+      setBookingInitialDraft({
+        customerId: customer?.id ?? "",
+        customerQuery: customer ? customerName(customer) : "",
+        phone: customer?.phone ?? "",
+        serviceIds: nextServiceIds,
+        staffId: nextStaffId,
+        localDate: nextLocalDate,
+        localStartTime: nextLocalStartTime,
+      });
+      setCustomerPickerOpen(false);
       setFormNotice(prefill?.notice ?? "");
       try {
         const [nextServices, nextStaff] = await Promise.all([
@@ -747,8 +799,12 @@ export function App() {
           !nextStaff.some(
             (item) => item.isActive && item.id === prefill.staffId,
           )
-        )
+        ) {
           setStaffId("");
+          setBookingInitialDraft((current) =>
+            current ? { ...current, staffId: "" } : current,
+          );
+        }
       } catch {
         setFormError("Randevu seçenekleri yüklenemedi.");
       }
@@ -933,9 +989,14 @@ export function App() {
       setEditDate(local.localDate);
       setEditTime(local.localStartTime);
       setEditStaffId(appointment.staffId);
-      setEditServiceIds(
-        appointment.services.map((service) => service.serviceId),
-      );
+      const serviceIds = appointment.services.map((service) => service.serviceId);
+      setEditServiceIds(serviceIds);
+      setEditInitialDraft({
+        localDate: local.localDate,
+        localStartTime: local.localStartTime,
+        staffId: appointment.staffId,
+        serviceIds,
+      });
       setEditError("");
       try {
         const [nextStaff, nextServices] = await Promise.all([
@@ -950,6 +1011,16 @@ export function App() {
     },
     [],
   );
+
+  const resetAppointmentEditor = useCallback(() => {
+    setEditingAppointment(null);
+    setEditInitialDraft(null);
+    setEditError("");
+    setEditDate("");
+    setEditTime("");
+    setEditStaffId("");
+    setEditServiceIds([]);
+  }, []);
 
   const saveAppointmentEdit = useCallback(async () => {
     if (!editingAppointment || isEditSaving) return;
@@ -969,7 +1040,7 @@ export function App() {
         status: editingAppointment.status,
         note: editingAppointment.note,
       });
-      setEditingAppointment(null);
+      resetAppointmentEditor();
       await Promise.all([loadToday(), loadCalendar()]);
     } catch (error) {
       setEditError(bookingErrorMessage(error));
@@ -985,6 +1056,7 @@ export function App() {
     isEditSaving,
     loadCalendar,
     loadToday,
+    resetAppointmentEditor,
   ]);
 
   const resetServiceForm = useCallback(() => {
@@ -1078,12 +1150,30 @@ export function App() {
     setStaffSpecialtyNote("");
   }, []);
 
-  const navigateToRoot = useCallback(
+  const bookingIsDirty =
+    bookingOpen &&
+    bookingInitialDraft !== null &&
+    (bookingInitialDraft.customerId !== (selectedCustomer?.id ?? "") ||
+      bookingInitialDraft.customerQuery !== customerQuery ||
+      bookingInitialDraft.phone !== phone ||
+      !sameIds(bookingInitialDraft.serviceIds, serviceIds) ||
+      bookingInitialDraft.staffId !== staffId ||
+      bookingInitialDraft.localDate !== localDate ||
+      bookingInitialDraft.localStartTime !== localStartTime);
+
+  const appointmentEditIsDirty =
+    editingAppointment !== null &&
+    editInitialDraft !== null &&
+    (editInitialDraft.localDate !== editDate ||
+      editInitialDraft.localStartTime !== editTime ||
+      editInitialDraft.staffId !== editStaffId ||
+      !sameIds(editInitialDraft.serviceIds, editServiceIds));
+
+  const completeRootNavigation = useCallback(
     (item: (typeof navigationItems)[number]) => {
       setBookingOpen(false);
       resetBooking();
-      setEditingAppointment(null);
-      setEditError("");
+      resetAppointmentEditor();
       setCustomerHistory(null);
       setHistoryError("");
       setHistoryOffset(0);
@@ -1096,7 +1186,23 @@ export function App() {
       setRestoreCandidate(null);
       setActiveItem(item);
     },
-    [resetBooking, resetServiceForm, resetStaffForm],
+    [
+      resetAppointmentEditor,
+      resetBooking,
+      resetServiceForm,
+      resetStaffForm,
+    ],
+  );
+
+  const navigateToRoot = useCallback(
+    (item: (typeof navigationItems)[number]) => {
+      if (bookingIsDirty || appointmentEditIsDirty) {
+        setPendingRootNavigation(item);
+        return;
+      }
+      completeRootNavigation(item);
+    },
+    [appointmentEditIsDirty, bookingIsDirty, completeRootNavigation],
   );
 
   const beginStaffEdit = useCallback((item: Staff) => {
@@ -1839,6 +1945,37 @@ export function App() {
             {formNotice}
           </p>
         )}
+        {pendingRootNavigation && (
+          <section
+            className="restore-confirmation"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="discard-booking-title"
+          >
+            <h2 id="discard-booking-title">Kaydedilmemiş bilgiler var.</h2>
+            <p>Bu ekrandan çıkmak istiyor musunuz?</p>
+            <div className="booking-actions">
+              <button
+                type="button"
+                className="dismiss-button"
+                onClick={() => setPendingRootNavigation(null)}
+              >
+                Kal
+              </button>
+              <button
+                type="button"
+                className="primary-action"
+                onClick={() => {
+                  const item = pendingRootNavigation;
+                  setPendingRootNavigation(null);
+                  completeRootNavigation(item);
+                }}
+              >
+                Çık
+              </button>
+            </div>
+          </section>
+        )}
         {bookingOpen && (
           <section className="booking-surface" aria-labelledby="booking-title">
             <div className="booking-heading">
@@ -1870,8 +2007,10 @@ export function App() {
                   aria-label="Müşteri adı"
                   value={customerQuery}
                   disabled={Boolean(selectedCustomer) || isSaving}
+                  onFocus={() => setCustomerPickerOpen(true)}
                   onChange={(event) => {
                     setCustomerQuery(event.target.value);
+                    setCustomerPickerOpen(true);
                     setFormError("");
                   }}
                   placeholder="Ad Soyad"
@@ -1896,6 +2035,7 @@ export function App() {
                     setSelectedCustomer(null);
                     setCustomerQuery("");
                     setPhone("");
+                    setCustomerPickerOpen(false);
                   }}
                 >
                   Farklı müşteri seç
@@ -1912,6 +2052,7 @@ export function App() {
                           setCustomerQuery(customerName(customer));
                           setPhone(customer.phone ?? "");
                           setCustomerResults([]);
+                          setCustomerPickerOpen(false);
                         }}
                       >
                         {customerName(customer)}
@@ -3641,7 +3782,7 @@ export function App() {
                 type="button"
                 className="dismiss-button"
                 disabled={isEditSaving}
-                onClick={() => setEditingAppointment(null)}
+                onClick={resetAppointmentEditor}
               >
                 Vazgeç
               </button>
@@ -3722,7 +3863,7 @@ export function App() {
                 type="button"
                 className="dismiss-button"
                 disabled={isEditSaving}
-                onClick={() => setEditingAppointment(null)}
+                onClick={resetAppointmentEditor}
               >
                 Vazgeç
               </button>
