@@ -434,6 +434,8 @@ export function App() {
   const [googleError, setGoogleError] = useState("");
   const [googleNotice, setGoogleNotice] = useState("");
   const [reminderConnected, setReminderConnected] = useState(false);
+  const [reminderConnectionUnavailable, setReminderConnectionUnavailable] =
+    useState(false);
   const [reminderReadiness, setReminderReadiness] = useState<
     "disconnected" | "connected_not_ready" | "ready"
   >("disconnected");
@@ -676,12 +678,13 @@ export function App() {
   const loadReminderConnection = useCallback(async () => {
     setReminderLoading(true);
     try {
-      const [status, readiness] = await Promise.all([
-        getCloudConnectionStatus(),
-        getReminderReadiness(),
-      ]);
+      const status = await getCloudConnectionStatus();
+      const readiness = await getReminderReadiness();
       setReminderConnected(
         status.sessionPresent && readiness.state !== "disconnected",
+      );
+      setReminderConnectionUnavailable(
+        status.validationState === "unavailable",
       );
       setReminderReadiness(readiness.state);
       setAutomaticRemindersEnabled(readiness.automaticEnabled);
@@ -3702,7 +3705,9 @@ export function App() {
               ) : reminderConnected ? (
                 <div className="settings-actions">
                   <p className="connection-state">
-                    {reminderReadiness === "ready"
+                    {reminderConnectionUnavailable
+                      ? "Bağlantı durumu şu anda doğrulanamıyor"
+                      : reminderReadiness === "ready"
                       ? "Hazır / Hatırlatmalar aktif"
                       : "Bağlı, ancak hatırlatmalar hazır değil"}
                   </p>
@@ -3710,7 +3715,7 @@ export function App() {
                     <input
                       type="checkbox"
                       checked={automaticRemindersEnabled}
-                      disabled={reminderSettingSaving}
+                      disabled={reminderSettingSaving || reminderConnectionUnavailable}
                       onChange={(event) =>
                         void changeAutomaticReminders(event.target.checked)
                       }

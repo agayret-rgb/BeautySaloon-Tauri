@@ -5522,10 +5522,62 @@ fn cloud_connection_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<services::supabase::SupabaseConnectionStatus, AppError> {
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
-    Ok(services::supabase::SupabaseConnectionStatus {
-        configured: load_live_services_config()?.supabase.is_some(),
-        session_present: services::reminder_cloud::has_session_secret(&connection)?,
-    })
+    let config = match supabase_config() {
+        Ok(config) => Some(config),
+        Err(AppError::Validation(code)) if code == "CLOUD_CONFIG_MISSING" => None,
+        Err(error) => return Err(error),
+    };
+    let protector = services::secure_store::WindowsDpapiProtector;
+    let mut transport = services::google::ReqwestHttpTransport;
+    cloud_connection_status_with(&connection, &protector, config.as_ref(), &mut transport)
+}
+
+fn cloud_connection_status_with(
+    connection: &Connection,
+    protector: &dyn services::secure_store::SecretProtector,
+    config: Option<&services::supabase::SupabaseConfig>,
+    transport: &mut dyn services::google::HttpTransport,
+) -> Result<services::supabase::SupabaseConnectionStatus, AppError> {
+    let Some(config) = config else {
+        return Ok(services::supabase::SupabaseConnectionStatus {
+            configured: false,
+            session_present: false,
+            validation_state: services::supabase::SupabaseSessionValidationState::Disconnected,
+        });
+    };
+    let Some(session) = services::secure_store::read_supabase_session(connection, protector)?
+    else {
+        return Ok(services::supabase::SupabaseConnectionStatus {
+            configured: true,
+            session_present: false,
+            validation_state: services::supabase::SupabaseSessionValidationState::Disconnected,
+        });
+    };
+
+    match services::supabase::validate_authenticated_session(
+        transport,
+        config,
+        &session.access_token,
+    ) {
+        Ok(()) => Ok(services::supabase::SupabaseConnectionStatus {
+            configured: true,
+            session_present: true,
+            validation_state: services::supabase::SupabaseSessionValidationState::Valid,
+        }),
+        Err(AppError::Validation(code)) if code == "SUPABASE_AUTH_INVALID" => {
+            services::secure_store::delete_secret(connection, "cloud_supabase_session")?;
+            Ok(services::supabase::SupabaseConnectionStatus {
+                configured: true,
+                session_present: false,
+                validation_state: services::supabase::SupabaseSessionValidationState::Disconnected,
+            })
+        }
+        Err(_) => Ok(services::supabase::SupabaseConnectionStatus {
+            configured: true,
+            session_present: true,
+            validation_state: services::supabase::SupabaseSessionValidationState::Unavailable,
+        }),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5665,6 +5717,7 @@ fn cloud_verify_otp(
     Ok(services::supabase::SupabaseConnectionStatus {
         configured: true,
         session_present: true,
+        validation_state: services::supabase::SupabaseSessionValidationState::Valid,
     })
 }
 
@@ -6384,6 +6437,168 @@ mod tests {
         let status = reminder_readiness_status(&connection).expect("readiness");
         assert_eq!(status.state, "disconnected");
         assert!(!status.automatic_enabled);
+    }
+
+    fn test_supabase_config() -> services::supabase::SupabaseConfig {
+        services::supabase::SupabaseConfig {
+            project_url: "https://example.supabase.co".into(),
+            publishable_key: "public-key-with-enough-length".into(),
+        }
+    }
+
+    fn test_supabase_session() -> services::supabase::SupabaseSession {
+        services::supabase::SupabaseSession {
+            access_token: "test-access-token".into(),
+            refresh_token: "test-refresh-token".into(),
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn cloud_session_validation_keeps_a_valid_session_without_dispatcher_mutation() {
+        let (_temp, connection) = open_temp();
+        let protector = services::secure_store::TestProtector;
+        services::secure_store::store_supabase_session(
+            &connection,
+            &protector,
+            &test_supabase_session(),
+        )
+        .expect("store session");
+        let mut transport =
+            services::google::FakeHttpTransport::new(vec![services::google::HttpResponse {
+                status: 200,
+                body: br#"{"id":"user"}"#.to_vec(),
+            }]);
+
+        let status = cloud_connection_status_with(
+            &connection,
+            &protector,
+            Some(&test_supabase_config()),
+            &mut transport,
+        )
+        .expect("status");
+
+        assert!(status.configured && status.session_present);
+        assert_eq!(
+            status.validation_state,
+            services::supabase::SupabaseSessionValidationState::Valid
+        );
+        assert!(
+            services::secure_store::read_supabase_session(&connection, &protector)
+                .expect("read session")
+                .is_some()
+        );
+        assert_eq!(transport.requests.len(), 1);
+        assert!(transport.requests[0].url.ends_with("/auth/v1/user"));
+        assert!(transport.requests[0]
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("apikey")));
+        assert!(transport.requests[0]
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("authorization")
+                && value.starts_with("Bearer ")));
+        assert!(!transport.requests[0].url.contains("/functions/v1/"));
+    }
+
+    #[test]
+    fn cloud_session_validation_clears_only_authoritatively_invalid_session() {
+        let (_temp, connection) = open_temp();
+        let protector = services::secure_store::TestProtector;
+        services::secure_store::store_supabase_session(
+            &connection,
+            &protector,
+            &test_supabase_session(),
+        )
+        .expect("store cloud session");
+        services::secure_store::upsert_secret(
+            &connection,
+            &protector,
+            "google_calendar_refresh_token",
+            "google-refresh",
+        )
+        .expect("store google secret");
+        let google_outbox_before: i64 = connection
+            .query_row("SELECT COUNT(*) FROM google_calendar_outbox", [], |row| {
+                row.get(0)
+            })
+            .expect("google outbox count");
+        let mut transport =
+            services::google::FakeHttpTransport::new(vec![services::google::HttpResponse {
+                status: 401,
+                body: br#"{"error":"unauthorized"}"#.to_vec(),
+            }]);
+
+        let status = cloud_connection_status_with(
+            &connection,
+            &protector,
+            Some(&test_supabase_config()),
+            &mut transport,
+        )
+        .expect("status");
+
+        assert!(!status.session_present);
+        assert_eq!(
+            status.validation_state,
+            services::supabase::SupabaseSessionValidationState::Disconnected
+        );
+        assert!(
+            services::secure_store::read_supabase_session(&connection, &protector)
+                .expect("read cloud session")
+                .is_none()
+        );
+        assert!(services::secure_store::read_secret(
+            &connection,
+            &protector,
+            "google_calendar_refresh_token"
+        )
+        .expect("read google secret")
+        .is_some());
+        let google_outbox_after: i64 = connection
+            .query_row("SELECT COUNT(*) FROM google_calendar_outbox", [], |row| {
+                row.get(0)
+            })
+            .expect("google outbox count");
+        assert_eq!(google_outbox_after, google_outbox_before);
+        assert!(!transport.requests[0].url.contains("/functions/v1/"));
+    }
+
+    #[test]
+    fn cloud_session_validation_preserves_session_during_temporary_failure() {
+        let (_temp, connection) = open_temp();
+        let protector = services::secure_store::TestProtector;
+        services::secure_store::store_supabase_session(
+            &connection,
+            &protector,
+            &test_supabase_session(),
+        )
+        .expect("store session");
+        let mut transport =
+            services::google::FakeHttpTransport::new(vec![services::google::HttpResponse {
+                status: 503,
+                body: Vec::new(),
+            }]);
+
+        let status = cloud_connection_status_with(
+            &connection,
+            &protector,
+            Some(&test_supabase_config()),
+            &mut transport,
+        )
+        .expect("status");
+
+        assert!(status.session_present);
+        assert_eq!(
+            status.validation_state,
+            services::supabase::SupabaseSessionValidationState::Unavailable
+        );
+        assert!(
+            services::secure_store::read_supabase_session(&connection, &protector)
+                .expect("read session")
+                .is_some()
+        );
+        assert!(!transport.requests[0].url.contains("/functions/v1/"));
     }
 
     fn seed_core(connection: &mut Connection) -> (Customer, Staff, ServiceItem) {

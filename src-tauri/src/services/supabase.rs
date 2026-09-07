@@ -23,6 +23,15 @@ pub struct SupabaseSession {
 pub struct SupabaseConnectionStatus {
     pub configured: bool,
     pub session_present: bool,
+    pub validation_state: SupabaseSessionValidationState,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SupabaseSessionValidationState {
+    Valid,
+    Disconnected,
+    Unavailable,
 }
 
 pub fn validate_public_config(config: &SupabaseConfig) -> Result<(), AppError> {

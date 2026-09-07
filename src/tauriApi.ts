@@ -231,6 +231,7 @@ export interface GoogleConnectionStatus {
 export interface CloudConnectionStatus {
   configured: boolean;
   sessionPresent: boolean;
+  validationState?: "valid" | "disconnected" | "unavailable";
 }
 
 export interface ReminderReadinessStatus {
