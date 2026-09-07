@@ -4078,11 +4078,13 @@ fn reconcile_all_reminders_mock(connection: &Connection) -> Result<u32, AppError
 }
 
 fn automatic_reminders_enabled(connection: &Connection) -> Result<bool, AppError> {
-    connection.query_row(
-        "SELECT automatic_reminder_enabled=1 AND is_enabled=1 AND phone_number_id IS NOT NULL AND template_name IS NOT NULL FROM whatsapp_settings WHERE id=1",
-        [],
-        |row| row.get(0),
-    ).map_err(Into::into)
+    connection
+        .query_row(
+            "SELECT automatic_reminder_enabled=1 FROM whatsapp_settings WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
 }
 
 fn automatic_reminder_tick(database_path: &Path) -> Result<bool, AppError> {
@@ -5594,17 +5596,9 @@ fn reminder_readiness_status(connection: &Connection) -> Result<ReminderReadines
         [],
         |row| row.get(0),
     )?;
-    let provider_configured: bool = connection.query_row(
-        "SELECT is_enabled=1 AND phone_number_id IS NOT NULL AND template_name IS NOT NULL FROM whatsapp_settings WHERE id=1",
-        [],
-        |row| row.get(0),
-    )?;
     let configured = load_live_services_config()?.supabase.is_some();
     let state = if !session_present || !configured {
         "disconnected"
-    } else if automatic_enabled && provider_configured {
-        // Dispatcher readiness is intentionally not inferred from a local session.
-        "connected_not_ready"
     } else {
         "connected_not_ready"
     };
@@ -6439,6 +6433,24 @@ mod tests {
         assert!(!status.automatic_enabled);
     }
 
+    #[test]
+    fn automatic_reminders_do_not_require_local_provider_metadata() {
+        let (_temp, connection) = open_temp();
+
+        connection
+            .execute(
+                "UPDATE whatsapp_settings
+                 SET automatic_reminder_enabled=1,
+                     is_enabled=0,
+                     phone_number_id=NULL,
+                     template_name=NULL
+                 WHERE id=1",
+                [],
+            )
+            .expect("enable automatic reminders without local provider metadata");
+
+        assert!(automatic_reminders_enabled(&connection).expect("automatic reminder status"));
+    }
     fn test_supabase_config() -> services::supabase::SupabaseConfig {
         services::supabase::SupabaseConfig {
             project_url: "https://example.supabase.co".into(),
