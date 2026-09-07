@@ -31,8 +31,8 @@ const AUTOMATIC_REMINDER_INTERVAL: StdDuration = StdDuration::from_secs(15 * 60)
 const SHUTDOWN_BACKUP_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const SHUTDOWN_BACKUP_POLL_INTERVAL: StdDuration = StdDuration::from_millis(25);
 const GOOGLE_OAUTH_CALLBACK_TIMEOUT: StdDuration = StdDuration::from_secs(15 * 60);
-const PACKAGED_GOOGLE_RUNTIME_DEFAULT: &str =
-    include_str!(concat!(env!("OUT_DIR"), "/google-runtime-default.json"));
+const PACKAGED_RUNTIME_DEFAULT: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/runtime-default.json"));
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Error)]
@@ -5015,58 +5015,87 @@ fn parse_live_services_config(text: &str) -> Result<LiveServicesConfig, AppError
 }
 
 fn packaged_live_services_config() -> Result<LiveServicesConfig, AppError> {
-    parse_live_services_config(PACKAGED_GOOGLE_RUNTIME_DEFAULT)
-        .map_err(|_| AppError::Validation("GOOGLE_RUNTIME_DEFAULT_INVALID".to_string()))
+    parse_live_services_config(PACKAGED_RUNTIME_DEFAULT)
+        .map_err(|_| AppError::Validation("RUNTIME_DEFAULT_INVALID".to_string()))
 }
 
-fn provision_google_runtime_config(
+fn provision_runtime_config(
     settings_dir: &Path,
     packaged: &LiveServicesConfig,
 ) -> Result<(), AppError> {
-    provision_google_runtime_config_for_fingerprint(
+    provision_runtime_config_for_fingerprint(
         settings_dir,
         packaged,
         LEGACY_GOOGLE_CLIENT_FINGERPRINT,
     )
 }
 
-fn provision_google_runtime_config_for_fingerprint(
+fn provision_runtime_config_for_fingerprint(
     settings_dir: &Path,
     packaged: &LiveServicesConfig,
     legacy_fingerprint: &str,
 ) -> Result<(), AppError> {
-    if packaged.google.is_none() {
+    if packaged.google.is_none() && packaged.supabase.is_none() {
         return Ok(());
     }
     let destination = settings_dir.join("live-services.json");
-    if destination.exists() {
-        let mut existing: serde_json::Value = serde_json::from_slice(&fs::read(&destination)?)
-            .map_err(|_| AppError::Validation("LIVE_SERVICE_CONFIG_INVALID".to_string()))?;
-        let current = existing
-            .pointer("/google/clientId")
-            .and_then(serde_json::Value::as_str);
-        if current.is_some_and(|client_id| {
-            legacy_google_client_fingerprint(client_id) == legacy_fingerprint
-        }) {
-            existing["google"]["clientId"] = serde_json::Value::String(
-                packaged.google.as_ref().expect("checked").client_id.clone(),
+    let mut existing = if destination.exists() {
+        serde_json::from_slice(&fs::read(&destination)?)
+            .map_err(|_| AppError::Validation("LIVE_SERVICE_CONFIG_INVALID".to_string()))?
+    } else {
+        serde_json::json!({})
+    };
+    let root = existing
+        .as_object_mut()
+        .ok_or_else(|| AppError::Validation("LIVE_SERVICE_CONFIG_INVALID".to_string()))?;
+    let mut changed = !destination.exists();
+
+    if let Some(google) = &packaged.google {
+        let legacy_google = root
+            .get("google")
+            .and_then(|value| value.get("clientId"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|client_id| {
+                legacy_google_client_fingerprint(client_id) == legacy_fingerprint
+            });
+        if legacy_google {
+            root.entry("google".to_string())
+                .or_insert_with(|| serde_json::json!({}))["clientId"] =
+                serde_json::Value::String(google.client_id.clone());
+            changed = true;
+        } else if !root.contains_key("google") {
+            root.insert(
+                "google".to_string(),
+                serde_json::json!({ "clientId": google.client_id, "calendarId": google.calendar_id }),
             );
-            fs::write(
-                &destination,
-                serde_json::to_vec_pretty(&existing).map_err(|_| {
-                    AppError::Validation("GOOGLE_RUNTIME_DEFAULT_INVALID".to_string())
-                })?,
-            )?;
+            changed = true;
+        } else if !destination.exists() {
+            root.insert(
+                "google".to_string(),
+                serde_json::json!({ "clientId": google.client_id, "calendarId": google.calendar_id }),
+            );
         }
+    }
+    if let Some(supabase) = &packaged.supabase {
+        if !root.contains_key("supabase") {
+            root.insert(
+                "supabase".to_string(),
+                serde_json::json!({
+                    "projectUrl": supabase.project_url,
+                    "publishableKey": supabase.publishable_key,
+                }),
+            );
+            changed = true;
+        }
+    }
+    if !changed {
         return Ok(());
     }
-    let google = packaged.google.as_ref().expect("checked");
-    let safe_config = serde_json::json!({ "google": { "clientId": google.client_id, "calendarId": google.calendar_id } });
     let temporary = destination.with_extension("json.tmp");
     fs::write(
         &temporary,
-        serde_json::to_vec_pretty(&safe_config)
-            .map_err(|_| AppError::Validation("GOOGLE_RUNTIME_DEFAULT_INVALID".to_string()))?,
+        serde_json::to_vec_pretty(&existing)
+            .map_err(|_| AppError::Validation("RUNTIME_DEFAULT_INVALID".to_string()))?,
     )?;
     fs::rename(temporary, destination)?;
     Ok(())
@@ -5680,7 +5709,7 @@ pub fn run() {
         .setup(|app| {
             let root = app_data_root(app.handle())?;
             let (database_path, _, _, _, settings_dir) = data_paths(&root)?;
-            provision_google_runtime_config(&settings_dir, &packaged_live_services_config()?)?;
+            provision_runtime_config(&settings_dir, &packaged_live_services_config()?)?;
             let sqlite = open_database(&database_path)?;
             let backup_coordinator = Arc::new(BackupCoordinator::default());
             let reminder_coordinator = Arc::new(ReminderCoordinator::default());
@@ -5810,9 +5839,12 @@ mod tests {
     }
 
     #[test]
-    fn desktop_client_provisioning_migrates_only_legacy_and_never_writes_secret() {
+    fn runtime_provisioning_migrates_legacy_google_and_preserves_custom_configuration() {
         let temp = tempdir().expect("temp");
-        let packaged = parse_live_services_config(r#"{"google":{"clientId":"new-client","clientSecret":"native-secret","calendarId":"primary"}}"#).expect("packaged");
+        let packaged = parse_live_services_config(
+            r#"{"google":{"clientId":"new-client","clientSecret":"native-secret","calendarId":"primary"},"supabase":{"projectUrl":"https://project.example","publishableKey":"public-key-with-enough-length"}}"#,
+        )
+        .expect("packaged");
         let legacy = "legacy-client";
         let fingerprint = legacy_google_client_fingerprint(legacy);
         let settings = temp.path().join("legacy");
@@ -5824,13 +5856,14 @@ mod tests {
             ),
         )
         .expect("legacy config");
-        provision_google_runtime_config_for_fingerprint(&settings, &packaged, &fingerprint)
+        provision_runtime_config_for_fingerprint(&settings, &packaged, &fingerprint)
             .expect("migrate");
         let migrated = fs::read_to_string(settings.join("live-services.json")).expect("read");
         assert!(
             migrated.contains("new-client")
                 && migrated.contains("kept")
                 && migrated.contains("unrelated")
+                && migrated.contains("https://project.example")
         );
         assert!(!migrated.contains("native-secret") && !migrated.contains("clientSecret"));
 
@@ -5838,54 +5871,129 @@ mod tests {
         fs::create_dir_all(&custom).expect("custom settings");
         fs::write(
             custom.join("live-services.json"),
-            r#"{"google":{"clientId":"custom-client"}}"#,
+            r#"{"google":{"clientId":"custom-client"},"supabase":{"projectUrl":"https://custom.example","publishableKey":"custom-public-key-with-enough-length"}}"#,
         )
         .expect("custom config");
-        provision_google_runtime_config_for_fingerprint(&custom, &packaged, &fingerprint)
+        provision_runtime_config_for_fingerprint(&custom, &packaged, &fingerprint)
             .expect("preserve custom");
-        assert!(fs::read_to_string(custom.join("live-services.json"))
-            .expect("custom read")
-            .contains("custom-client"));
+        let custom_text =
+            fs::read_to_string(custom.join("live-services.json")).expect("custom read");
+        assert!(
+            custom_text.contains("custom-client") && custom_text.contains("https://custom.example")
+        );
+        assert!(!custom_text.contains("https://project.example"));
+
+        let missing_google = temp.path().join("missing-google");
+        fs::create_dir_all(&missing_google).expect("missing Google settings");
+        fs::write(
+            missing_google.join("live-services.json"),
+            r#"{"custom":true}"#,
+        )
+        .expect("missing Google config");
+        provision_runtime_config_for_fingerprint(&missing_google, &packaged, &fingerprint)
+            .expect("add missing runtime sections");
+        let missing_google_text =
+            fs::read_to_string(missing_google.join("live-services.json")).expect("read config");
+        assert!(
+            missing_google_text.contains("new-client")
+                && missing_google_text.contains("https://project.example")
+                && missing_google_text.contains("custom")
+        );
 
         let clean = temp.path().join("clean");
         fs::create_dir_all(&clean).expect("clean settings");
-        provision_google_runtime_config_for_fingerprint(&clean, &packaged, &fingerprint)
+        provision_runtime_config_for_fingerprint(&clean, &packaged, &fingerprint)
             .expect("clean provision");
         let clean_text = fs::read_to_string(clean.join("live-services.json")).expect("clean read");
-        assert!(clean_text.contains("new-client") && !clean_text.contains("native-secret"));
+        assert!(
+            clean_text.contains("new-client") && clean_text.contains("https://project.example")
+        );
+        assert!(!clean_text.contains("native-secret") && !clean_text.contains("clientSecret"));
         let (_db_temp, connection) = open_temp();
-        let secret_count: i64 = connection.query_row("SELECT COUNT(*) FROM secure_secrets WHERE secret_key='google_calendar_client_secret'", [], |row| row.get(0)).expect("count");
+        let secret_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM secure_secrets", [], |row| row.get(0))
+            .expect("count");
         assert_eq!(secret_count, 0);
     }
 
     #[test]
-    fn packaged_google_config_bootstraps_clean_app_data_without_secrets() {
+    fn runtime_provisioning_preserves_existing_dpapi_session_and_does_not_process_outbox() {
+        let temp = tempdir().expect("tempdir");
+        let settings_dir = temp.path().join("settings");
+        fs::create_dir_all(&settings_dir).expect("settings");
+        let (_database_temp, connection) = open_temp();
+        let protector = services::secure_store::TestProtector;
+        let session = services::supabase::SupabaseSession {
+            access_token: "test-access-token".to_string(),
+            refresh_token: "test-refresh-token".to_string(),
+            expires_at: Some(123),
+        };
+        services::secure_store::store_supabase_session(&connection, &protector, &session)
+            .expect("store session");
+        let outbox_before: i64 = connection
+            .query_row("SELECT COUNT(*) FROM google_calendar_outbox", [], |row| {
+                row.get(0)
+            })
+            .expect("outbox count");
+        let packaged = parse_live_services_config(
+            r#"{"google":{"clientId":"packaged-client","calendarId":"primary"},"supabase":{"projectUrl":"https://project.example","publishableKey":"public-key-with-enough-length"}}"#,
+        )
+        .expect("packaged config");
+
+        provision_runtime_config(&settings_dir, &packaged).expect("provision");
+
+        let restored = services::secure_store::read_supabase_session(&connection, &protector)
+            .expect("read session")
+            .expect("session remains");
+        assert_eq!(restored.expires_at, session.expires_at);
+        assert_eq!(restored.access_token, session.access_token);
+        assert_eq!(restored.refresh_token, session.refresh_token);
+        let outbox_after: i64 = connection
+            .query_row("SELECT COUNT(*) FROM google_calendar_outbox", [], |row| {
+                row.get(0)
+            })
+            .expect("outbox count");
+        assert_eq!(outbox_after, outbox_before);
+    }
+
+    #[test]
+    fn packaged_runtime_config_bootstraps_clean_app_data_without_privileged_secrets() {
         let temp = tempdir().expect("tempdir");
         let settings_dir = temp.path().join("settings");
         fs::create_dir_all(&settings_dir).expect("settings");
         let packaged = parse_live_services_config(
-            r#"{"google":{"clientId":"packaged-client","calendarId":"primary"}}"#,
+            r#"{"google":{"clientId":"packaged-client","calendarId":"primary"},"supabase":{"projectUrl":"https://project.example","publishableKey":"public-key-with-enough-length"}}"#,
         )
         .expect("packaged config");
 
-        provision_google_runtime_config(&settings_dir, &packaged).expect("provision");
+        provision_runtime_config(&settings_dir, &packaged).expect("provision");
         let text = fs::read_to_string(settings_dir.join("live-services.json")).expect("config");
         let resolved = parse_live_services_config(&text).expect("resolved");
         assert_eq!(
-            google_oauth_config(resolved)
+            google_oauth_config(resolved.clone())
                 .expect("Google config")
                 .client_id,
             "packaged-client"
         );
-        for forbidden in ["clientSecret", "refreshToken", "accessToken", "supabase"] {
+        assert_eq!(
+            resolved.supabase.expect("Supabase config").project_url,
+            "https://project.example"
+        );
+        for forbidden in [
+            "clientSecret",
+            "refreshToken",
+            "accessToken",
+            "serviceRole",
+            "meta",
+        ] {
             assert!(!text.contains(forbidden));
         }
     }
 
     #[test]
-    fn packaged_google_default_never_contains_machine_or_provider_secrets() {
+    fn packaged_runtime_default_contains_only_expected_google_and_public_supabase_fields() {
         let packaged: serde_json::Value =
-            serde_json::from_str(PACKAGED_GOOGLE_RUNTIME_DEFAULT).expect("packaged default");
+            serde_json::from_str(PACKAGED_RUNTIME_DEFAULT).expect("packaged default");
         let google = packaged
             .get("google")
             .and_then(serde_json::Value::as_object);
@@ -5894,14 +6002,16 @@ mod tests {
                 .keys()
                 .all(|key| key == "clientId" || key == "clientSecret" || key == "calendarId"));
         }
-        let text = PACKAGED_GOOGLE_RUNTIME_DEFAULT.to_ascii_lowercase();
-        for forbidden in [
-            "refresh",
-            "access_token",
-            "supabase",
-            "service_role",
-            "whatsapp",
-        ] {
+        let supabase = packaged
+            .get("supabase")
+            .and_then(serde_json::Value::as_object);
+        if let Some(supabase) = supabase {
+            assert!(supabase
+                .keys()
+                .all(|key| key == "projectUrl" || key == "publishableKey"));
+        }
+        let text = PACKAGED_RUNTIME_DEFAULT.to_ascii_lowercase();
+        for forbidden in ["refresh", "access_token", "service_role", "whatsapp"] {
             assert!(!text.contains(forbidden));
         }
     }
@@ -6260,11 +6370,11 @@ mod tests {
             r#"{"google":{"clientId":"packaged-client","calendarId":"primary"}}"#,
         )
         .expect("packaged config");
-        provision_google_runtime_config(&settings_dir, &packaged).expect("provision");
+        provision_runtime_config(&settings_dir, &packaged).expect("provision");
         let path = settings_dir.join("live-services.json");
         let before = fs::read_to_string(&path).expect("config");
 
-        provision_google_runtime_config(&settings_dir, &packaged).expect("reconnect provision");
+        provision_runtime_config(&settings_dir, &packaged).expect("reconnect provision");
         assert_eq!(fs::read_to_string(path).expect("config"), before);
     }
 

@@ -46,7 +46,9 @@ test("release metadata stays synchronized and Windows release uses the GUI subsy
   assert.match(packageJson, /"version": "1\.1\.2"/);
   assert.match(cargoToml, /^version = "1\.1\.2"/m);
   assert.match(tauriConfig, /"version": "1\.1\.2"/);
+  assert.match(tauriConfig, /"identifier": "com\.beautysaloon\.desktop"/);
   assert.match(tauriConfig, /"installMode": "currentUser"/);
+  assert.match(tauriConfig, /"allowDowngrades": false/);
   assert.match(
     main,
     /cfg_attr\(all\(windows, not\(debug_assertions\)\), windows_subsystem = "windows"\)/,

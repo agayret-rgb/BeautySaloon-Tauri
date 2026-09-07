@@ -29,6 +29,7 @@
     "targets": "nsis",
     "icon": ["icons/icon.ico"],
     "windows": {
+      "allowDowngrades": false,
       "nsis": {
         "installMode": "currentUser"
       }
