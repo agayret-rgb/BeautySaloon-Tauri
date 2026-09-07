@@ -5567,12 +5567,33 @@ fn cloud_connection_status_with(
             validation_state: services::supabase::SupabaseSessionValidationState::Valid,
         }),
         Err(AppError::Validation(code)) if code == "SUPABASE_AUTH_INVALID" => {
-            services::secure_store::delete_secret(connection, "cloud_supabase_session")?;
-            Ok(services::supabase::SupabaseConnectionStatus {
-                configured: true,
-                session_present: false,
-                validation_state: services::supabase::SupabaseSessionValidationState::Disconnected,
-            })
+            match services::supabase::refresh_session(transport, config, &session.refresh_token) {
+                Ok(refreshed) => {
+                    services::secure_store::store_supabase_session(
+                        connection, protector, &refreshed,
+                    )?;
+                    Ok(services::supabase::SupabaseConnectionStatus {
+                        configured: true,
+                        session_present: true,
+                        validation_state: services::supabase::SupabaseSessionValidationState::Valid,
+                    })
+                }
+                Err(AppError::Validation(code)) if code == "SUPABASE_AUTH_INVALID" => {
+                    services::secure_store::delete_secret(connection, "cloud_supabase_session")?;
+                    Ok(services::supabase::SupabaseConnectionStatus {
+                        configured: true,
+                        session_present: false,
+                        validation_state:
+                            services::supabase::SupabaseSessionValidationState::Disconnected,
+                    })
+                }
+                Err(_) => Ok(services::supabase::SupabaseConnectionStatus {
+                    configured: true,
+                    session_present: true,
+                    validation_state:
+                        services::supabase::SupabaseSessionValidationState::Unavailable,
+                }),
+            }
         }
         Err(_) => Ok(services::supabase::SupabaseConnectionStatus {
             configured: true,
@@ -6515,6 +6536,57 @@ mod tests {
     }
 
     #[test]
+    fn cloud_session_validation_refreshes_expired_access_token() {
+        let (_temp, connection) = open_temp();
+        let protector = services::secure_store::TestProtector;
+        services::secure_store::store_supabase_session(
+            &connection,
+            &protector,
+            &test_supabase_session(),
+        )
+        .expect("store session");
+
+        let mut transport = services::google::FakeHttpTransport::new(vec![
+            services::google::HttpResponse {
+                status: 401,
+                body: br#"{"error":"expired_access_token"}"#.to_vec(),
+            },
+            services::google::HttpResponse {
+                status: 200,
+                body: br#"{"access_token":"refreshed-access","refresh_token":"refreshed-refresh","expires_at":1800000000}"#
+                    .to_vec(),
+            },
+        ]);
+
+        let status = cloud_connection_status_with(
+            &connection,
+            &protector,
+            Some(&test_supabase_config()),
+            &mut transport,
+        )
+        .expect("status");
+
+        assert!(status.configured && status.session_present);
+        assert_eq!(
+            status.validation_state,
+            services::supabase::SupabaseSessionValidationState::Valid
+        );
+
+        let stored = services::secure_store::read_supabase_session(&connection, &protector)
+            .expect("read session")
+            .expect("stored refreshed session");
+
+        assert_eq!(stored.access_token, "refreshed-access");
+        assert_eq!(stored.refresh_token, "refreshed-refresh");
+
+        assert_eq!(transport.requests.len(), 2);
+        assert!(transport.requests[0].url.ends_with("/auth/v1/user"));
+        assert!(transport.requests[1]
+            .url
+            .contains("grant_type=refresh_token"));
+    }
+
+    #[test]
     fn cloud_session_validation_clears_only_authoritatively_invalid_session() {
         let (_temp, connection) = open_temp();
         let protector = services::secure_store::TestProtector;
@@ -6536,11 +6608,16 @@ mod tests {
                 row.get(0)
             })
             .expect("google outbox count");
-        let mut transport =
-            services::google::FakeHttpTransport::new(vec![services::google::HttpResponse {
+        let mut transport = services::google::FakeHttpTransport::new(vec![
+            services::google::HttpResponse {
                 status: 401,
-                body: br#"{"error":"unauthorized"}"#.to_vec(),
-            }]);
+                body: br#"{"error":"expired_access_token"}"#.to_vec(),
+            },
+            services::google::HttpResponse {
+                status: 401,
+                body: br#"{"error":"invalid_refresh_token"}"#.to_vec(),
+            },
+        ]);
 
         let status = cloud_connection_status_with(
             &connection,
@@ -6611,6 +6688,55 @@ mod tests {
                 .is_some()
         );
         assert!(!transport.requests[0].url.contains("/functions/v1/"));
+    }
+
+    #[test]
+    fn cloud_session_validation_preserves_session_when_refresh_is_temporarily_unavailable() {
+        let (_temp, connection) = open_temp();
+        let protector = services::secure_store::TestProtector;
+        services::secure_store::store_supabase_session(
+            &connection,
+            &protector,
+            &test_supabase_session(),
+        )
+        .expect("store session");
+
+        let mut transport = services::google::FakeHttpTransport::new(vec![
+            services::google::HttpResponse {
+                status: 401,
+                body: br#"{"error":"expired_access_token"}"#.to_vec(),
+            },
+            services::google::HttpResponse {
+                status: 503,
+                body: Vec::new(),
+            },
+        ]);
+
+        let status = cloud_connection_status_with(
+            &connection,
+            &protector,
+            Some(&test_supabase_config()),
+            &mut transport,
+        )
+        .expect("status");
+
+        assert!(status.session_present);
+        assert_eq!(
+            status.validation_state,
+            services::supabase::SupabaseSessionValidationState::Unavailable
+        );
+
+        let stored = services::secure_store::read_supabase_session(&connection, &protector)
+            .expect("read session")
+            .expect("preserved session");
+
+        assert_eq!(stored.access_token, "test-access-token");
+        assert_eq!(stored.refresh_token, "test-refresh-token");
+
+        assert_eq!(transport.requests.len(), 2);
+        assert!(transport.requests[1]
+            .url
+            .contains("grant_type=refresh_token"));
     }
 
     fn seed_core(connection: &mut Connection) -> (Customer, Staff, ServiceItem) {
