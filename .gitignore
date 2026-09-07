@@ -9,4 +9,6 @@ runtime-*.png
 *.tmp
 src-tauri/live-services.local.json
 src-tauri/live-services.local.*.json
+src-tauri/.local-secrets/
+src-tauri/target-*-diagnostic/
 supabase/.temp/

@@ -1,7 +1,10 @@
 use crate::{utc_iso, AppError, AppointmentSummary};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use url::Url;
 
@@ -106,10 +109,125 @@ pub struct GoogleTokenSet {
     pub access_token: Option<String>,
 }
 
+pub fn token_exchange_failure_code(response: &HttpResponse) -> String {
+    let response_data = serde_json::from_slice::<Value>(&response.body).ok();
+    let oauth_error = response_data
+        .as_ref()
+        .and_then(|data| data.get("error").and_then(Value::as_str).map(str::to_owned))
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || character == '_' || character == '-'
+                })
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let description_category = response_data
+        .as_ref()
+        .and_then(|data| data.get("error_description").and_then(Value::as_str))
+        .map(classify_token_error_description)
+        .unwrap_or("OTHER");
+    format!(
+        "GOOGLE_TOKEN_EXCHANGE_FAILED_HTTP:{}:{oauth_error}:{description_category}",
+        response.status
+    )
+}
+
+pub fn classify_token_error_description(description: &str) -> &'static str {
+    let text = description.to_ascii_lowercase();
+    let has_secret = text.contains("client_secret") || text.contains("client secret");
+    let missing = text.contains("missing") || text.contains("required") || text.contains("absent");
+    let invalid = text.contains("invalid") || text.contains("incorrect");
+    if has_secret && missing {
+        "CLIENT_SECRET_MISSING"
+    } else if has_secret && invalid {
+        "CLIENT_SECRET_INVALID"
+    } else if text.contains("code_verifier")
+        || text.contains("code verifier")
+        || text.contains("pkce")
+    {
+        "CODE_VERIFIER_PROBLEM"
+    } else if text.contains("redirect_uri") || text.contains("redirect uri") {
+        "REDIRECT_URI_PROBLEM"
+    } else if text.contains("client_id") || text.contains("client id") {
+        "CLIENT_ID_PROBLEM"
+    } else if text.contains("grant_type") || text.contains("grant type") {
+        "GRANT_TYPE_PROBLEM"
+    } else if text.contains("unsupported")
+        && (text.contains("authorization")
+            || text.contains("authentication")
+            || text.contains("auth method"))
+    {
+        "UNSUPPORTED_AUTH_METHOD"
+    } else if missing {
+        "MISSING_PARAMETER_OTHER"
+    } else {
+        "OTHER"
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PkceCodes {
+    pub verifier: String,
+    pub challenge: String,
+}
+
+pub fn is_valid_pkce_verifier(verifier: &str) -> bool {
+    (43..=128).contains(&verifier.len())
+        && verifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_' || c == '~')
+}
+
+pub fn derive_pkce_challenge(verifier: &str) -> String {
+    let hash = Sha256::digest(verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(hash)
+}
+
+fn secure_random_bytes(buffer: &mut [u8]) -> Result<(), AppError> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Security::Cryptography::{
+            BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        };
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if status != 0 {
+            return Err(AppError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        use std::io::Read;
+        let mut file = std::fs::File::open("/dev/urandom")?;
+        file.read_exact(buffer)?;
+        Ok(())
+    }
+}
+
+pub fn generate_pkce() -> Result<PkceCodes, AppError> {
+    let mut random_bytes = [0u8; 32];
+    secure_random_bytes(&mut random_bytes)?;
+    let verifier = URL_SAFE_NO_PAD.encode(random_bytes);
+    let challenge = derive_pkce_challenge(&verifier);
+    Ok(PkceCodes {
+        verifier,
+        challenge,
+    })
+}
+
 pub fn build_google_auth_url(
     client_id: &str,
     redirect_uri: &str,
     state: &str,
+    code_challenge: &str,
 ) -> Result<String, AppError> {
     let mut url = Url::parse(GOOGLE_AUTH_ENDPOINT)
         .map_err(|_| AppError::Validation("GOOGLE_AUTH_URL_INVALID".to_string()))?;
@@ -120,7 +238,9 @@ pub fn build_google_auth_url(
         .append_pair("scope", GOOGLE_CALENDAR_SCOPE)
         .append_pair("access_type", "offline")
         .append_pair("prompt", "consent")
-        .append_pair("state", state);
+        .append_pair("state", state)
+        .append_pair("code_challenge", code_challenge)
+        .append_pair("code_challenge_method", "S256");
     Ok(url.to_string())
 }
 
@@ -154,12 +274,23 @@ pub fn exchange_auth_code(
     config: &GoogleOAuthConfig,
     redirect_uri: &str,
     code: &str,
+    code_verifier: &str,
 ) -> Result<GoogleTokenSet, AppError> {
+    if config.client_id.trim().is_empty()
+        || redirect_uri.trim().is_empty()
+        || code.trim().is_empty()
+        || !is_valid_pkce_verifier(code_verifier)
+    {
+        return Err(AppError::Validation(
+            "GOOGLE_TOKEN_REQUEST_INVALID".to_string(),
+        ));
+    }
     let mut form = url::form_urlencoded::Serializer::new(String::new());
     form.append_pair("code", code)
         .append_pair("client_id", &config.client_id)
         .append_pair("redirect_uri", redirect_uri)
-        .append_pair("grant_type", "authorization_code");
+        .append_pair("grant_type", "authorization_code")
+        .append_pair("code_verifier", code_verifier);
     if !config.client_secret.trim().is_empty() {
         form.append_pair("client_secret", &config.client_secret);
     }
@@ -174,9 +305,7 @@ pub fn exchange_auth_code(
         body: body.into_bytes(),
     })?;
     if response.status != 200 {
-        return Err(AppError::Database(
-            "GOOGLE_CALENDAR_AUTH_REQUIRED".to_string(),
-        ));
+        return Err(AppError::Database(token_exchange_failure_code(&response)));
     }
     let data: Value = serde_json::from_slice(&response.body)
         .map_err(|_| AppError::Database("GOOGLE_TOKEN_RESPONSE_INVALID".to_string()))?;

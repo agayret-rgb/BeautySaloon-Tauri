@@ -4,9 +4,18 @@ use std::fs;
 use std::path::Path;
 
 fn safe_google_runtime_config() -> Option<Value> {
+    let desktop = fs::read_to_string(".local-secrets/google-desktop-oauth.json")
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.get("installed").cloned());
     let client_id = env::var("BEAUTYSALOON_GOOGLE_CLIENT_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            desktop
+                .as_ref()
+                .and_then(|value| value.get("client_id")?.as_str().map(str::to_owned))
+        })
         .or_else(|| {
             let path = Path::new("live-services.local.json");
             let text = fs::read_to_string(path).ok()?;
@@ -31,9 +40,14 @@ fn safe_google_runtime_config() -> Option<Value> {
                 .filter(|value| !value.trim().is_empty())
         });
 
+    let client_secret = desktop
+        .as_ref()
+        .and_then(|value| value.get("client_secret")?.as_str())
+        .filter(|value| !value.trim().is_empty())?;
     Some(json!({
         "google": {
             "clientId": client_id,
+            "clientSecret": client_secret,
             "calendarId": calendar_id,
         }
     }))
@@ -43,6 +57,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BEAUTYSALOON_GOOGLE_CLIENT_ID");
     println!("cargo:rerun-if-env-changed=BEAUTYSALOON_GOOGLE_CALENDAR_ID");
     println!("cargo:rerun-if-changed=live-services.local.json");
+    println!("cargo:rerun-if-changed=.local-secrets/google-desktop-oauth.json");
 
     let default_config = match safe_google_runtime_config() {
         Some(config) => config,

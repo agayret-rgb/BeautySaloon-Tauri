@@ -1,6 +1,7 @@
 use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Utc};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -29,6 +30,7 @@ const AUTOMATIC_BACKUP_INTERVAL: StdDuration = StdDuration::from_secs(15 * 60);
 const AUTOMATIC_REMINDER_INTERVAL: StdDuration = StdDuration::from_secs(15 * 60);
 const SHUTDOWN_BACKUP_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const SHUTDOWN_BACKUP_POLL_INTERVAL: StdDuration = StdDuration::from_millis(25);
+const GOOGLE_OAUTH_CALLBACK_TIMEOUT: StdDuration = StdDuration::from_secs(15 * 60);
 const PACKAGED_GOOGLE_RUNTIME_DEFAULT: &str =
     include_str!(concat!(env!("OUT_DIR"), "/google-runtime-default.json"));
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -295,6 +297,8 @@ impl BackupCoordinator {
 #[serde(rename_all = "camelCase")]
 struct GoogleRuntimeConfig {
     client_id: String,
+    #[serde(default)]
+    client_secret: Option<String>,
     calendar_id: Option<String>,
 }
 
@@ -302,7 +306,7 @@ impl GoogleRuntimeConfig {
     fn into_oauth_config(self) -> services::google::GoogleOAuthConfig {
         services::google::GoogleOAuthConfig {
             client_id: self.client_id,
-            client_secret: String::new(),
+            client_secret: self.client_secret.unwrap_or_default(),
             calendar_id: self.calendar_id,
         }
     }
@@ -4912,8 +4916,13 @@ fn load_live_services_config() -> Result<LiveServicesConfig, AppError> {
         .ok()
         .filter(|value| !value.trim().is_empty());
     if let Some(client_id) = google_client_id {
+        let client_secret = config
+            .google
+            .as_ref()
+            .and_then(|google| google.client_secret.clone());
         config.google = Some(GoogleRuntimeConfig {
             client_id,
+            client_secret,
             calendar_id: std::env::var("BEAUTYSALOON_GOOGLE_CALENDAR_ID")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
@@ -4940,8 +4949,13 @@ fn merge_live_services_config(target: &mut LiveServicesConfig, source: Option<Li
     let Some(source) = source else {
         return;
     };
-    if source.google.is_some() {
-        target.google = source.google;
+    if let Some(source_google) = source.google {
+        if let Some(target_google) = target.google.as_mut() {
+            target_google.client_id = source_google.client_id;
+            target_google.calendar_id = source_google.calendar_id;
+        } else {
+            target.google = Some(source_google);
+        }
     }
     if source.supabase.is_some() {
         target.supabase = source.supabase;
@@ -5009,14 +5023,45 @@ fn provision_google_runtime_config(
     settings_dir: &Path,
     packaged: &LiveServicesConfig,
 ) -> Result<(), AppError> {
+    provision_google_runtime_config_for_fingerprint(
+        settings_dir,
+        packaged,
+        LEGACY_GOOGLE_CLIENT_FINGERPRINT,
+    )
+}
+
+fn provision_google_runtime_config_for_fingerprint(
+    settings_dir: &Path,
+    packaged: &LiveServicesConfig,
+    legacy_fingerprint: &str,
+) -> Result<(), AppError> {
     if packaged.google.is_none() {
         return Ok(());
     }
     let destination = settings_dir.join("live-services.json");
     if destination.exists() {
+        let mut existing: serde_json::Value = serde_json::from_slice(&fs::read(&destination)?)
+            .map_err(|_| AppError::Validation("LIVE_SERVICE_CONFIG_INVALID".to_string()))?;
+        let current = existing
+            .pointer("/google/clientId")
+            .and_then(serde_json::Value::as_str);
+        if current.is_some_and(|client_id| {
+            legacy_google_client_fingerprint(client_id) == legacy_fingerprint
+        }) {
+            existing["google"]["clientId"] = serde_json::Value::String(
+                packaged.google.as_ref().expect("checked").client_id.clone(),
+            );
+            fs::write(
+                &destination,
+                serde_json::to_vec_pretty(&existing).map_err(|_| {
+                    AppError::Validation("GOOGLE_RUNTIME_DEFAULT_INVALID".to_string())
+                })?,
+            )?;
+        }
         return Ok(());
     }
-    let safe_config = serde_json::json!({ "google": packaged.google });
+    let google = packaged.google.as_ref().expect("checked");
+    let safe_config = serde_json::json!({ "google": { "clientId": google.client_id, "calendarId": google.calendar_id } });
     let temporary = destination.with_extension("json.tmp");
     fs::write(
         &temporary,
@@ -5025,6 +5070,11 @@ fn provision_google_runtime_config(
     )?;
     fs::rename(temporary, destination)?;
     Ok(())
+}
+
+const LEGACY_GOOGLE_CLIENT_FINGERPRINT: &str = "0d8e294fc461";
+fn legacy_google_client_fingerprint(client_id: &str) -> String {
+    format!("{:x}", Sha256::digest(client_id.as_bytes()))[..12].to_string()
 }
 
 fn google_config() -> Result<services::google::GoogleOAuthConfig, AppError> {
@@ -5116,16 +5166,26 @@ async fn google_calendar_connect(
         );
         safe_diagnostic("GOOGLE_CONNECT_LISTENER_BOUND");
         let state_token = new_uuid();
-        let auth_url =
-            services::google::build_google_auth_url(&config.client_id, &redirect_uri, &state_token)?;
+        let pkce = services::google::generate_pkce()?;
+        let auth_url = services::google::build_google_auth_url(
+            &config.client_id,
+            &redirect_uri,
+            &state_token,
+            &pkce.challenge,
+        )?;
         validate_oauth_redirect_uri(&auth_url, &redirect_uri)?;
         open_system_browser(&auth_url)?;
         let callback_url =
-            wait_for_oauth_callback(&listener, &redirect_uri, StdDuration::from_secs(120))?;
+            wait_for_oauth_callback(&listener, &redirect_uri, GOOGLE_OAUTH_CALLBACK_TIMEOUT)?;
         let code = services::google::parse_oauth_callback(&callback_url, &state_token)?;
         let mut transport = services::google::ReqwestHttpTransport;
-        let token_set =
-            services::google::exchange_auth_code(&mut transport, &config, &redirect_uri, &code)?;
+        let token_set = services::google::exchange_auth_code(
+            &mut transport,
+            &config,
+            &redirect_uri,
+            &code,
+            &pkce.verifier,
+        )?;
         let calendar_id = config
             .calendar_id
             .clone()
@@ -5359,7 +5419,7 @@ fn wait_for_oauth_callback(
     timeout: StdDuration,
 ) -> Result<String, AppError> {
     let started = Instant::now();
-    while started.elapsed() < timeout {
+    while oauth_callback_window_open(started.elapsed(), timeout) {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let _ = stream.set_nonblocking(false);
@@ -5422,6 +5482,10 @@ fn wait_for_oauth_callback(
         }
     }
     Err(AppError::Validation("GOOGLE_OAUTH_TIMEOUT".to_string()))
+}
+
+fn oauth_callback_window_open(elapsed: StdDuration, timeout: StdDuration) -> bool {
+    elapsed < timeout
 }
 
 #[tauri::command]
@@ -5746,6 +5810,55 @@ mod tests {
     }
 
     #[test]
+    fn desktop_client_provisioning_migrates_only_legacy_and_never_writes_secret() {
+        let temp = tempdir().expect("temp");
+        let packaged = parse_live_services_config(r#"{"google":{"clientId":"new-client","clientSecret":"native-secret","calendarId":"primary"}}"#).expect("packaged");
+        let legacy = "legacy-client";
+        let fingerprint = legacy_google_client_fingerprint(legacy);
+        let settings = temp.path().join("legacy");
+        fs::create_dir_all(&settings).expect("settings");
+        fs::write(
+            settings.join("live-services.json"),
+            format!(
+                r#"{{"google":{{"clientId":"{legacy}","calendarId":"kept"}},"unrelated":true}}"#
+            ),
+        )
+        .expect("legacy config");
+        provision_google_runtime_config_for_fingerprint(&settings, &packaged, &fingerprint)
+            .expect("migrate");
+        let migrated = fs::read_to_string(settings.join("live-services.json")).expect("read");
+        assert!(
+            migrated.contains("new-client")
+                && migrated.contains("kept")
+                && migrated.contains("unrelated")
+        );
+        assert!(!migrated.contains("native-secret") && !migrated.contains("clientSecret"));
+
+        let custom = temp.path().join("custom");
+        fs::create_dir_all(&custom).expect("custom settings");
+        fs::write(
+            custom.join("live-services.json"),
+            r#"{"google":{"clientId":"custom-client"}}"#,
+        )
+        .expect("custom config");
+        provision_google_runtime_config_for_fingerprint(&custom, &packaged, &fingerprint)
+            .expect("preserve custom");
+        assert!(fs::read_to_string(custom.join("live-services.json"))
+            .expect("custom read")
+            .contains("custom-client"));
+
+        let clean = temp.path().join("clean");
+        fs::create_dir_all(&clean).expect("clean settings");
+        provision_google_runtime_config_for_fingerprint(&clean, &packaged, &fingerprint)
+            .expect("clean provision");
+        let clean_text = fs::read_to_string(clean.join("live-services.json")).expect("clean read");
+        assert!(clean_text.contains("new-client") && !clean_text.contains("native-secret"));
+        let (_db_temp, connection) = open_temp();
+        let secret_count: i64 = connection.query_row("SELECT COUNT(*) FROM secure_secrets WHERE secret_key='google_calendar_client_secret'", [], |row| row.get(0)).expect("count");
+        assert_eq!(secret_count, 0);
+    }
+
+    #[test]
     fn packaged_google_config_bootstraps_clean_app_data_without_secrets() {
         let temp = tempdir().expect("tempdir");
         let settings_dir = temp.path().join("settings");
@@ -5779,11 +5892,10 @@ mod tests {
         if let Some(google) = google {
             assert!(google
                 .keys()
-                .all(|key| key == "clientId" || key == "calendarId"));
+                .all(|key| key == "clientId" || key == "clientSecret" || key == "calendarId"));
         }
         let text = PACKAGED_GOOGLE_RUNTIME_DEFAULT.to_ascii_lowercase();
         for forbidden in [
-            "clientsecret",
             "refresh",
             "access_token",
             "supabase",
@@ -5815,6 +5927,328 @@ mod tests {
     fn missing_google_config_returns_the_existing_safe_error() {
         let error = google_oauth_config(LiveServicesConfig::default()).expect_err("missing config");
         assert!(error.to_string().contains("GOOGLE_CONFIG_MISSING"));
+    }
+
+    #[test]
+    fn token_exchange_diagnostics_classify_only_http_status_and_oauth_error() {
+        let config = services::google::GoogleOAuthConfig {
+            client_id: "client-id".into(),
+            client_secret: String::new(),
+            calendar_id: Some("primary".into()),
+        };
+        let cases = [
+            (
+                401,
+                br#"{"error":"invalid_client","error_description":"authorization-code=secret-code"}"#.to_vec(),
+                "TOKEN_EXCHANGE_FAILED_HTTP:401:invalid_client:OTHER",
+            ),
+            (
+                400,
+                br#"{"error":"invalid_grant","error_description":"refresh_token=secret-token"}"#.to_vec(),
+                "TOKEN_EXCHANGE_FAILED_HTTP:400:invalid_grant:OTHER",
+            ),
+            (
+                400,
+                b"not-json access_token=secret-token".to_vec(),
+                "TOKEN_EXCHANGE_FAILED_HTTP:400:unknown:OTHER",
+            ),
+            (
+                400,
+                br#"{"error":"unsafe error with email user@example.com"}"#.to_vec(),
+                "TOKEN_EXCHANGE_FAILED_HTTP:400:unknown:OTHER",
+            ),
+        ];
+
+        for (status, body, expected_marker) in cases {
+            let mut transport =
+                services::google::FakeHttpTransport::new(vec![services::google::HttpResponse {
+                    status,
+                    body,
+                }]);
+            let error = services::google::exchange_auth_code(
+                &mut transport,
+                &config,
+                "http://127.0.0.1:4444/oauth2callback",
+                "authorization-code",
+                "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+            )
+            .expect_err("non-success token response");
+            let marker = match error {
+                AppError::Database(code) => code,
+                other => panic!("expected database error, got {other}"),
+            };
+            assert_eq!(marker, format!("GOOGLE_{expected_marker}"));
+            for forbidden in [
+                "authorization-code",
+                "secret-code",
+                "secret-token",
+                "error_description",
+                "access_token",
+                "refresh_token",
+                "user@example.com",
+                "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+            ] {
+                assert!(!marker.contains(forbidden));
+            }
+        }
+
+        for (description, expected) in [
+            ("client_secret is missing", "CLIENT_SECRET_MISSING"),
+            ("client secret is invalid", "CLIENT_SECRET_INVALID"),
+            ("code_verifier does not match pkce", "CODE_VERIFIER_PROBLEM"),
+            ("redirect_uri is invalid", "REDIRECT_URI_PROBLEM"),
+            ("client_id is invalid", "CLIENT_ID_PROBLEM"),
+            ("unexpected response", "OTHER"),
+        ] {
+            assert_eq!(
+                services::google::classify_token_error_description(description),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn reqwest_transport_emits_form_content_type_on_wire() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local mock");
+        let endpoint = format!(
+            "http://127.0.0.1:{}/token",
+            listener.local_addr().expect("local address").port()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).expect("read request");
+                assert!(read > 0, "request must not end before headers");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let wire = String::from_utf8(request).expect("request header utf8");
+            let mut lines = wire.split("\r\n");
+            assert_eq!(lines.next(), Some("POST /token HTTP/1.1"));
+            assert!(lines.any(|line| {
+                line.eq_ignore_ascii_case("content-type: application/x-www-form-urlencoded")
+            }));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .expect("send response");
+        });
+
+        let mut transport = services::google::ReqwestHttpTransport;
+        let response = transport
+            .send(services::google::HttpRequest {
+                method: "POST".to_string(),
+                url: endpoint,
+                headers: vec![(
+                    "Content-Type".to_string(),
+                    "application/x-www-form-urlencoded".to_string(),
+                )],
+                body: b"code=placeholder&client_id=placeholder&redirect_uri=placeholder&grant_type=authorization_code&code_verifier=placeholder".to_vec(),
+            })
+            .expect("local form request");
+        assert_eq!(response.status, 200);
+        server.join().expect("local mock server");
+    }
+
+    #[test]
+    fn google_oauth_pkce_contract_and_verifier_privacy() {
+        // 1. Verifier is RFC 7636 valid
+        let pkce1 = services::google::generate_pkce().expect("pkce1");
+        assert!(services::google::is_valid_pkce_verifier(&pkce1.verifier));
+        assert!(pkce1.verifier.len() >= 43 && pkce1.verifier.len() <= 128);
+        assert!(pkce1.verifier.chars().all(|c| {
+            c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_' || c == '~'
+        }));
+
+        // 2. Two attempts produce different verifiers and challenges
+        let pkce2 = services::google::generate_pkce().expect("pkce2");
+        assert_ne!(pkce1.verifier, pkce2.verifier);
+        assert_ne!(pkce1.challenge, pkce2.challenge);
+
+        // 3. S256 challenge is correct (RFC 7636 Appendix B test vector)
+        let rfc_verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let rfc_expected_challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        assert_eq!(
+            services::google::derive_pkce_challenge(rfc_verifier),
+            rfc_expected_challenge
+        );
+        assert_eq!(
+            services::google::derive_pkce_challenge(&pkce1.verifier),
+            pkce1.challenge
+        );
+
+        // 4. Auth URL contains challenge + S256 and required offline access parameters
+        let redirect_uri = "http://127.0.0.1:4444/oauth2callback";
+        let auth_url_str = services::google::build_google_auth_url(
+            "client-id-123",
+            redirect_uri,
+            "state-abc",
+            &pkce1.challenge,
+        )
+        .expect("auth url");
+        let auth_url = url::Url::parse(&auth_url_str).expect("parse auth url");
+        let query_pairs: std::collections::HashMap<String, String> =
+            auth_url.query_pairs().into_owned().collect();
+        assert_eq!(query_pairs.get("code_challenge"), Some(&pkce1.challenge));
+        assert_eq!(
+            query_pairs.get("code_challenge_method"),
+            Some(&"S256".to_string())
+        );
+        assert_eq!(
+            query_pairs.get("client_id"),
+            Some(&"client-id-123".to_string())
+        );
+        assert_eq!(
+            query_pairs.get("redirect_uri"),
+            Some(&redirect_uri.to_string())
+        );
+        assert_eq!(query_pairs.get("response_type"), Some(&"code".to_string()));
+        assert_eq!(
+            query_pairs.get("scope"),
+            Some(&services::google::GOOGLE_CALENDAR_SCOPE.to_string())
+        );
+        assert_eq!(query_pairs.get("access_type"), Some(&"offline".to_string()));
+        assert_eq!(query_pairs.get("prompt"), Some(&"consent".to_string()));
+        assert_eq!(query_pairs.get("state"), Some(&"state-abc".to_string()));
+
+        // 5. Token request contains matching code_verifier and does NOT contain client_secret
+        let config = services::google::GoogleOAuthConfig {
+            client_id: "client-id-123".into(),
+            client_secret: String::new(), // desktop app flow has no client secret
+            calendar_id: Some("primary".into()),
+        };
+        let mut transport =
+            services::google::FakeHttpTransport::new(vec![services::google::HttpResponse {
+                status: 200,
+                body: br#"{"refresh_token":"secret-refresh-1","access_token":"secret-access-1"}"#
+                    .to_vec(),
+            }]);
+        let _tokens = services::google::exchange_auth_code(
+            &mut transport,
+            &config,
+            redirect_uri,
+            "auth-code-xyz",
+            &pkce1.verifier,
+        )
+        .expect("token exchange");
+
+        assert_eq!(transport.requests.len(), 1);
+        let request = &transport.requests[0];
+        let body_str = String::from_utf8(request.body.clone()).expect("utf8 form body");
+        let form_pairs = url::form_urlencoded::parse(request.body.as_slice())
+            .into_owned()
+            .collect::<Vec<_>>();
+        let form_params: std::collections::HashMap<String, String> =
+            form_pairs.iter().cloned().collect();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.url, services::google::GOOGLE_TOKEN_ENDPOINT);
+        assert!(request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type")
+                && value.eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        }));
+        assert_eq!(form_pairs.len(), 5);
+        for required in [
+            "code",
+            "client_id",
+            "redirect_uri",
+            "grant_type",
+            "code_verifier",
+        ] {
+            assert_eq!(
+                form_pairs
+                    .iter()
+                    .filter(|(name, _)| name == required)
+                    .count(),
+                1,
+                "required parameter appears exactly once"
+            );
+            assert!(
+                form_params
+                    .get(required)
+                    .is_some_and(|value| !value.trim().is_empty()),
+                "required parameter is non-empty"
+            );
+        }
+        assert_eq!(form_params.get("code"), Some(&"auth-code-xyz".to_string()));
+        assert_eq!(
+            form_params.get("client_id"),
+            Some(&"client-id-123".to_string())
+        );
+        assert_eq!(
+            form_params.get("redirect_uri"),
+            Some(&redirect_uri.to_string())
+        );
+        assert_eq!(
+            form_params.get("redirect_uri"),
+            query_pairs.get("redirect_uri")
+        );
+        assert_eq!(
+            form_params.get("grant_type"),
+            Some(&"authorization_code".to_string())
+        );
+        assert_eq!(form_params.get("code_verifier"), Some(&pkce1.verifier));
+        assert!(!form_params.contains_key("client_secret"));
+        assert!(!body_str.contains("client_secret"));
+
+        // 6. Invalid required inputs fail before a network request is created.
+        for (client_id, candidate_redirect_uri, authorization_code, verifier) in [
+            ("", redirect_uri, "auth-code", pkce1.verifier.as_str()),
+            ("client-id", "", "auth-code", pkce1.verifier.as_str()),
+            ("client-id", redirect_uri, "", pkce1.verifier.as_str()),
+            ("client-id", redirect_uri, "auth-code", "short"),
+        ] {
+            let config = services::google::GoogleOAuthConfig {
+                client_id: client_id.to_string(),
+                client_secret: String::new(),
+                calendar_id: Some("primary".into()),
+            };
+            let mut transport = services::google::FakeHttpTransport::new(vec![]);
+            let error = services::google::exchange_auth_code(
+                &mut transport,
+                &config,
+                candidate_redirect_uri,
+                authorization_code,
+                verifier,
+            )
+            .expect_err("invalid token request must fail before transport");
+            assert!(
+                matches!(error, AppError::Validation(code) if code == "GOOGLE_TOKEN_REQUEST_INVALID")
+            );
+            assert!(transport.requests.is_empty());
+        }
+
+        // 7. The safe token error code cannot contain PKCE material.
+        let safe_error_code =
+            services::google::token_exchange_failure_code(&services::google::HttpResponse {
+                status: 400,
+                body: br#"{\"error\":\"invalid_request\"}"#.to_vec(),
+            });
+        assert!(!safe_error_code.contains(&pkce1.verifier));
+        assert!(!safe_error_code.contains(&pkce1.challenge));
+
+        // 8. Verifier is never persisted in database
+        let (_temp, connection) = open_temp();
+        let count_verifier_secrets: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM secure_secrets WHERE secret_key LIKE ?1 OR encrypted_value LIKE ?1",
+                params![format!("%{}%", pkce1.verifier)],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        assert_eq!(count_verifier_secrets, 0);
+
+        // 9. Timeout/failure clears attempt state
+        {
+            let _guard = try_acquire_google_connect_guard().expect("acquire guard");
+        }
+        let reacquired = try_acquire_google_connect_guard().expect("reacquire guard after release");
+        drop(reacquired);
+
+        // 10. Redirect URI remains unchanged and validates
+        assert!(validate_oauth_redirect_uri(&auth_url_str, redirect_uri).is_ok());
     }
 
     #[test]
@@ -7792,6 +8226,7 @@ mod tests {
             "client-id",
             "http://127.0.0.1:4444/oauth2callback",
             "state-1",
+            "challenge-1",
         )
         .expect("auth url");
         assert!(
@@ -7844,6 +8279,7 @@ mod tests {
             &config,
             "http://127.0.0.1:4444/oauth2callback",
             "abc",
+            "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
         )
         .expect("exchange");
         assert_eq!(tokens.refresh_token, "refresh-1");
@@ -11613,6 +12049,40 @@ mod tests {
         let result =
             wait_for_oauth_callback(&listener, &redirect_uri, StdDuration::from_millis(50));
         assert!(matches!(result, Err(AppError::Validation(msg)) if msg == "GOOGLE_OAUTH_TIMEOUT"));
+    }
+
+    #[test]
+    fn oauth_callback_window_allows_consent_beyond_the_old_two_minute_limit() {
+        assert_eq!(
+            GOOGLE_OAUTH_CALLBACK_TIMEOUT,
+            StdDuration::from_secs(15 * 60)
+        );
+        assert!(oauth_callback_window_open(
+            StdDuration::from_secs(121),
+            GOOGLE_OAUTH_CALLBACK_TIMEOUT
+        ));
+        assert!(!oauth_callback_window_open(
+            GOOGLE_OAUTH_CALLBACK_TIMEOUT,
+            GOOGLE_OAUTH_CALLBACK_TIMEOUT
+        ));
+    }
+
+    #[test]
+    fn oauth_timeout_releases_the_connect_guard() {
+        {
+            let _guard = try_acquire_google_connect_guard().expect("acquire guard");
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let port = listener.local_addr().expect("port").port();
+            let redirect_uri = format!("http://127.0.0.1:{port}/oauth2callback");
+            let result =
+                wait_for_oauth_callback(&listener, &redirect_uri, StdDuration::from_millis(1));
+            assert!(
+                matches!(result, Err(AppError::Validation(msg)) if msg == "GOOGLE_OAUTH_TIMEOUT")
+            );
+        }
+        let guard = try_acquire_google_connect_guard().expect("guard released after timeout");
+        drop(guard);
     }
 
     #[test]
