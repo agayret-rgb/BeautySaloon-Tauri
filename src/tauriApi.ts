@@ -18,6 +18,8 @@ export interface AppointmentSummary {
   totalDurationMinutes: number;
   status: string;
   note: string | null;
+  whatsappReminderEnabled: boolean;
+  whatsappReminderEffective: boolean;
   customerName: string;
   customerPhone: string | null;
   staffName: string;
@@ -219,6 +221,7 @@ export interface AppointmentInput {
   serviceIds: string[];
   status?: string;
   note?: string | null;
+  whatsappReminderEnabled?: boolean;
 }
 
 export interface GoogleConnectionStatus {

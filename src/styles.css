@@ -316,6 +316,12 @@ p {
   font-weight: 700;
   white-space: nowrap;
 }
+.whatsapp-reminder-indicator {
+  color: #1d6256;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
 .status-completed {
   color: #1d6256;
   background: #dff0e9;

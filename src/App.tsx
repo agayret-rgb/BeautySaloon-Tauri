@@ -277,6 +277,7 @@ type BookingDraft = {
   customerQuery: string;
   phone: string;
   whatsappConsent: boolean;
+  whatsappReminderEnabled: boolean;
   serviceIds: string[];
   staffId: string;
   localDate: string;
@@ -288,6 +289,7 @@ type AppointmentEditDraft = {
   localStartTime: string;
   staffId: string;
   serviceIds: string[];
+  whatsappReminderEnabled: boolean;
 };
 
 export function App() {
@@ -310,6 +312,8 @@ export function App() {
   const [editTime, setEditTime] = useState("");
   const [editStaffId, setEditStaffId] = useState("");
   const [editServiceIds, setEditServiceIds] = useState<string[]>([]);
+  const [editWhatsappReminderEnabled, setEditWhatsappReminderEnabled] =
+    useState(true);
   const [editStaff, setEditStaff] = useState<Staff[]>([]);
   const [editServices, setEditServices] = useState<ServiceItem[]>([]);
   const [editError, setEditError] = useState("");
@@ -338,6 +342,7 @@ export function App() {
   );
   const [phone, setPhone] = useState("");
   const [whatsappConsent, setWhatsappConsent] = useState(false);
+  const [whatsappReminderEnabled, setWhatsappReminderEnabled] = useState(true);
   const [services, setServices] = useState<ServiceItem[]>([]);
   const [staff, setStaff] = useState<Staff[]>([]);
   const [serviceIds, setServiceIds] = useState<string[]>([]);
@@ -794,6 +799,7 @@ export function App() {
     setCustomerPickerOpen(false);
     setPhone("");
     setWhatsappConsent(false);
+    setWhatsappReminderEnabled(true);
     setServiceIds([]);
     setStaffId("");
     setLocalDate(todayLocalDate());
@@ -815,6 +821,7 @@ export function App() {
       setCustomerQuery(customer ? customerName(customer) : "");
       setPhone(customer?.phone ?? "");
       setWhatsappConsent(false);
+      setWhatsappReminderEnabled(true);
       setServiceIds(nextServiceIds);
       setStaffId(nextStaffId);
       setLocalDate(nextLocalDate);
@@ -824,6 +831,7 @@ export function App() {
         customerQuery: customer ? customerName(customer) : "",
         phone: customer?.phone ?? "",
         whatsappConsent: false,
+        whatsappReminderEnabled: true,
         serviceIds: nextServiceIds,
         staffId: nextStaffId,
         localDate: nextLocalDate,
@@ -957,6 +965,7 @@ export function App() {
         serviceIds,
         status: "planned",
         note: null,
+        whatsappReminderEnabled,
       });
       resetBooking();
       setBookingOpen(false);
@@ -984,6 +993,7 @@ export function App() {
     localStartTime,
     phone,
     whatsappConsent,
+    whatsappReminderEnabled,
     resetBooking,
     selectedCustomer,
     serviceIds,
@@ -1037,11 +1047,13 @@ export function App() {
       setEditStaffId(appointment.staffId);
       const serviceIds = appointment.services.map((service) => service.serviceId);
       setEditServiceIds(serviceIds);
+      setEditWhatsappReminderEnabled(appointment.whatsappReminderEnabled);
       setEditInitialDraft({
         localDate: local.localDate,
         localStartTime: local.localStartTime,
         staffId: appointment.staffId,
         serviceIds,
+        whatsappReminderEnabled: appointment.whatsappReminderEnabled,
       });
       setEditError("");
       try {
@@ -1066,6 +1078,7 @@ export function App() {
     setEditTime("");
     setEditStaffId("");
     setEditServiceIds([]);
+    setEditWhatsappReminderEnabled(true);
   }, []);
 
   const saveAppointmentEdit = useCallback(async () => {
@@ -1085,6 +1098,7 @@ export function App() {
         serviceIds: editServiceIds,
         status: editingAppointment.status,
         note: editingAppointment.note,
+        whatsappReminderEnabled: editWhatsappReminderEnabled,
       });
       resetAppointmentEditor();
       await Promise.all([loadToday(), loadCalendar()]);
@@ -1098,6 +1112,7 @@ export function App() {
     editServiceIds,
     editStaffId,
     editTime,
+    editWhatsappReminderEnabled,
     editingAppointment,
     isEditSaving,
     loadCalendar,
@@ -1203,6 +1218,7 @@ export function App() {
       bookingInitialDraft.customerQuery !== customerQuery ||
       bookingInitialDraft.phone !== phone ||
       bookingInitialDraft.whatsappConsent !== whatsappConsent ||
+      bookingInitialDraft.whatsappReminderEnabled !== whatsappReminderEnabled ||
       !sameIds(bookingInitialDraft.serviceIds, serviceIds) ||
       bookingInitialDraft.staffId !== staffId ||
       bookingInitialDraft.localDate !== localDate ||
@@ -1214,6 +1230,7 @@ export function App() {
     (editInitialDraft.localDate !== editDate ||
       editInitialDraft.localStartTime !== editTime ||
       editInitialDraft.staffId !== editStaffId ||
+      editInitialDraft.whatsappReminderEnabled !== editWhatsappReminderEnabled ||
       !sameIds(editInitialDraft.serviceIds, editServiceIds));
 
   const completeRootNavigation = useCallback(
@@ -2119,6 +2136,17 @@ export function App() {
                   WhatsApp ile randevu hatırlatması gönderilebilir
                 </label>
               )}
+              <label className="archive-filter">
+                <input
+                  type="checkbox"
+                  checked={whatsappReminderEnabled}
+                  disabled={isSaving}
+                  onChange={(event) =>
+                    setWhatsappReminderEnabled(event.target.checked)
+                  }
+                />{" "}
+                Bu randevu için WhatsApp hatırlatması
+              </label>
               {selectedCustomer && (
                 <button
                   type="button"
@@ -2272,6 +2300,15 @@ export function App() {
                       >
                         {statusLabel(appointment.status)}
                       </span>
+                      {appointment.whatsappReminderEffective && (
+                        <span
+                          className="whatsapp-reminder-indicator"
+                          aria-label="WhatsApp hatırlatması uygun"
+                          title="WhatsApp hatırlatması uygun"
+                        >
+                          WhatsApp
+                        </span>
+                      )}
                     </div>
                     <p>
                       {appointment.services
@@ -3968,6 +4005,17 @@ export function App() {
                   disabled={isEditSaving}
                   onChange={(event) => setEditTime(event.target.value)}
                 />
+              </label>
+              <label className="archive-filter">
+                <input
+                  type="checkbox"
+                  checked={editWhatsappReminderEnabled}
+                  disabled={isEditSaving}
+                  onChange={(event) =>
+                    setEditWhatsappReminderEnabled(event.target.checked)
+                  }
+                />{" "}
+                Bu randevu için WhatsApp hatırlatması
               </label>
             </div>
             <div className="booking-actions">

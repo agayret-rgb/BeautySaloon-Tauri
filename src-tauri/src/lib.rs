@@ -23,7 +23,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 mod services;
 
-const CORE_SCHEMA_VERSION: i64 = 18;
+const CORE_SCHEMA_VERSION: i64 = 19;
 const ISTANBUL_OFFSET_MINUTES: i64 = 180;
 const APPOINTMENT_STATUS_CANCELLED: &str = "cancelled";
 const AUTOMATIC_BACKUP_INTERVAL: StdDuration = StdDuration::from_secs(15 * 60);
@@ -513,6 +513,8 @@ pub struct AppointmentSummary {
     total_duration_minutes: i64,
     status: String,
     note: Option<String>,
+    whatsapp_reminder_enabled: bool,
+    whatsapp_reminder_effective: bool,
     customer_name: String,
     customer_phone: Option<String>,
     staff_name: String,
@@ -580,6 +582,7 @@ pub struct AppointmentInput {
     service_ids: Vec<String>,
     status: Option<String>,
     note: Option<String>,
+    whatsapp_reminder_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -878,6 +881,7 @@ fn migrate_core(connection: &Connection) -> Result<(), AppError> {
           total_duration_minutes INTEGER NOT NULL CHECK (total_duration_minutes BETWEEN 5 AND 720),
           status TEXT NOT NULL DEFAULT 'planned' CHECK (status IN ('planned', 'confirmed', 'completed', 'cancelled', 'no_show')),
           note TEXT NULL CHECK (note IS NULL OR length(note) <= 2000),
+          whatsapp_reminder_enabled INTEGER NOT NULL DEFAULT 1 CHECK (whatsapp_reminder_enabled IN (0, 1)),
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
           CHECK (end_at_utc > start_at_utc),
@@ -1047,6 +1051,7 @@ fn migrate_core(connection: &Connection) -> Result<(), AppError> {
     migrate_v16_scheduling_schema(connection)?;
     migrate_v17_archive_and_audit_schema(connection)?;
     migrate_v18_business_profile_schema(connection)?;
+    migrate_v19_appointment_whatsapp_preference(connection)?;
     connection.execute(
         "UPDATE app_meta SET schema_version = ?1 WHERE schema_version < ?1",
         params![CORE_SCHEMA_VERSION],
@@ -1080,6 +1085,27 @@ fn migrate_v18_business_profile_schema(connection: &Connection) -> Result<(), Ap
              COMMIT;",
         )
         .map_err(Into::into)
+}
+
+fn migrate_v19_appointment_whatsapp_preference(connection: &Connection) -> Result<(), AppError> {
+    if read_schema_version(connection)? >= 19 {
+        return Ok(());
+    }
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<(), AppError> {
+        if !table_columns(connection, "appointments")?.contains("whatsapp_reminder_enabled") {
+            connection.execute(
+                "ALTER TABLE appointments ADD COLUMN whatsapp_reminder_enabled INTEGER NOT NULL DEFAULT 1 CHECK (whatsapp_reminder_enabled IN (0, 1))",
+                [],
+            )?;
+        }
+        connection.execute_batch("COMMIT;")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = connection.execute_batch("ROLLBACK;");
+    }
+    result
 }
 
 fn migrate_v16_scheduling_schema(connection: &Connection) -> Result<(), AppError> {
@@ -2781,6 +2807,7 @@ fn create_appointment_tx(
 ) -> Result<AppointmentSummary, AppError> {
     let status = validate_status(input.status.as_deref().unwrap_or("planned"))?;
     let note = optional_text(input.note, 2000)?;
+    let whatsapp_reminder_enabled = input.whatsapp_reminder_enabled.unwrap_or(true);
     let tx = connection.transaction()?;
     assert_appointment_references(&tx, &input.customer_id, &input.staff_id, None)?;
     let (snapshots, total_duration, _) =
@@ -2812,9 +2839,9 @@ fn create_appointment_tx(
     let id = new_uuid();
     let now = now_iso();
     tx.execute(
-        "INSERT INTO appointments (id, customer_id, staff_id, start_at_utc, end_at_utc, total_duration_minutes, status, note, created_at, updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
-        params![id, input.customer_id, input.staff_id, start_iso, end_iso, total_duration, status, note, now],
+        "INSERT INTO appointments (id, customer_id, staff_id, start_at_utc, end_at_utc, total_duration_minutes, status, note, whatsapp_reminder_enabled, created_at, updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10)",
+        params![id, input.customer_id, input.staff_id, start_iso, end_iso, total_duration, status, note, bool_to_i64(whatsapp_reminder_enabled), now],
     )?;
     for snapshot in &snapshots {
         tx.execute(
@@ -2845,6 +2872,9 @@ fn update_appointment_tx(
     let note = optional_text(input.note, 2000)?;
     let current = get_raw_appointment(connection, id)?
         .ok_or_else(|| AppError::NotFound("APPOINTMENT_NOT_FOUND".to_string()))?;
+    let whatsapp_reminder_enabled = input
+        .whatsapp_reminder_enabled
+        .unwrap_or(current.whatsapp_reminder_enabled);
     let tx = connection.transaction()?;
     assert_appointment_references(
         &tx,
@@ -2890,7 +2920,8 @@ fn update_appointment_tx(
         && current.end_at_utc == end_iso
         && current.total_duration_minutes == total_duration
         && current.status == status
-        && current.note == note;
+        && current.note == note
+        && current.whatsapp_reminder_enabled == whatsapp_reminder_enabled;
     if no_change {
         drop(tx);
         return get_appointment(connection, id);
@@ -2914,10 +2945,13 @@ fn update_appointment_tx(
     if current.note != note {
         changed_fields.push("note");
     }
+    if current.whatsapp_reminder_enabled != whatsapp_reminder_enabled {
+        changed_fields.push("whatsapp_reminder_enabled");
+    }
     let status_changed = current.status != status;
     tx.execute(
-        "UPDATE appointments SET customer_id=?1,staff_id=?2,start_at_utc=?3,end_at_utc=?4,total_duration_minutes=?5,status=?6,note=?7,updated_at=?8 WHERE id=?9",
-        params![input.customer_id, input.staff_id, start_iso, end_iso, total_duration, status, note, now_iso(), id],
+        "UPDATE appointments SET customer_id=?1,staff_id=?2,start_at_utc=?3,end_at_utc=?4,total_duration_minutes=?5,status=?6,note=?7,whatsapp_reminder_enabled=?8,updated_at=?9 WHERE id=?10",
+        params![input.customer_id, input.staff_id, start_iso, end_iso, total_duration, status, note, bool_to_i64(whatsapp_reminder_enabled), now_iso(), id],
     )?;
     if !used_existing {
         tx.execute(
@@ -2968,6 +3002,7 @@ struct RawAppointment {
     total_duration_minutes: i64,
     status: String,
     note: Option<String>,
+    whatsapp_reminder_enabled: bool,
 }
 
 fn get_raw_appointment(
@@ -2976,7 +3011,7 @@ fn get_raw_appointment(
 ) -> Result<Option<RawAppointment>, AppError> {
     connection
         .query_row(
-            "SELECT customer_id, staff_id, start_at_utc, end_at_utc, total_duration_minutes, status, note FROM appointments WHERE id=?1",
+            "SELECT customer_id, staff_id, start_at_utc, end_at_utc, total_duration_minutes, status, note, whatsapp_reminder_enabled FROM appointments WHERE id=?1",
             params![id],
             |row| {
                 Ok(RawAppointment {
@@ -2987,6 +3022,7 @@ fn get_raw_appointment(
                     total_duration_minutes: row.get(4)?,
                     status: row.get(5)?,
                     note: row.get(6)?,
+                    whatsapp_reminder_enabled: row.get::<_, i64>(7)? == 1,
                 })
             },
         )
@@ -3966,7 +4002,7 @@ fn reconcile_reminder_for_appointment(
 ) -> Result<bool, AppError> {
     let row = connection
         .query_row(
-            "SELECT a.start_at_utc, a.status, c.is_active, c.phone, c.whatsapp_reminder_enabled, c.whatsapp_consent_confirmed, c.first_name, c.last_name
+            "SELECT a.start_at_utc, a.status, a.whatsapp_reminder_enabled, c.is_active, c.phone, c.whatsapp_reminder_enabled, c.whatsapp_consent_confirmed, c.first_name, c.last_name
              FROM appointments a INNER JOIN customers c ON c.id=a.customer_id WHERE a.id=?1",
             params![appointment_id],
             |row| {
@@ -3974,22 +4010,33 @@ fn reconcile_reminder_for_appointment(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                     row.get::<_, i64>(5)?,
-                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(6)?,
                     row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
                 ))
             },
         )
         .optional()?;
-    let Some((start_at, status, active, phone, reminder_enabled, consent, first_name, last_name)) =
-        row
+    let Some((
+        start_at,
+        status,
+        appointment_reminder_enabled,
+        active,
+        phone,
+        reminder_enabled,
+        consent,
+        first_name,
+        last_name,
+    )) = row
     else {
         return Ok(false);
     };
     let eligible = matches!(status.as_str(), "planned" | "confirmed")
         && active == 1
+        && appointment_reminder_enabled == 1
         && reminder_enabled == 1
         && consent == 1
         && normalize_phone(phone.as_deref(), true).is_ok();
@@ -4165,6 +4212,7 @@ fn list_whatsapp_candidates_tx(
          FROM appointments a INNER JOIN customers c ON c.id=a.customer_id
          WHERE a.start_at_utc >= ?1 AND a.start_at_utc <= ?2
            AND a.status IN ('planned','confirmed')
+           AND a.whatsapp_reminder_enabled=1
            AND c.is_active=1 AND c.whatsapp_reminder_enabled=1 AND c.whatsapp_consent_confirmed=1
          ORDER BY a.start_at_utc ASC",
     )?;
@@ -4226,6 +4274,8 @@ fn list_appointments_between(
 ) -> Result<Vec<AppointmentSummary>, AppError> {
     let mut sql = String::from(
         "SELECT a.*, c.first_name || ' ' || c.last_name AS customer_name, c.phone AS customer_phone,
+                c.whatsapp_reminder_enabled AS customer_whatsapp_reminder_enabled,
+                c.whatsapp_consent_confirmed AS customer_whatsapp_consent_confirmed,
                 st.first_name || COALESCE(' ' || st.last_name, '') AS staff_name
          FROM appointments a
          INNER JOIN customers c ON c.id = a.customer_id
@@ -4270,8 +4320,11 @@ fn list_appointments_between(
             row.get::<_, i64>("total_duration_minutes")?,
             row.get::<_, String>("status")?,
             row.get::<_, Option<String>>("note")?,
+            row.get::<_, i64>("whatsapp_reminder_enabled")?,
             row.get::<_, String>("customer_name")?,
             row.get::<_, Option<String>>("customer_phone")?,
+            row.get::<_, i64>("customer_whatsapp_reminder_enabled")?,
+            row.get::<_, i64>("customer_whatsapp_consent_confirmed")?,
             row.get::<_, String>("staff_name")?,
             row.get::<_, String>("updated_at")?,
         ))
@@ -4294,8 +4347,11 @@ fn list_appointments_between(
             total_duration_minutes,
             status,
             note,
+            whatsapp_reminder_enabled,
             customer_name,
             customer_phone,
+            customer_whatsapp_reminder_enabled,
+            customer_whatsapp_consent_confirmed,
             staff_name,
             updated_at,
         ) = row;
@@ -4313,6 +4369,11 @@ fn list_appointments_between(
             total_duration_minutes,
             status,
             note,
+            whatsapp_reminder_enabled: whatsapp_reminder_enabled == 1,
+            whatsapp_reminder_effective: whatsapp_reminder_enabled == 1
+                && customer_whatsapp_reminder_enabled == 1
+                && customer_whatsapp_consent_confirmed == 1
+                && normalize_phone(customer_phone.as_deref(), true).is_ok(),
             customer_name,
             customer_phone,
             staff_name,
@@ -6804,7 +6865,140 @@ mod tests {
             service_ids,
             status: Some(status.into()),
             note: None,
+            whatsapp_reminder_enabled: None,
         }
+    }
+
+    #[test]
+    fn v18_to_v19_appointment_whatsapp_preference_defaults_existing_rows_to_enabled() {
+        let connection = Connection::open_in_memory().expect("memory db");
+        connection
+            .execute_batch(
+                "CREATE TABLE app_meta (schema_version INTEGER NOT NULL);
+                 INSERT INTO app_meta (schema_version) VALUES (18);
+                 CREATE TABLE appointments (id TEXT PRIMARY KEY NOT NULL);
+                 INSERT INTO appointments (id) VALUES ('legacy-appointment');",
+            )
+            .expect("v18 fixture");
+
+        migrate_v19_appointment_whatsapp_preference(&connection).expect("migrate v19");
+
+        assert!(table_columns(&connection, "appointments")
+            .expect("appointment columns")
+            .contains("whatsapp_reminder_enabled"));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT whatsapp_reminder_enabled FROM appointments WHERE id='legacy-appointment'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("legacy preference"),
+            1
+        );
+    }
+
+    #[test]
+    fn appointment_whatsapp_preference_defaults_persists_and_controls_reminder_eligibility() {
+        let (_temp, mut connection) = open_temp();
+        let (customer, staff, service) = seed_core(&mut connection);
+        update_customer_tx(
+            &mut connection,
+            &customer.id,
+            CustomerInput {
+                first_name: customer.first_name.clone(),
+                last_name: customer.last_name.clone(),
+                phone: customer.phone.clone(),
+                email: customer.email.clone(),
+                notes: customer.notes.clone(),
+                whatsapp_reminder_enabled: Some(true),
+                whatsapp_consent_confirmed: Some(true),
+            },
+        )
+        .expect("record consent");
+
+        let default_appointment = create_appointment_tx(
+            &mut connection,
+            appointment_input(
+                &customer.id,
+                &staff.id,
+                "2036-12-02",
+                "10:00",
+                vec![service.id.clone()],
+                "planned",
+            ),
+        )
+        .expect("default appointment");
+        assert!(default_appointment.whatsapp_reminder_enabled);
+        assert!(default_appointment.whatsapp_reminder_effective);
+
+        let mut disabled_input = appointment_input(
+            &customer.id,
+            &staff.id,
+            "2036-12-03",
+            "10:00",
+            vec![service.id.clone()],
+            "planned",
+        );
+        disabled_input.whatsapp_reminder_enabled = Some(false);
+        let disabled =
+            create_appointment_tx(&mut connection, disabled_input).expect("disabled appointment");
+        assert!(!disabled.whatsapp_reminder_enabled);
+        assert!(!disabled.whatsapp_reminder_effective);
+        let disabled_reminders: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM appointment_reminders WHERE appointment_id=?1",
+                params![disabled.id],
+                |row| row.get(0),
+            )
+            .expect("disabled reminder count");
+        assert_eq!(disabled_reminders, 0);
+        let google_outbox_after_disabled: i64 = connection
+            .query_row("SELECT COUNT(*) FROM google_calendar_outbox", [], |row| {
+                row.get(0)
+            })
+            .expect("Google outbox count");
+        assert_eq!(google_outbox_after_disabled, 0);
+
+        let mut enabled_input = appointment_input(
+            &customer.id,
+            &staff.id,
+            "2036-12-03",
+            "10:00",
+            vec![service.id.clone()],
+            "planned",
+        );
+        enabled_input.whatsapp_reminder_enabled = Some(true);
+        let enabled = update_appointment_tx(&mut connection, &disabled.id, enabled_input)
+            .expect("enable preference");
+        assert!(enabled.whatsapp_reminder_enabled);
+        assert!(enabled.whatsapp_reminder_effective);
+        let enabled_reminders: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM appointment_reminders WHERE appointment_id=?1",
+                params![disabled.id],
+                |row| row.get(0),
+            )
+            .expect("enabled reminder count");
+        assert_eq!(enabled_reminders, 1);
+        let google_outbox_after_enabled: i64 = connection
+            .query_row("SELECT COUNT(*) FROM google_calendar_outbox", [], |row| {
+                row.get(0)
+            })
+            .expect("Google outbox unchanged");
+        assert_eq!(google_outbox_after_enabled, 0);
+
+        connection
+            .execute(
+                "UPDATE customers SET phone=NULL WHERE id=?1",
+                params![customer.id],
+            )
+            .expect("clear test phone");
+        reconcile_reminder_for_appointment(&connection, &disabled.id)
+            .expect("reconcile after phone removal");
+        let without_phone = get_appointment(&connection, &disabled.id).expect("appointment");
+        assert!(without_phone.whatsapp_reminder_enabled);
+        assert!(!without_phone.whatsapp_reminder_effective);
     }
 
     fn configure_daily_hours(connection: &mut Connection, staff_id: &str) {
@@ -7689,6 +7883,7 @@ mod tests {
                 service_ids: vec![service.id.clone()],
                 status: Some("planned".into()),
                 note: Some("ilk".into()),
+                whatsapp_reminder_enabled: None,
             },
         )
         .expect("appointment");
@@ -7708,6 +7903,7 @@ mod tests {
                 service_ids: vec![service.id.clone()],
                 status: Some("planned".into()),
                 note: None,
+                whatsapp_reminder_enabled: None,
             },
         );
         assert!(matches!(conflict, Err(AppError::Conflict(_))));
@@ -7723,6 +7919,7 @@ mod tests {
                 service_ids: vec![service.id],
                 status: Some("cancelled".into()),
                 note: Some("iptal".into()),
+                whatsapp_reminder_enabled: None,
             },
         )
         .expect("cancel");
@@ -7753,6 +7950,7 @@ mod tests {
                 service_ids: vec![service.id],
                 status: Some("confirmed".into()),
                 note: None,
+                whatsapp_reminder_enabled: None,
             },
         )
         .expect("appointment");
@@ -7886,6 +8084,7 @@ mod tests {
                 service_ids: vec![new_uuid()],
                 status: Some("planned".into()),
                 note: None,
+                whatsapp_reminder_enabled: None,
             },
         );
         assert!(bad.is_err());
@@ -8520,6 +8719,7 @@ mod tests {
                 service_ids: vec![service.id.clone()],
                 status: Some("planned".into()),
                 note: None,
+                whatsapp_reminder_enabled: None,
             },
         )
         .expect("create");
@@ -8547,6 +8747,7 @@ mod tests {
                 service_ids: vec![service.id],
                 status: Some("cancelled".into()),
                 note: Some("iptal".into()),
+                whatsapp_reminder_enabled: None,
             },
         )
         .expect("cancel");
@@ -8592,6 +8793,7 @@ mod tests {
                 service_ids: vec![service.id.clone()],
                 status: Some("confirmed".into()),
                 note: None,
+                whatsapp_reminder_enabled: None,
             },
         )
         .expect("appointment");
@@ -8622,6 +8824,7 @@ mod tests {
                 service_ids: vec![service.id],
                 status: Some("cancelled".into()),
                 note: None,
+                whatsapp_reminder_enabled: None,
             },
         )
         .expect("cancel");
@@ -8763,6 +8966,7 @@ mod tests {
                 service_ids: vec![service.id],
                 status: Some("planned".into()),
                 note: None,
+                whatsapp_reminder_enabled: None,
             },
         )
         .expect("appointment");
@@ -8896,6 +9100,7 @@ mod tests {
                 service_ids: vec![service.id],
                 status: Some("confirmed".into()),
                 note: None,
+                whatsapp_reminder_enabled: None,
             },
         )
         .expect("appointment");
@@ -9013,6 +9218,7 @@ mod tests {
                         service_ids: vec![service.id.clone()],
                         status: Some("confirmed".into()),
                         note: None,
+                        whatsapp_reminder_enabled: None,
                     },
                 )
                 .expect("appointment")
@@ -9179,6 +9385,7 @@ mod tests {
                 service_ids: vec![service.id],
                 status: Some("planned".into()),
                 note: None,
+                whatsapp_reminder_enabled: None,
             },
         )
         .expect("appointment");
@@ -9362,6 +9569,7 @@ mod tests {
             service_ids: vec![service.id.clone()],
             status: Some("planned".into()),
             note: Some("SENTETIK TEST - GOOGLE LIVE ACCEPTANCE".into()),
+            whatsapp_reminder_enabled: None,
         };
         let appointment = create_appointment_tx(&mut connection, initial.clone())
             .expect("create synthetic appointment");
@@ -9544,6 +9752,7 @@ mod tests {
             service_ids,
             status: Some("planned".into()),
             note: Some("SENTETIK TEST - GOOGLE LIVE ACCEPTANCE".into()),
+            whatsapp_reminder_enabled: None,
         };
         update_appointment_tx(&mut connection, &appointment_id, updated.clone())
             .expect("update same synthetic appointment");
@@ -9758,7 +9967,7 @@ mod tests {
         ).expect("v13 fixture");
         drop(old);
         let connection = initialize_database_at(&path).expect("migrate explicit v13 path");
-        assert_eq!(read_schema_version(&connection).expect("version"), 18);
+        assert_eq!(read_schema_version(&connection).expect("version"), 19);
         assert_eq!(
             connection
                 .query_row(
@@ -9870,7 +10079,7 @@ mod tests {
         let reopened = initialize_database_at(&path).expect("restart safe");
         assert_eq!(
             read_schema_version(&reopened).expect("version after restart"),
-            18
+            19
         );
         assert!(integrity_check(&reopened).expect("integrity after restart"));
     }
@@ -9903,7 +10112,7 @@ mod tests {
         let connection =
             initialize_explicit_migration_rehearsal(Some(&temp_db), Some(&forbidden_db))
                 .expect("explicit rehearsal succeeds");
-        assert_eq!(read_schema_version(&connection).expect("schema"), 18);
+        assert_eq!(read_schema_version(&connection).expect("schema"), 19);
         assert!(integrity_check(&connection).expect("integrity"));
     }
 
@@ -9985,7 +10194,7 @@ mod tests {
             initialize_explicit_migration_rehearsal(Some(&rehearsal_path), Some(&forbidden_path))
                 .expect("rehearsal migration succeeds");
 
-        assert_eq!(read_schema_version(&connection).expect("schema 18"), 18);
+        assert_eq!(read_schema_version(&connection).expect("schema 19"), 19);
         assert!(integrity_check(&connection).expect("migrated integrity"));
         assert_eq!(
             connection
@@ -10062,7 +10271,7 @@ mod tests {
         let reopened =
             initialize_explicit_migration_rehearsal(Some(&rehearsal_path), Some(&forbidden_path))
                 .expect("reopen migration succeeds");
-        assert_eq!(read_schema_version(&reopened).expect("reopen schema"), 18);
+        assert_eq!(read_schema_version(&reopened).expect("reopen schema"), 19);
         assert!(integrity_check(&reopened).expect("reopen integrity"));
         assert_eq!(
             reopened
@@ -10125,7 +10334,7 @@ mod tests {
         };
 
         let connection = open_database(&path).expect("migrate v16");
-        assert_eq!(read_schema_version(&connection).expect("schema"), 18);
+        assert_eq!(read_schema_version(&connection).expect("schema"), 19);
         assert_eq!(
             (
                 connection
@@ -10248,7 +10457,7 @@ mod tests {
         assert!(integrity_check(&connection).expect("integrity"));
         drop(connection);
         let reopened = open_database(&path).expect("restart safe");
-        assert_eq!(read_schema_version(&reopened).expect("reopened schema"), 18);
+        assert_eq!(read_schema_version(&reopened).expect("reopened schema"), 19);
         assert!(integrity_check(&reopened).expect("reopened integrity"));
     }
 
@@ -10300,7 +10509,7 @@ mod tests {
         };
 
         let connection = open_database(&path).expect("migrate v17");
-        assert_eq!(read_schema_version(&connection).expect("schema"), 18);
+        assert_eq!(read_schema_version(&connection).expect("schema"), 19);
         assert_eq!(
             connection
                 .query_row(
@@ -10402,7 +10611,7 @@ mod tests {
         assert!(integrity_check(&connection).expect("integrity"));
         drop(connection);
         let reopened = open_database(&path).expect("restart safe");
-        assert_eq!(read_schema_version(&reopened).expect("reopened schema"), 18);
+        assert_eq!(read_schema_version(&reopened).expect("reopened schema"), 19);
         assert_eq!(
             reopened
                 .query_row("SELECT COUNT(*) FROM business_profile", [], |row| row
@@ -11078,6 +11287,7 @@ mod tests {
                 service_ids: vec![service.id.clone()],
                 status: Some("confirmed".into()),
                 note: Some(marker.into()),
+                whatsapp_reminder_enabled: None,
             },
         )
         .expect("synthetic appointment");
@@ -11153,6 +11363,7 @@ mod tests {
                 service_ids: vec![service.id],
                 status: Some("planned".into()),
                 note: Some(marker.into()),
+                whatsapp_reminder_enabled: None,
             },
         )
         .expect("synthetic update");
@@ -11237,6 +11448,7 @@ mod tests {
                 service_ids: cancel_services,
                 status: Some("cancelled".into()),
                 note: Some(marker.into()),
+                whatsapp_reminder_enabled: None,
             },
         )
         .expect("synthetic cancel");
@@ -11697,6 +11909,7 @@ mod tests {
                 service_ids: vec![service.id.clone()],
                 status: Some("planned".into()),
                 note: None,
+                whatsapp_reminder_enabled: None,
             },
         )
         .expect("single-service appointment");
@@ -11714,6 +11927,7 @@ mod tests {
                 service_ids: vec![service.id.clone(), second_service.id.clone()],
                 status: Some("planned".into()),
                 note: None,
+                whatsapp_reminder_enabled: None,
             },
         )
         .expect("multi-service appointment");
@@ -12572,6 +12786,7 @@ mod tests {
                 service_ids: vec![service.id.clone()],
                 status: Some("planned".into()),
                 note: None,
+                whatsapp_reminder_enabled: None,
             },
         )
         .expect("concurrent appointment create");

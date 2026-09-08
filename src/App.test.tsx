@@ -115,6 +115,8 @@ const todayAppointment = {
   totalDurationMinutes: 45,
   status: "planned",
   note: null,
+  whatsappReminderEnabled: true,
+  whatsappReminderEffective: true,
   customerName: "Ayşe Yılmaz",
   customerPhone: null,
   staffName: "Ece Demir",
@@ -479,6 +481,35 @@ describe("New appointment flow", () => {
     );
   });
 
+  it("defaults the appointment WhatsApp preference to enabled and persists an explicit opt-out", async () => {
+    await openForm();
+    expect(
+      screen.getByLabelText("Bu randevu için WhatsApp hatırlatması"),
+    ).toBeChecked();
+    await fillRequiredFields();
+    fireEvent.click(
+      screen.getByLabelText("Bu randevu için WhatsApp hatırlatması"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Randevuyu Kaydet" }));
+    await waitFor(() =>
+      expect(api.createAppointment).toHaveBeenCalledWith(
+        expect.objectContaining({ whatsappReminderEnabled: false }),
+      ),
+    );
+  });
+
+  it("shows the Today WhatsApp indicator only when the effective preference is enabled", async () => {
+    api.listAppointmentsByDate.mockResolvedValueOnce([
+      todayAppointment,
+      { ...todayAppointment, id: "appointment-disabled", whatsappReminderEffective: false },
+    ]);
+    render(<App />);
+    await screen.findAllByText("Ayşe Yılmaz");
+    expect(
+      screen.getAllByLabelText("WhatsApp hatırlatması uygun"),
+    ).toHaveLength(1);
+  });
+
   it("disables saving while a create request is pending", async () => {
     let resolveCreate: ((value: unknown) => void) | undefined;
     api.createAppointment.mockImplementationOnce(
@@ -749,6 +780,9 @@ describe("Calendar day, week and edit foundation", () => {
     });
     fireEvent.click(screen.getByRole("checkbox", { name: "Düzenle Fön" }));
     fireEvent.click(
+      screen.getByLabelText("Bu randevu için WhatsApp hatırlatması"),
+    );
+    fireEvent.click(
       screen.getByRole("button", { name: "Değişiklikleri Kaydet" }),
     );
     await waitFor(() =>
@@ -758,6 +792,7 @@ describe("Calendar day, week and edit foundation", () => {
           localDate: "2026-09-02",
           localStartTime: "11:30",
           serviceIds: ["service-1", "service-3"],
+          whatsappReminderEnabled: false,
         }),
       ),
     );
