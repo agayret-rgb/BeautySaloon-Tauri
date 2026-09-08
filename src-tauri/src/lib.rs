@@ -1621,6 +1621,18 @@ fn normalize_phone(value: Option<&str>, required: bool) -> Result<Option<String>
     Ok(Some(normalized))
 }
 
+fn map_customer_phone_conflict(error: rusqlite::Error) -> AppError {
+    if matches!(
+        &error,
+        rusqlite::Error::SqliteFailure(_, Some(message))
+            if message.contains("customers.phone") || message.contains("customers_phone_unique_idx")
+    ) {
+        AppError::Conflict("CUSTOMER_PHONE_CONFLICT".to_string())
+    } else {
+        AppError::Sqlite(error)
+    }
+}
+
 fn name_key(name: &str) -> String {
     name.split_whitespace()
         .collect::<Vec<_>>()
@@ -2085,7 +2097,8 @@ fn create_customer_tx(
             notes,
             now
         ],
-    )?;
+    )
+    .map_err(map_customer_phone_conflict)?;
     append_audit_event(
         &tx,
         AuditEntityType::Customer,
@@ -2140,7 +2153,8 @@ fn update_customer_tx(
     tx.execute(
         "UPDATE customers SET first_name=?1,last_name=?2,phone=?3,email=?4,whatsapp_reminder_enabled=?5,whatsapp_consent_confirmed=?6,whatsapp_consent_recorded_at=CASE WHEN ?6 = 1 THEN COALESCE(whatsapp_consent_recorded_at, ?7) ELSE NULL END,notes=?8,updated_at=?7 WHERE id=?9",
         params![first_name,last_name,phone,email,bool_to_i64(input.whatsapp_reminder_enabled.unwrap_or(true)),bool_to_i64(consent),now,notes,id],
-    )?;
+    )
+    .map_err(map_customer_phone_conflict)?;
     append_audit_event(
         &tx,
         AuditEntityType::Customer,
@@ -7832,6 +7846,23 @@ mod tests {
         assert_eq!(customer.phone.as_deref(), Some("5551112233"));
         assert_eq!(staff.phone.as_deref(), Some("5552223344"));
         assert_eq!(service.availability_status, "ready");
+
+        let duplicate_phone = create_customer_tx(
+            &mut connection,
+            CustomerInput {
+                first_name: "Baska".into(),
+                last_name: "Musteri".into(),
+                phone: Some("05551112233".into()),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: None,
+                whatsapp_consent_confirmed: None,
+            },
+        )
+        .expect_err("duplicate phone must have a safe domain code");
+        assert!(duplicate_phone
+            .to_string()
+            .contains("CUSTOMER_PHONE_CONFLICT"));
 
         let updated = update_customer_tx(
             &mut connection,

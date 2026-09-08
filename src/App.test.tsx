@@ -575,7 +575,7 @@ describe("New appointment flow", () => {
 
   it("maps duplicate phone errors", async () => {
     api.createCustomer.mockRejectedValueOnce(
-      new Error("UNIQUE constraint failed: customers.phone"),
+      new Error("CONFLICT: CUSTOMER_PHONE_CONFLICT"),
     );
     await openForm();
     await fillRequiredFields();
@@ -586,6 +586,31 @@ describe("New appointment flow", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Bu telefon numarası başka bir müşteride kayıtlı.",
     );
+  });
+
+  it("shows the new-customer name error only for an incomplete new customer", async () => {
+    await openForm();
+    fireEvent.change(screen.getByLabelText("Müşteri adı"), {
+      target: { value: "Deniz" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Randevuyu Kaydet" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Müşteri adı ve soyadı girilmelidir.",
+    );
+    expect(api.createCustomer).not.toHaveBeenCalled();
+  });
+
+  it("places a failed save error next to the save controls and preserves the draft", async () => {
+    api.createAppointment.mockRejectedValueOnce(new Error("APPOINTMENT_CONFLICT"));
+    await openForm();
+    await fillRequiredFields();
+    fireEvent.click(screen.getByRole("button", { name: "Randevuyu Kaydet" }));
+    const error = await screen.findByRole("alert");
+    const booking = error.closest(".booking-surface");
+    expect(error.nextElementSibling).toBe(
+      booking?.querySelector(".booking-actions"),
+    );
+    expect(screen.getByLabelText("Müşteri adı")).toHaveValue("Deniz Kaya");
   });
 });
 
@@ -663,13 +688,42 @@ describe("Today appointment timeline", () => {
   );
 
   it("keeps the timeline visible and reports a status failure", async () => {
-    api.updateAppointment.mockRejectedValueOnce(new Error("failure"));
+    api.updateAppointment.mockRejectedValueOnce(new Error("STAFF_TIME_OFF"));
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "İptal" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Randevu durumu güncellenemedi.",
+      "Personel seçilen tarih veya saatte izinli.",
     );
     expect(screen.getByText("Ayşe Yılmaz")).toBeInTheDocument();
+  });
+
+  it("keeps status corrections available after a completed or cancelled status", async () => {
+    api.listAppointmentsByDate.mockResolvedValueOnce([
+      { ...todayAppointment, status: "completed" },
+    ]);
+    render(<App />);
+    await screen.findByText("Ayşe Yılmaz");
+    expect(screen.getByRole("button", { name: "Gelmedi" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Gelmedi" }));
+    await waitFor(() =>
+      expect(api.updateAppointment).toHaveBeenCalledWith(
+        "appointment-1",
+        expect.objectContaining({ status: "no_show" }),
+      ),
+    );
+  });
+
+  it("shows the availability reason when cancelled is corrected to active", async () => {
+    api.listAppointmentsByDate.mockResolvedValueOnce([
+      { ...todayAppointment, status: "cancelled" },
+    ]);
+    api.updateAppointment.mockRejectedValueOnce(new Error("APPOINTMENT_CONFLICT"));
+    render(<App />);
+    await screen.findByText("Ayşe Yılmaz");
+    fireEvent.click(screen.getByRole("button", { name: "Tamamlandı" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Bu personelin seçilen saatte başka bir randevusu var.",
+    );
   });
 
   it("refreshes the bounded today list after a successful new appointment", async () => {
@@ -760,9 +814,13 @@ describe("Calendar day, week and edit foundation", () => {
     );
   });
 
-  it("opens an appointment, excludes inactive edit choices, and saves the full update", async () => {
+  it("opens editing only from the explicit action, preserves choices, and saves the full update", async () => {
     await openCalendar();
-    fireEvent.click(await screen.findByRole("button", { name: /Ayşe Yılmaz/ }));
+    fireEvent.click(await screen.findByText("Ayşe Yılmaz"));
+    expect(
+      screen.queryByRole("heading", { name: "Randevuyu Düzenle" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Düzenle" }));
     expect(
       await screen.findByRole("heading", { name: "Randevuyu Düzenle" }),
     ).toBeInTheDocument();
@@ -800,7 +858,7 @@ describe("Calendar day, week and edit foundation", () => {
 
   it("keeps a dirty appointment edit open until the user chooses to leave", async () => {
     await openCalendar();
-    fireEvent.click(await screen.findByRole("button", { name: /Ayşe Yılmaz/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Düzenle" }));
     await screen.findByRole("heading", { name: "Randevuyu Düzenle" });
     fireEvent.change(screen.getByLabelText("Düzenle saat"), {
       target: { value: "13:00" },
@@ -823,7 +881,7 @@ describe("Calendar day, week and edit foundation", () => {
   it("keeps the edit draft open and maps availability failures", async () => {
     api.updateAppointment.mockRejectedValueOnce(new Error("STAFF_TIME_OFF"));
     await openCalendar();
-    fireEvent.click(await screen.findByRole("button", { name: /Ayşe Yılmaz/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Düzenle" }));
     await screen.findByRole("heading", { name: "Randevuyu Düzenle" });
     fireEvent.change(screen.getByLabelText("Düzenle saat"), {
       target: { value: "13:00" },
@@ -842,7 +900,7 @@ describe("Calendar day, week and edit foundation", () => {
       "CONFLICT: APPOINTMENT_CONFLICT",
     );
     await openCalendar();
-    fireEvent.click(await screen.findByRole("button", { name: /Ayşe Yılmaz/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Düzenle" }));
     await screen.findByRole("heading", { name: "Randevuyu Düzenle" });
     fireEvent.change(screen.getByLabelText("Düzenle saat"), {
       target: { value: "13:00" },
@@ -861,7 +919,7 @@ describe("Calendar day, week and edit foundation", () => {
       new Error("CONFLICT: APPOINTMENT_CONFLICT"),
     );
     await openCalendar();
-    fireEvent.click(await screen.findByRole("button", { name: /Ayşe Yılmaz/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Düzenle" }));
     await screen.findByRole("heading", { name: "Randevuyu Düzenle" });
     fireEvent.click(
       screen.getByRole("button", { name: "Değişiklikleri Kaydet" }),
@@ -874,19 +932,19 @@ describe("Calendar day, week and edit foundation", () => {
   it("keeps an unknown Tauri rejection behind the generic message", async () => {
     api.updateAppointment.mockRejectedValueOnce("UNEXPECTED_BACKEND_FAILURE");
     await openCalendar();
-    fireEvent.click(await screen.findByRole("button", { name: /Ayşe Yılmaz/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Düzenle" }));
     await screen.findByRole("heading", { name: "Randevuyu Düzenle" });
     fireEvent.click(
       screen.getByRole("button", { name: "Değişiklikleri Kaydet" }),
     );
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "İşlem tamamlanamadı. Bilgileri kontrol edip tekrar deneyin.",
+      "Randevu kaydedilemedi. Lütfen bilgileri kontrol edip tekrar deneyin.",
     );
   });
 
   it("cancels an edit without a mutation", async () => {
     await openCalendar();
-    fireEvent.click(await screen.findByRole("button", { name: /Ayşe Yılmaz/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Düzenle" }));
     await screen.findByRole("heading", { name: "Randevuyu Düzenle" });
     fireEvent.click(screen.getAllByRole("button", { name: "Vazgeç" }).at(-1)!);
     expect(

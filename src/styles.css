@@ -337,6 +337,16 @@ p {
   gap: 8px;
   margin-top: 8px;
 }
+.is-current-status {
+  border-color: #8bbcad;
+  color: #1d6256;
+  background: #dff0e9;
+  font-weight: 700;
+}
+.status-error,
+.form-error--action {
+  margin: 0;
+}
 .calendar-surface {
   display: grid;
   gap: 18px;
@@ -373,7 +383,7 @@ p {
 }
 .calendar-appointment {
   display: grid;
-  grid-template-columns: 62px minmax(0, 1fr);
+  grid-template-columns: 62px minmax(0, 1fr) auto;
   gap: 12px;
   width: 100%;
   border: 1px solid #e5e0d8;
@@ -382,11 +392,6 @@ p {
   color: #28302c;
   background: #fffdf9;
   text-align: left;
-  cursor: pointer;
-}
-.calendar-appointment:hover {
-  border-color: #9ccfc0;
-  background: #f5faf7;
 }
 .calendar-appointment time {
   color: #235e55;
@@ -400,6 +405,9 @@ p {
 .calendar-appointment small {
   color: #667068;
   line-height: 1.4;
+}
+.calendar-edit-action {
+  align-self: center;
 }
 .calendar-week-grid {
   display: grid;
@@ -429,9 +437,12 @@ p {
   font-size: 14px;
 }
 .calendar-week-day .calendar-appointment {
-  grid-template-columns: 1fr;
+  grid-template-columns: 1fr auto;
   gap: 4px;
   padding: 10px;
+}
+.calendar-week-day .calendar-appointment time {
+  grid-column: 1 / -1;
 }
 .customers-surface,
 .customer-history,

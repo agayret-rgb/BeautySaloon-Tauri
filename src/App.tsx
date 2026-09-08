@@ -175,6 +175,16 @@ function statusLabel(status: string): string {
 function bookingErrorMessage(error: unknown): string {
   const message =
     error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  if (message.includes("CUSTOMER_NAME_REQUIRED"))
+    return "Müşteri adı ve soyadı girilmelidir.";
+  if (
+    message.includes("INVALID_DATE_TIME") ||
+    message.includes("localDate invalid") ||
+    message.includes("localStartTime invalid") ||
+    message.includes("localStartTime step")
+  ) {
+    return "Geçerli bir tarih ve saat seçin.";
+  }
   if (message.includes("OUTSIDE_WORKING_HOURS"))
     return "Seçilen saat personelin çalışma saatleri dışında.";
   if (message.includes("STAFF_TIME_OFF"))
@@ -199,7 +209,7 @@ function bookingErrorMessage(error: unknown): string {
   ) {
     return "Bu telefon numarası başka bir müşteride kayıtlı.";
   }
-  return "İşlem tamamlanamadı. Bilgileri kontrol edip tekrar deneyin.";
+  return "Randevu kaydedilemedi. Lütfen bilgileri kontrol edip tekrar deneyin.";
 }
 
 function customerName(customer: Customer): string {
@@ -299,6 +309,7 @@ export function App() {
   const [todayLoading, setTodayLoading] = useState(true);
   const [todayError, setTodayError] = useState("");
   const [statusPendingId, setStatusPendingId] = useState<string | null>(null);
+  const [statusErrorId, setStatusErrorId] = useState<string | null>(null);
   const [calendarMode, setCalendarMode] = useState<CalendarMode>("day");
   const [calendarDate, setCalendarDate] = useState(todayLocalDate());
   const [calendarAppointments, setCalendarAppointments] = useState<
@@ -937,7 +948,7 @@ export function App() {
     if (isSaving) return;
     const nameParts = customerQuery.trim().split(/\s+/).filter(Boolean);
     if (!selectedCustomer && nameParts.length < 2) {
-      setFormError("Müşteri için ad ve soyad girin.");
+      setFormError("Müşteri adı ve soyadı girilmelidir.");
       return;
     }
     if (!staffId || serviceIds.length === 0 || !localDate || !localStartTime) {
@@ -1010,6 +1021,7 @@ export function App() {
       }
       setStatusPendingId(appointment.id);
       setTodayError("");
+      setStatusErrorId(null);
       const input: AppointmentInput = {
         customerId: appointment.customerId,
         staffId: appointment.staffId,
@@ -1025,8 +1037,9 @@ export function App() {
           loadToday(),
           activeItem === "Takvim" ? loadCalendar() : Promise.resolve(),
         ]);
-      } catch {
-        setTodayError("Randevu durumu güncellenemedi.");
+      } catch (error) {
+        setTodayError(bookingErrorMessage(error));
+        setStatusErrorId(appointment.id);
       } finally {
         setStatusPendingId(null);
       }
@@ -2087,11 +2100,6 @@ export function App() {
                 Vazgeç
               </button>
             </div>
-            {formError && (
-              <p className="form-error" role="alert">
-                {formError}
-              </p>
-            )}
             <div className="booking-grid">
               <label className="form-field">
                 <span>Müşteri adı</span>
@@ -2242,6 +2250,11 @@ export function App() {
                 />
               </label>
             </div>
+            {formError && (
+              <p className="form-error form-error--action" role="alert">
+                {formError}
+              </p>
+            )}
             <div className="booking-actions">
               <button
                 type="button"
@@ -2268,7 +2281,7 @@ export function App() {
 
         {activeItem === "Bugün" ? (
           <section className="today-timeline" aria-label="Bugünün randevuları">
-            {todayError && (
+            {todayError && !statusErrorId && (
               <div className="timeline-message" role="alert">
                 <span>{todayError}</span>
                 <button
@@ -2319,39 +2332,32 @@ export function App() {
                       {appointment.staffName} ·{" "}
                       {appointment.totalDurationMinutes} dk
                     </p>
-                    {appointment.status === "planned" && (
-                      <div className="status-actions">
+                    <div className="status-actions" aria-label="Randevu durumu">
+                      {[
+                        ["completed", "Tamamlandı"],
+                        ["no_show", "Gelmedi"],
+                        ["cancelled", "İptal"],
+                      ].map(([status, label]) => (
                         <button
                           type="button"
-                          className="dismiss-button"
-                          disabled={statusPendingId === appointment.id}
-                          onClick={() =>
-                            void changeStatus(appointment, "completed")
+                          className={
+                            appointment.status === status
+                              ? "dismiss-button is-current-status"
+                              : "dismiss-button"
                           }
-                        >
-                          Tamamlandı
-                        </button>
-                        <button
-                          type="button"
-                          className="dismiss-button"
+                          aria-pressed={appointment.status === status}
                           disabled={statusPendingId === appointment.id}
-                          onClick={() =>
-                            void changeStatus(appointment, "no_show")
-                          }
+                          key={status}
+                          onClick={() => void changeStatus(appointment, status)}
                         >
-                          Gelmedi
+                          {label}
                         </button>
-                        <button
-                          type="button"
-                          className="dismiss-button"
-                          disabled={statusPendingId === appointment.id}
-                          onClick={() =>
-                            void changeStatus(appointment, "cancelled")
-                          }
-                        >
-                          İptal
-                        </button>
-                      </div>
+                      ))}
+                    </div>
+                    {todayError && statusErrorId === appointment.id && (
+                      <p className="form-error status-error" role="alert">
+                        {todayError}
+                      </p>
                     )}
                   </div>
                 </article>
@@ -2452,12 +2458,7 @@ export function App() {
                   <p className="calendar-empty">Randevu yok</p>
                 ) : (
                   calendarAppointments.map((appointment) => (
-                    <button
-                      type="button"
-                      className="calendar-appointment"
-                      key={appointment.id}
-                      onClick={() => void openAppointmentEditor(appointment)}
-                    >
+                    <article className="calendar-appointment" key={appointment.id}>
                       <time>{timeInIstanbul(appointment.startAtUtc)}</time>
                       <span>
                         <strong>{appointment.customerName}</strong>
@@ -2469,7 +2470,14 @@ export function App() {
                           {statusLabel(appointment.status)}
                         </small>
                       </span>
-                    </button>
+                      <button
+                        type="button"
+                        className="text-action calendar-edit-action"
+                        onClick={() => void openAppointmentEditor(appointment)}
+                      >
+                        Düzenle
+                      </button>
+                    </article>
                   ))
                 )}
               </div>
@@ -2489,14 +2497,7 @@ export function App() {
                         <p>Randevu yok</p>
                       ) : (
                         items.map((appointment) => (
-                          <button
-                            type="button"
-                            className="calendar-appointment"
-                            key={appointment.id}
-                            onClick={() =>
-                              void openAppointmentEditor(appointment)
-                            }
-                          >
+                          <article className="calendar-appointment" key={appointment.id}>
                             <time>
                               {timeInIstanbul(appointment.startAtUtc)}
                             </time>
@@ -2510,7 +2511,14 @@ export function App() {
                                 {statusLabel(appointment.status)}
                               </small>
                             </span>
-                          </button>
+                            <button
+                              type="button"
+                              className="text-action calendar-edit-action"
+                              onClick={() => void openAppointmentEditor(appointment)}
+                            >
+                              Düzenle
+                            </button>
+                          </article>
                         ))
                       )}
                     </section>
@@ -3942,11 +3950,6 @@ export function App() {
                 .map((service) => service.serviceNameSnapshot)
                 .join(", ")}
             </p>
-            {editError && (
-              <p className="form-error" role="alert">
-                {editError}
-              </p>
-            )}
             <div className="booking-grid">
               <fieldset className="service-picker">
                 <legend>Hizmet</legend>
@@ -4018,6 +4021,11 @@ export function App() {
                 Bu randevu için WhatsApp hatırlatması
               </label>
             </div>
+            {editError && (
+              <p className="form-error form-error--action" role="alert">
+                {editError}
+              </p>
+            )}
             <div className="booking-actions">
               <button
                 type="button"
