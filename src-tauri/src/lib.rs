@@ -7049,7 +7049,7 @@ mod tests {
             .prepare(
                 "SELECT action, metadata_json FROM audit_log
                  WHERE entity_type=?1 AND entity_id=?2
-                 ORDER BY occurred_at ASC, id ASC",
+                 ORDER BY occurred_at ASC, rowid ASC",
             )
             .expect("audit query");
         let rows = statement
