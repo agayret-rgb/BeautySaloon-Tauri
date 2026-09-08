@@ -60,6 +60,7 @@ import {
   serviceStatistics,
   updateAppointment,
   updateBusinessProfile,
+  updateCustomer,
   updateService,
   updateStaff,
   updateStaffTimeOff,
@@ -342,6 +343,14 @@ export function App() {
   const [historyHasMore, setHistoryHasMore] = useState(false);
   const [historyPageLoading, setHistoryPageLoading] = useState(false);
   const [customerActionPending, setCustomerActionPending] = useState(false);
+  const [customerFormOpen, setCustomerFormOpen] = useState(false);
+  const [editingCustomer, setEditingCustomer] = useState<Customer | null>(null);
+  const [customerFirstName, setCustomerFirstName] = useState("");
+  const [customerLastName, setCustomerLastName] = useState("");
+  const [customerFormPhone, setCustomerFormPhone] = useState("");
+  const [customerNotes, setCustomerNotes] = useState("");
+  const [customerFormError, setCustomerFormError] = useState("");
+  const [customerFormSaving, setCustomerFormSaving] = useState(false);
   const [bookingOpen, setBookingOpen] = useState(false);
   const [bookingInitialDraft, setBookingInitialDraft] =
     useState<BookingDraft | null>(null);
@@ -401,6 +410,9 @@ export function App() {
   const [serviceDuration, setServiceDuration] = useState("30");
   const [servicePrice, setServicePrice] = useState("0");
   const [serviceSaving, setServiceSaving] = useState(false);
+  const [newCategoryName, setNewCategoryName] = useState("");
+  const [categorySaving, setCategorySaving] = useState(false);
+  const [categoryError, setCategoryError] = useState("");
   const [adminStaff, setAdminStaff] = useState<Staff[]>([]);
   const [showInactiveStaff, setShowInactiveStaff] = useState(false);
   const [staffAdminLoading, setStaffAdminLoading] = useState(false);
@@ -504,7 +516,7 @@ export function App() {
     if (calendarMode === "day")
       return { startDate: calendarDate, endDate: calendarDate };
     const startDate = weekStart(calendarDate);
-    return { startDate, endDate: addLocalDays(startDate, 6) };
+    return { startDate, endDate: addLocalDays(startDate, 5) };
   }, [calendarDate, calendarMode]);
 
   const loadCalendar = useCallback(async () => {
@@ -524,13 +536,13 @@ export function App() {
     }
   }, [calendarRange]);
 
-  const loadCustomers = useCallback(async () => {
+  const loadCustomers = useCallback(async (query = customerSearch) => {
     setCustomersLoading(true);
     setCustomersError("");
     try {
       setCustomerList(
         await searchCustomersByStatus(
-          customerSearch.trim(),
+          query.trim(),
           showArchivedCustomers ? "all" : "active",
         ),
       );
@@ -883,6 +895,10 @@ export function App() {
         firstName: parts[0] ?? "",
         lastName: parts.slice(1).join(" "),
         phone: history.customer.phone,
+        email: null,
+        notes: null,
+        whatsappReminderEnabled: true,
+        whatsappConsentConfirmed: false,
         isActive: history.customer.isActive,
       };
     },
@@ -942,6 +958,82 @@ export function App() {
     customerHistory,
     loadCustomerHistory,
     loadCustomers,
+  ]);
+
+  const resetCustomerForm = useCallback(() => {
+    setCustomerFormOpen(false);
+    setEditingCustomer(null);
+    setCustomerFirstName("");
+    setCustomerLastName("");
+    setCustomerFormPhone("");
+    setCustomerNotes("");
+    setCustomerFormError("");
+  }, []);
+
+  const beginCustomerEdit = useCallback((customer: Customer) => {
+    setCustomerFormOpen(true);
+    setEditingCustomer(customer);
+    setCustomerFirstName(customer.firstName);
+    setCustomerLastName(customer.lastName);
+    setCustomerFormPhone(customer.phone ?? "");
+    setCustomerNotes(customer.notes ?? "");
+    setCustomerFormError("");
+  }, []);
+
+  const saveCustomer = useCallback(async () => {
+    if (customerFormSaving) return;
+    if (!customerFirstName.trim() || !customerLastName.trim()) {
+      setCustomerFormError("Müşteri adı ve soyadı girilmelidir.");
+      return;
+    }
+    setCustomerFormSaving(true);
+    setCustomerFormError("");
+    const input = {
+      firstName: customerFirstName.trim(),
+      lastName: customerLastName.trim(),
+      phone: customerFormPhone.trim() || null,
+      notes: customerNotes.trim() || null,
+      ...(editingCustomer
+        ? {
+            email: editingCustomer.email,
+            whatsappReminderEnabled: editingCustomer.whatsappReminderEnabled,
+            whatsappConsentConfirmed: editingCustomer.whatsappConsentConfirmed,
+          }
+        : {
+            whatsappReminderEnabled: true,
+            whatsappConsentConfirmed: false,
+          }),
+    };
+    try {
+      const saved = editingCustomer
+        ? await updateCustomer(editingCustomer.id, input)
+        : await createCustomer(input);
+      resetCustomerForm();
+      setCustomerSearch("");
+      await loadCustomers("");
+      if (editingCustomer || customerHistory?.customer.customerId === saved.id)
+        await loadCustomerHistory(saved.id);
+    } catch (error) {
+      const message = bookingErrorMessage(error);
+      setCustomerFormError(
+        message === "Randevu kaydedilemedi. Lütfen bilgileri kontrol edip tekrar deneyin."
+          ? "Müşteri kaydedilemedi. Lütfen bilgileri kontrol edip tekrar deneyin."
+          : message,
+      );
+    } finally {
+      setCustomerFormSaving(false);
+    }
+  }, [
+    customerFirstName,
+    customerFormPhone,
+    customerFormSaving,
+    customerHistory?.customer.customerId,
+    customerLastName,
+    customerNotes,
+    editingCustomer,
+    loadCustomerHistory,
+    loadCustomers,
+    resetCustomerForm,
   ]);
 
   const saveAppointment = useCallback(async () => {
@@ -1150,6 +1242,29 @@ export function App() {
     setServicesAdminError("");
   }, []);
 
+  const saveServiceCategory = useCallback(async () => {
+    if (categorySaving) return;
+    if (!newCategoryName.trim()) {
+      setCategoryError("Kategori adı girin.");
+      return;
+    }
+    setCategorySaving(true);
+    setCategoryError("");
+    try {
+      const category = await createServiceCategory({
+        name: newCategoryName.trim(),
+        isActive: true,
+      });
+      setServiceCategories((current) => [...current, category]);
+      setServiceCategoryId(category.id);
+      setNewCategoryName("");
+    } catch {
+      setCategoryError("Kategori kaydedilemedi. Aynı adla aktif bir kategori olabilir.");
+    } finally {
+      setCategorySaving(false);
+    }
+  }, [categorySaving, newCategoryName]);
+
   const saveService = useCallback(async () => {
     if (serviceSaving) return;
     const duration = Number(serviceDuration);
@@ -1255,6 +1370,7 @@ export function App() {
       setHistoryError("");
       setHistoryOffset(0);
       setHistoryHasMore(false);
+      resetCustomerForm();
       resetServiceForm();
       resetStaffForm();
       setStaffDetail(null);
@@ -1266,6 +1382,7 @@ export function App() {
     [
       resetAppointmentEditor,
       resetBooking,
+      resetCustomerForm,
       resetServiceForm,
       resetStaffForm,
     ],
@@ -2483,7 +2600,7 @@ export function App() {
               </div>
             ) : (
               <div className="calendar-week-grid">
-                {Array.from({ length: 7 }, (_, index) =>
+                {Array.from({ length: 6 }, (_, index) =>
                   addLocalDays(calendarRange.startDate, index),
                 ).map((date) => {
                   const items = calendarAppointments.filter(
@@ -2554,6 +2671,27 @@ export function App() {
                     </p>
                   </div>
                   <div className="customer-detail-actions">
+                    {customerList.find(
+                      (customer) =>
+                        customer.id === customerHistory.customer.customerId,
+                    ) && (
+                      <button
+                        type="button"
+                        className="dismiss-button"
+                        onClick={() => {
+                          const customer = customerList.find(
+                            (item) =>
+                              item.id === customerHistory.customer.customerId,
+                          );
+                          if (customer) {
+                            beginCustomerEdit(customer);
+                            setCustomerHistory(null);
+                          }
+                        }}
+                      >
+                        Düzenle
+                      </button>
+                    )}
                     {customerHistory.customer.isActive ? (
                       <button
                         type="button"
@@ -2692,7 +2830,95 @@ export function App() {
                     />{" "}
                     Arşivdekileri göster
                   </label>
+                  <button
+                    type="button"
+                    className="primary-action"
+                    onClick={() => {
+                      resetCustomerForm();
+                      setCustomerFormOpen(true);
+                    }}
+                  >
+                    Yeni Müşteri
+                  </button>
                 </div>
+                {customerFormOpen && (
+                  <section
+                    className="management-form"
+                    aria-labelledby="customer-form-title"
+                  >
+                    <div className="booking-heading">
+                      <h3 id="customer-form-title">
+                        {editingCustomer ? "Müşteriyi Düzenle" : "Yeni Müşteri"}
+                      </h3>
+                      <button
+                        type="button"
+                        className="text-action"
+                        disabled={customerFormSaving}
+                        onClick={resetCustomerForm}
+                      >
+                        Vazgeç
+                      </button>
+                    </div>
+                    <div className="booking-grid">
+                      <label className="form-field">
+                        <span>Ad</span>
+                        <input
+                          aria-label="Müşteri adı"
+                          value={customerFirstName}
+                          disabled={customerFormSaving}
+                          onChange={(event) => setCustomerFirstName(event.target.value)}
+                        />
+                      </label>
+                      <label className="form-field">
+                        <span>Soyad</span>
+                        <input
+                          aria-label="Müşteri soyadı"
+                          value={customerLastName}
+                          disabled={customerFormSaving}
+                          onChange={(event) => setCustomerLastName(event.target.value)}
+                        />
+                      </label>
+                      <label className="form-field">
+                        <span>Telefon (isteğe bağlı)</span>
+                        <input
+                          aria-label="Müşteri telefonu"
+                          value={customerFormPhone}
+                          disabled={customerFormSaving}
+                          onChange={(event) => setCustomerFormPhone(event.target.value)}
+                          placeholder="05xx xxx xx xx"
+                        />
+                      </label>
+                      <label className="form-field form-field--wide">
+                        <span>Müşteri notu (isteğe bağlı)</span>
+                        <textarea
+                          aria-label="Müşteri notu"
+                          value={customerNotes}
+                          disabled={customerFormSaving}
+                          onChange={(event) => setCustomerNotes(event.target.value)}
+                        />
+                      </label>
+                    </div>
+                    {customerFormError && (
+                      <p className="form-error form-error--action" role="alert">
+                        {customerFormError}
+                      </p>
+                    )}
+                    <div className="booking-actions">
+                      <button
+                        type="button"
+                        className="primary-action"
+                        disabled={customerFormSaving}
+                        onClick={() => void saveCustomer()}
+                      >
+                        {customerFormSaving
+                          ? "Kaydediliyor..."
+                          : editingCustomer
+                            ? "Müşteriyi Güncelle"
+                            : "Müşteri Ekle"}
+                      </button>
+                    </div>
+                  </section>
+                )}
                 {customersError && (
                   <div className="timeline-message" role="alert">
                     <span>{customersError}</span>
@@ -2835,6 +3061,30 @@ export function App() {
                         ))}
                       </select>
                     </label>
+                    <div className="category-create" aria-label="Yeni kategori">
+                      <label className="form-field">
+                        <span>Yeni kategori</span>
+                        <input
+                          aria-label="Yeni kategori adı"
+                          value={newCategoryName}
+                          disabled={categorySaving || serviceSaving}
+                          onChange={(event) => setNewCategoryName(event.target.value)}
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className="dismiss-button"
+                        disabled={categorySaving || serviceSaving}
+                        onClick={() => void saveServiceCategory()}
+                      >
+                        {categorySaving ? "Ekleniyor..." : "Kategori Ekle"}
+                      </button>
+                      {categoryError && (
+                        <p className="form-error" role="alert">
+                          {categoryError}
+                        </p>
+                      )}
+                    </div>
                     <label className="form-field">
                       <span>Süre (dakika)</span>
                       <input

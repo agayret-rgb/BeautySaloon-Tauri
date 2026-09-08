@@ -61,6 +61,7 @@ const api = vi.hoisted(() => ({
   reactivateCustomer: vi.fn(),
   searchCustomers: vi.fn(),
   searchCustomersByStatus: vi.fn(),
+  updateCustomer: vi.fn(),
   updateAppointment: vi.fn(),
 }));
 
@@ -104,6 +105,10 @@ const existingCustomer = {
   firstName: "Ayşe",
   lastName: "Yılmaz",
   phone: "+905551112233",
+  email: null,
+  notes: "Eski not",
+  whatsappReminderEnabled: true,
+  whatsappConsentConfirmed: false,
   isActive: true,
 };
 const todayAppointment = {
@@ -784,14 +789,22 @@ describe("Calendar day, week and edit foundation", () => {
     expect(screen.getByText("Ayşe Yılmaz")).toBeInTheDocument();
   });
 
-  it("switches to Monday-through-Sunday week view and shows empty days safely", async () => {
+  it("switches to a Monday-through-Saturday week view without a horizontal scroll surface", async () => {
     await openCalendar();
     fireEvent.click(screen.getByRole("button", { name: "Hafta" }));
     await waitFor(() =>
       expect(api.listAppointmentsByDateRange).toHaveBeenCalledTimes(2),
     );
     expect(screen.getAllByText("Randevu yok").length).toBeGreaterThan(0);
-    expect(screen.getByText("Ayşe Yılmaz")).toBeInTheDocument();
+    const weekGrid = screen.getByRole("region", { name: "Randevu takvimi" })
+      .querySelector(".calendar-week-grid")!;
+    expect(weekGrid.querySelectorAll(".calendar-week-day")).toHaveLength(6);
+    expect(
+      Array.from(weekGrid.querySelectorAll("h3")).some((heading) =>
+        heading.textContent?.endsWith(" Pazar"),
+      ),
+    ).toBe(false);
+    expect(weekGrid).not.toHaveStyle({ overflowX: "auto" });
   });
 
   it("navigates previous, today and next using bounded range reloads", async () => {
@@ -1000,6 +1013,7 @@ describe("Customer list, history and repeat booking", () => {
       isActive: false,
     });
     api.reactivateCustomer.mockResolvedValue(existingCustomer);
+    api.updateCustomer.mockResolvedValue(existingCustomer);
     api.createAppointment.mockResolvedValue({ id: "appointment-new" });
   });
 
@@ -1035,6 +1049,110 @@ describe("Customer list, history and repeat booking", () => {
         "active",
       ),
     );
+  });
+
+  it("creates an independent customer with an optional phone and refreshes the list", async () => {
+    const created = {
+      ...existingCustomer,
+      id: "customer-new",
+      firstName: "Deniz",
+      lastName: "Kaya",
+      phone: null,
+      notes: "Yeni not",
+    };
+    api.searchCustomersByStatus
+      .mockResolvedValueOnce([existingCustomer])
+      .mockResolvedValueOnce([existingCustomer, created]);
+    api.createCustomer.mockResolvedValue(created);
+    await openCustomers();
+    fireEvent.click(screen.getByRole("button", { name: "Yeni Müşteri" }));
+    fireEvent.change(screen.getByLabelText("Müşteri adı"), {
+      target: { value: "Deniz" },
+    });
+    fireEvent.change(screen.getByLabelText("Müşteri soyadı"), {
+      target: { value: "Kaya" },
+    });
+    fireEvent.change(screen.getByLabelText("Müşteri notu"), {
+      target: { value: "Yeni not" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Müşteri Ekle" }));
+    await waitFor(() =>
+      expect(api.createCustomer).toHaveBeenCalledWith(
+        expect.objectContaining({
+          firstName: "Deniz",
+          lastName: "Kaya",
+          phone: null,
+          notes: "Yeni not",
+        }),
+      ),
+    );
+    await screen.findByText("Deniz Kaya");
+    expect(api.createAppointment).not.toHaveBeenCalled();
+  });
+
+  it("keeps an independent customer draft and shows the safe duplicate phone error", async () => {
+    api.createCustomer.mockRejectedValueOnce(
+      new Error("CONFLICT: CUSTOMER_PHONE_CONFLICT"),
+    );
+    await openCustomers();
+    fireEvent.click(screen.getByRole("button", { name: "Yeni Müşteri" }));
+    fireEvent.change(screen.getByLabelText("Müşteri adı"), {
+      target: { value: "Deniz" },
+    });
+    fireEvent.change(screen.getByLabelText("Müşteri soyadı"), {
+      target: { value: "Kaya" },
+    });
+    fireEvent.change(screen.getByLabelText("Müşteri telefonu"), {
+      target: { value: "05551112233" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Müşteri Ekle" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Bu telefon numarası başka bir müşteride kayıtlı.",
+    );
+    expect(screen.getByLabelText("Müşteri telefonu")).toHaveValue("05551112233");
+  });
+
+  it("loads, updates, and clears customer phone and notes", async () => {
+    const updated = { ...existingCustomer, phone: null, notes: null };
+    api.updateCustomer.mockResolvedValue(updated);
+    await openCustomers();
+    fireEvent.click(await screen.findByRole("button", { name: /Ayşe Yılmaz/ }));
+    await screen.findByRole("heading", { name: "Randevu Geçmişi" });
+    fireEvent.click(screen.getByRole("button", { name: "Düzenle" }));
+    expect(screen.getByLabelText("Müşteri adı")).toHaveValue("Ayşe");
+    expect(screen.getByLabelText("Müşteri telefonu")).toHaveValue("+905551112233");
+    expect(screen.getByLabelText("Müşteri notu")).toHaveValue("Eski not");
+    fireEvent.change(screen.getByLabelText("Müşteri telefonu"), {
+      target: { value: "" },
+    });
+    fireEvent.change(screen.getByLabelText("Müşteri notu"), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Müşteriyi Güncelle" }));
+    await waitFor(() =>
+      expect(api.updateCustomer).toHaveBeenCalledWith(
+        "customer-1",
+        expect.objectContaining({ phone: null, notes: null }),
+      ),
+    );
+  });
+
+  it("preserves an edit draft after a customer update failure", async () => {
+    api.updateCustomer.mockRejectedValueOnce(
+      new Error("CONFLICT: CUSTOMER_PHONE_CONFLICT"),
+    );
+    await openCustomers();
+    fireEvent.click(await screen.findByRole("button", { name: /Ayşe Yılmaz/ }));
+    await screen.findByRole("heading", { name: "Randevu Geçmişi" });
+    fireEvent.click(screen.getByRole("button", { name: "Düzenle" }));
+    fireEvent.change(screen.getByLabelText("Müşteri notu"), {
+      target: { value: "Değişen not" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Müşteriyi Güncelle" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Bu telefon numarası başka bir müşteride kayıtlı.",
+    );
+    expect(screen.getByLabelText("Müşteri notu")).toHaveValue("Değişen not");
   });
 
   it("opens snapshot history and renders all historical services", async () => {
@@ -1202,6 +1320,12 @@ describe("Services and staff management", () => {
     api.listServiceCategories.mockResolvedValue([
       { id: "category-1", name: "Saç", sortOrder: 10, isActive: true },
     ]);
+    api.createServiceCategory.mockResolvedValue({
+      id: "category-2",
+      name: "Cilt",
+      sortOrder: 20,
+      isActive: true,
+    });
     api.createService.mockResolvedValue(managedService);
     api.updateService.mockResolvedValue(managedService);
     api.deactivateService.mockResolvedValue({
@@ -1263,6 +1387,24 @@ describe("Services and staff management", () => {
     await waitFor(() =>
       expect(api.deactivateService).toHaveBeenCalledWith("service-1"),
     );
+  });
+
+  it("creates a category and selects it for the service form", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Hizmetler" }));
+    await screen.findByRole("region", { name: "Hizmetler" });
+    fireEvent.change(screen.getByLabelText("Yeni kategori adı"), {
+      target: { value: "Cilt" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Kategori Ekle" }));
+    await waitFor(() =>
+      expect(api.createServiceCategory).toHaveBeenCalledWith({
+        name: "Cilt",
+        isActive: true,
+      }),
+    );
+    expect(screen.getByRole("option", { name: "Cilt" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Hizmet kategorisi")).toHaveValue("category-2");
   });
 
   it("keeps inactive services out of new assignments and can persist staff assignment and hours", async () => {

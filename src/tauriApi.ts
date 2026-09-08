@@ -52,6 +52,10 @@ export interface Customer {
   firstName: string;
   lastName: string;
   phone: string | null;
+  email: string | null;
+  notes: string | null;
+  whatsappReminderEnabled: boolean;
+  whatsappConsentConfirmed: boolean;
   isActive: boolean;
 }
 
@@ -364,6 +368,13 @@ export async function reactivateCustomer(id: string): Promise<Customer> {
 
 export async function createCustomer(input: CustomerInput): Promise<Customer> {
   return invoke<Customer>("customer_create", { input });
+}
+
+export async function updateCustomer(
+  id: string,
+  input: CustomerInput,
+): Promise<Customer> {
+  return invoke<Customer>("customer_update", { id, input });
 }
 
 export async function listActiveStaff(): Promise<Staff[]> {
