@@ -77,6 +77,20 @@ const navigationItems = [
   "Ayarlar",
 ] as const;
 
+const reservedServiceCategoryNames = new Set(["genel", "tümü"]);
+
+function isVisibleServiceCategory(category: ServiceCategory): boolean {
+  return !reservedServiceCategoryNames.has(
+    category.name.trim().toLocaleLowerCase("tr-TR"),
+  );
+}
+
+function isReservedServiceCategoryName(name: string): boolean {
+  return reservedServiceCategoryNames.has(
+    name.trim().toLocaleLowerCase("tr-TR"),
+  );
+}
+
 function todayLocalDate(): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Europe/Istanbul",
@@ -493,6 +507,11 @@ export function App() {
   const [onboardingServiceDuration, setOnboardingServiceDuration] =
     useState("30");
   const [onboardingServicePrice, setOnboardingServicePrice] = useState("0");
+  const [onboardingServiceCategories, setOnboardingServiceCategories] =
+    useState<ServiceCategory[]>([]);
+  const [onboardingServiceCategoryId, setOnboardingServiceCategoryId] =
+    useState("");
+  const [onboardingCategoryName, setOnboardingCategoryName] = useState("");
   const [onboardingSaving, setOnboardingSaving] = useState(false);
   const [onboardingError, setOnboardingError] = useState("");
 
@@ -632,10 +651,20 @@ export function App() {
         listServiceCategories(),
         getBusinessProfile(),
       ]);
+      const visibleCategories = categories.filter(isVisibleServiceCategory);
       setAdminServices(items);
-      setServiceCategories(categories);
+      setServiceCategories(visibleCategories);
       setCurrencyCode(profile.currencyCode);
-      setServiceCategoryId((current) => current || categories[0]?.id || "");
+      setServiceCategoryId((current) =>
+        visibleCategories.some((category) => category.id === current)
+          ? current
+          : "",
+      );
+      setServiceCategoryFilterId((current) =>
+        current === "all" || visibleCategories.some((category) => category.id === current)
+          ? current
+          : "all",
+      );
     } catch {
       setServicesAdminError("Hizmetler yüklenemedi.");
     } finally {
@@ -1236,8 +1265,8 @@ export function App() {
     setServiceName("");
     setServiceDuration("30");
     setServicePrice("0");
-    setServiceCategoryId(serviceCategories[0]?.id ?? "");
-  }, [serviceCategories]);
+    setServiceCategoryId("");
+  }, []);
 
   const beginServiceEdit = useCallback((item: ServiceItem) => {
     setEditingService(item);
@@ -1252,6 +1281,10 @@ export function App() {
     if (categorySaving) return;
     if (!newCategoryName.trim()) {
       setCategoryError("Kategori adı girin.");
+      return;
+    }
+    if (isReservedServiceCategoryName(newCategoryName)) {
+      setCategoryError("Bu kategori adı kullanılamaz.");
       return;
     }
     setCategorySaving(true);
@@ -1281,6 +1314,10 @@ export function App() {
     if (!editingCategory || categorySaving) return;
     if (!editingCategoryName.trim()) {
       setCategoryError("Kategori adı girin.");
+      return;
+    }
+    if (isReservedServiceCategoryName(editingCategoryName)) {
+      setCategoryError("Bu kategori adı kullanılamaz.");
       return;
     }
     setCategorySaving(true);
@@ -1313,6 +1350,10 @@ export function App() {
     if (serviceSaving) return;
     const duration = Number(serviceDuration);
     const price = parseMinor(servicePrice);
+    if (!editingService && serviceCategories.length === 0) {
+      setServicesAdminError("Hizmet eklemek için önce bir kategori oluşturun.");
+      return;
+    }
     if (
       !serviceName.trim() ||
       !serviceCategoryId ||
@@ -1350,6 +1391,7 @@ export function App() {
     editingService,
     loadServicesAdmin,
     resetServiceForm,
+    serviceCategories.length,
     serviceCategoryId,
     serviceDuration,
     serviceName,
@@ -1871,16 +1913,30 @@ export function App() {
       setOnboardingError("Hizmet adı, süre ve geçerli bir ücret girin.");
       return;
     }
+    if (!onboardingServiceCategoryId) {
+      setOnboardingError(
+        onboardingServiceCategories.length === 0
+          ? "İlk hizmeti eklemek için önce bir kategori oluşturun."
+          : "Hizmet için bir kategori seçin.",
+      );
+      return;
+    }
     setOnboardingSaving(true);
     setOnboardingError("");
     try {
       const currentStaffId =
         onboardingStaffId || (await listActiveStaff())[0]?.id || "";
       if (!currentStaffId) throw new Error("staff missing");
-      const categories = await listServiceCategories();
-      const category =
-        categories[0] ??
-        (await createServiceCategory({ name: "Genel", isActive: true }));
+      const categories = (await listServiceCategories()).filter(
+        isVisibleServiceCategory,
+      );
+      const category = categories.find(
+        (item) => item.id === onboardingServiceCategoryId,
+      );
+      if (!category) {
+        setOnboardingError("Hizmet eklemek için önce bir kategori oluşturun.");
+        return;
+      }
       const service = await createService({
         categoryId: category.id,
         name: onboardingServiceName.trim(),
@@ -1899,10 +1955,61 @@ export function App() {
   }, [
     onboardingSaving,
     onboardingServiceDuration,
+    onboardingServiceCategoryId,
+    onboardingServiceCategories.length,
     onboardingServiceName,
     onboardingServicePrice,
     onboardingStaffId,
   ]);
+
+  const saveOnboardingCategory = useCallback(async () => {
+    if (onboardingSaving) return;
+    if (!onboardingCategoryName.trim()) {
+      setOnboardingError("Kategori adı girin.");
+      return;
+    }
+    if (isReservedServiceCategoryName(onboardingCategoryName)) {
+      setOnboardingError("Bu kategori adı kullanılamaz.");
+      return;
+    }
+    setOnboardingSaving(true);
+    setOnboardingError("");
+    try {
+      const category = await createServiceCategory({
+        name: onboardingCategoryName.trim(),
+        isActive: true,
+      });
+      setOnboardingServiceCategories((current) => [...current, category]);
+      setOnboardingServiceCategoryId(category.id);
+      setOnboardingCategoryName("");
+    } catch {
+      setOnboardingError("Kategori kaydedilemedi. Aynı adla aktif bir kategori olabilir.");
+    } finally {
+      setOnboardingSaving(false);
+    }
+  }, [onboardingCategoryName, onboardingSaving]);
+
+  useEffect(() => {
+    if (!onboardingOpen || onboardingStep !== 3) return;
+    let cancelled = false;
+    void listServiceCategories()
+      .then((categories) => {
+        if (cancelled) return;
+        const visibleCategories = categories.filter(isVisibleServiceCategory);
+        setOnboardingServiceCategories(visibleCategories);
+        setOnboardingServiceCategoryId((current) =>
+          visibleCategories.some((category) => category.id === current)
+            ? current
+            : "",
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setOnboardingError("Kategoriler yüklenemedi.");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [onboardingOpen, onboardingStep]);
 
   const finishOnboarding = useCallback(() => {
     setOnboardingOpen(false);
@@ -2012,6 +2119,24 @@ export function App() {
               </label>
               <div className="booking-grid">
                 <label className="form-field">
+                  <span>Kategori</span>
+                  <select
+                    aria-label="Onboarding hizmet kategorisi"
+                    value={onboardingServiceCategoryId}
+                    disabled={onboardingSaving}
+                    onChange={(event) =>
+                      setOnboardingServiceCategoryId(event.target.value)
+                    }
+                  >
+                    <option value="">Kategori seçin</option>
+                    {onboardingServiceCategories.map((category) => (
+                      <option key={category.id} value={category.id}>
+                        {category.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="form-field">
                   <span>Süre (dakika)</span>
                   <input
                     aria-label="Onboarding hizmet süresi"
@@ -2036,6 +2161,30 @@ export function App() {
                     }
                   />
                 </label>
+              </div>
+              {onboardingServiceCategories.length === 0 && (
+                <p className="timeline-message">
+                  İlk hizmeti eklemek için önce bir kategori oluşturun.
+                </p>
+              )}
+              <div className="category-create" aria-label="İlk hizmet kategorisi">
+                <label className="form-field">
+                  <span>Yeni kategori</span>
+                  <input
+                    aria-label="Onboarding yeni kategori adı"
+                    value={onboardingCategoryName}
+                    disabled={onboardingSaving}
+                    onChange={(event) => setOnboardingCategoryName(event.target.value)}
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="dismiss-button"
+                  disabled={onboardingSaving}
+                  onClick={() => void saveOnboardingCategory()}
+                >
+                  Kategori Ekle
+                </button>
               </div>
               <div className="onboarding-actions">
                 <button

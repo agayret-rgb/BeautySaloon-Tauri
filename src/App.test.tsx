@@ -1370,6 +1370,9 @@ describe("Services and staff management", () => {
     await screen.findByRole("region", { name: "Hizmetler" });
     expect(await screen.findByText("Saç Kesimi")).toBeInTheDocument();
     expect(screen.getByText(/₺/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Hizmet kategorisi"), {
+      target: { value: "category-1" },
+    });
     fireEvent.change(screen.getByLabelText("Hizmet adı"), {
       target: { value: "Boya" },
     });
@@ -1422,31 +1425,34 @@ describe("Services and staff management", () => {
     expect(screen.getByLabelText("Hizmet kategorisi")).toHaveValue("category-2");
   });
 
-  it("groups services by category and filters a distinct Genel category", async () => {
-    const generalService = {
+  it("hides the legacy Genel category and keeps Tümü for all real categories", async () => {
+    const skinService = {
       ...managedService,
       id: "service-2",
       name: "Manikür",
       categoryId: "category-2",
-      categoryName: "Genel",
+      categoryName: "Cilt",
     };
     api.listServiceCategories.mockResolvedValue([
       { id: "category-1", name: "Saç", sortOrder: 10, isActive: true },
-      { id: "category-2", name: "Genel", sortOrder: 20, isActive: true },
+      { id: "category-2", name: "Cilt", sortOrder: 20, isActive: true },
+      { id: "category-legacy", name: "Genel", sortOrder: 30, isActive: true },
     ]);
-    api.listServices.mockResolvedValue([managedService, generalService]);
+    api.listServices.mockResolvedValue([managedService, skinService]);
 
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Hizmetler" }));
     expect(await screen.findByRole("region", { name: "Saç kategorisi" })).toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "Genel kategorisi" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Cilt kategorisi" })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Genel kategorisi" })).not.toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Tümü" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Genel" })).not.toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Hizmet kategorisi filtresi"), {
       target: { value: "category-2" },
     });
     expect(screen.queryByRole("region", { name: "Saç kategorisi" })).not.toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "Genel kategorisi" })).toHaveTextContent(
+    expect(screen.getByRole("region", { name: "Cilt kategorisi" })).toHaveTextContent(
       "Manikür",
     );
   });
@@ -1476,12 +1482,12 @@ describe("Services and staff management", () => {
   it("moves a service by saving its one selected category", async () => {
     api.listServiceCategories.mockResolvedValue([
       { id: "category-1", name: "Saç", sortOrder: 10, isActive: true },
-      { id: "category-2", name: "Genel", sortOrder: 20, isActive: true },
+      { id: "category-2", name: "Cilt", sortOrder: 20, isActive: true },
     ]);
     api.updateService.mockResolvedValue({
       ...managedService,
       categoryId: "category-2",
-      categoryName: "Genel",
+      categoryName: "Cilt",
     });
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Hizmetler" }));
@@ -1499,6 +1505,35 @@ describe("Services and staff management", () => {
         expect.objectContaining({ categoryId: "category-2" }),
       ),
     );
+  });
+
+  it("requires a real category before creating a service", async () => {
+    api.listServiceCategories.mockResolvedValue([]);
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Hizmetler" }));
+    await screen.findByRole("region", { name: "Hizmetler" });
+    fireEvent.change(screen.getByLabelText("Hizmet adı"), {
+      target: { value: "Fön" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Hizmet Ekle" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Hizmet eklemek için önce bir kategori oluşturun.",
+    );
+    expect(api.createService).not.toHaveBeenCalled();
+  });
+
+  it("requires selecting a real category before creating a service", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Hizmetler" }));
+    await screen.findByRole("region", { name: "Hizmetler" });
+    fireEvent.change(screen.getByLabelText("Hizmet adı"), {
+      target: { value: "Fön" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Hizmet Ekle" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Hizmet adı, kategori, süre ve geçerli bir fiyat girin.",
+    );
+    expect(api.createService).not.toHaveBeenCalled();
   });
 
   it("keeps inactive services out of new assignments and can persist staff assignment and hours", async () => {
@@ -2029,7 +2064,7 @@ describe("First-run onboarding", () => {
   };
   const category = {
     id: "category-1",
-    name: "Genel",
+    name: "Cilt",
     sortOrder: 1,
     isActive: true,
   };
@@ -2103,6 +2138,9 @@ describe("First-run onboarding", () => {
     fireEvent.change(screen.getByLabelText("Onboarding hizmet adı"), {
       target: { value: "Saç Kesimi" },
     });
+    fireEvent.change(screen.getByLabelText("Onboarding hizmet kategorisi"), {
+      target: { value: "category-1" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Devam Et" }));
     await waitFor(() =>
       expect(api.setStaffServices).toHaveBeenCalledWith("staff-1", [
@@ -2131,40 +2169,16 @@ describe("First-run onboarding", () => {
     fireEvent.change(screen.getByLabelText("Onboarding hizmet adı"), {
       target: { value: "Fön" },
     });
+    fireEvent.change(await screen.findByLabelText("Onboarding hizmet kategorisi"), {
+      target: { value: "category-1" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Devam Et" }));
     await waitFor(() => expect(api.createService).toHaveBeenCalledTimes(1));
     expect(api.createStaff).not.toHaveBeenCalled();
   });
 
-  it("creates the fallback category only when no active category exists", async () => {
+  it("requires an explicit category when onboarding has none", async () => {
     api.listServiceCategories.mockResolvedValue([]);
-    api.createServiceCategory.mockResolvedValue(category);
-    api.getOnboardingState.mockResolvedValue({
-      needsOnboarding: true,
-      nextStep: 3,
-    });
-    render(<App />);
-    fireEvent.change(await screen.findByLabelText("Onboarding hizmet adı"), {
-      target: { value: "Fön" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Devam Et" }));
-    await waitFor(() =>
-      expect(api.createServiceCategory).toHaveBeenCalledWith({
-        name: "Genel",
-        isActive: true,
-      }),
-    );
-    expect(api.createServiceCategory).toHaveBeenCalledTimes(1);
-  });
-
-  it("reuses the persisted fallback category when service creation is retried", async () => {
-    api.listServiceCategories
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([category]);
-    api.createServiceCategory.mockResolvedValue(category);
-    api.createService
-      .mockRejectedValueOnce(new Error("failure"))
-      .mockResolvedValueOnce(activeService);
     api.getOnboardingState.mockResolvedValue({
       needsOnboarding: true,
       nextStep: 3,
@@ -2175,10 +2189,37 @@ describe("First-run onboarding", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Devam Et" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Hizmet kaydedilemedi.",
+      "İlk hizmeti eklemek için önce bir kategori oluşturun.",
+    );
+    expect(api.createServiceCategory).not.toHaveBeenCalled();
+    expect(api.createService).not.toHaveBeenCalled();
+  });
+
+  it("lets onboarding create and select a real category", async () => {
+    api.listServiceCategories
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([category]);
+    api.createServiceCategory.mockResolvedValue(category);
+    api.getOnboardingState.mockResolvedValue({
+      needsOnboarding: true,
+      nextStep: 3,
+    });
+    render(<App />);
+    fireEvent.change(await screen.findByLabelText("Onboarding hizmet adı"), {
+      target: { value: "Fön" },
+    });
+    fireEvent.change(screen.getByLabelText("Onboarding yeni kategori adı"), {
+      target: { value: "Cilt" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Kategori Ekle" }));
+    await waitFor(() =>
+      expect(api.createServiceCategory).toHaveBeenCalledWith({
+        name: "Cilt",
+        isActive: true,
+      }),
     );
     fireEvent.click(screen.getByRole("button", { name: "Devam Et" }));
-    await waitFor(() => expect(api.createService).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(api.createService).toHaveBeenCalledTimes(1));
     expect(api.createServiceCategory).toHaveBeenCalledTimes(1);
   });
 
