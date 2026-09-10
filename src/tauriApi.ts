@@ -400,6 +400,12 @@ export async function createServiceCategory(
 ): Promise<ServiceCategory> {
   return invoke<ServiceCategory>("service_category_create", { input });
 }
+export async function updateServiceCategory(
+  id: string,
+  input: ServiceCategoryInput,
+): Promise<ServiceCategory> {
+  return invoke<ServiceCategory>("service_category_update", { id, input });
+}
 export async function createService(input: ServiceInput): Promise<ServiceItem> {
   return invoke<ServiceItem>("service_create", { input });
 }
@@ -579,6 +585,7 @@ export const coreDataCommands = [
   "staff_list",
   "staff_set_services",
   "service_category_create",
+  "service_category_update",
   "service_create",
   "service_update",
   "service_set_active",

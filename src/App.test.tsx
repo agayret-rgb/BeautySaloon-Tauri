@@ -4,6 +4,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
@@ -12,6 +13,7 @@ const api = vi.hoisted(() => ({
   createAppointment: vi.fn(),
   createCustomer: vi.fn(),
   createServiceCategory: vi.fn(),
+  updateServiceCategory: vi.fn(),
   getCustomerHistory: vi.fn(),
   getRepeatBookingSeed: vi.fn(),
   listActiveServices: vi.fn(),
@@ -436,26 +438,14 @@ describe("New appointment flow", () => {
     expect(screen.getByText("Randevu kaydedildi.")).toBeInTheDocument();
   });
 
-  it("records WhatsApp consent only after an explicit checked choice with a phone", async () => {
+  it("shows only the appointment WhatsApp preference in the booking form", async () => {
     await openForm();
-    fireEvent.change(screen.getByLabelText("Müşteri adı"), {
-      target: { value: "Deniz Kaya" },
-    });
-    fireEvent.change(screen.getByLabelText("Telefon (isteğe bağlı)"), {
-      target: { value: "05551112233" },
-    });
-    fireEvent.click(
-      screen.getByLabelText(
-        "WhatsApp ile randevu hatırlatması gönderilebilir",
-      ),
-    );
-    await fillRequiredFields(false);
-    fireEvent.click(screen.getByRole("button", { name: "Randevuyu Kaydet" }));
-    await waitFor(() =>
-      expect(api.createCustomer).toHaveBeenCalledWith(
-        expect.objectContaining({ whatsappConsentConfirmed: true }),
-      ),
-    );
+    expect(
+      screen.queryByLabelText("WhatsApp ile randevu hatırlatması gönderilebilir"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Bu randevu için WhatsApp hatırlatması"),
+    ).toBeChecked();
   });
 
   it("shows only active services and staff", async () => {
@@ -867,6 +857,17 @@ describe("Calendar day, week and edit foundation", () => {
         }),
       ),
     );
+  });
+
+  it("keeps the Week edit action in its own stable card row", async () => {
+    await openCalendar();
+    fireEvent.click(screen.getByRole("button", { name: "Hafta" }));
+    fireEvent.click(screen.getByRole("button", { name: "Önceki" }));
+    const edit = await screen.findByRole("button", { name: "Düzenle" });
+    const card = edit.closest("article");
+    expect(card).toHaveClass("calendar-appointment");
+    expect(card?.querySelector(".calendar-appointment-details")).not.toBeNull();
+    expect(edit).toHaveClass("calendar-edit-action");
   });
 
   it("keeps a dirty appointment edit open until the user chooses to leave", async () => {
@@ -1326,6 +1327,12 @@ describe("Services and staff management", () => {
       sortOrder: 20,
       isActive: true,
     });
+    api.updateServiceCategory.mockResolvedValue({
+      id: "category-1",
+      name: "Saç Bakımı",
+      sortOrder: 10,
+      isActive: true,
+    });
     api.createService.mockResolvedValue(managedService);
     api.updateService.mockResolvedValue(managedService);
     api.deactivateService.mockResolvedValue({
@@ -1381,7 +1388,11 @@ describe("Services and staff management", () => {
         }),
       ),
     );
-    fireEvent.click(screen.getByRole("button", { name: "Düzenle" }));
+    fireEvent.click(
+      within(screen.getByRole("region", { name: "Saç kategorisi" }))
+        .getAllByRole("button", { name: "Düzenle" })
+        .at(-1)!,
+    );
     expect(screen.getByLabelText("Hizmet adı")).toHaveValue("Saç Kesimi");
     fireEvent.click(screen.getByRole("button", { name: "Pasife Al" }));
     await waitFor(() =>
@@ -1403,8 +1414,91 @@ describe("Services and staff management", () => {
         isActive: true,
       }),
     );
-    expect(screen.getByRole("option", { name: "Cilt" })).toBeInTheDocument();
+    expect(
+      within(screen.getByLabelText("Hizmet kategorisi")).getByRole("option", {
+        name: "Cilt",
+      }),
+    ).toBeInTheDocument();
     expect(screen.getByLabelText("Hizmet kategorisi")).toHaveValue("category-2");
+  });
+
+  it("groups services by category and filters a distinct Genel category", async () => {
+    const generalService = {
+      ...managedService,
+      id: "service-2",
+      name: "Manikür",
+      categoryId: "category-2",
+      categoryName: "Genel",
+    };
+    api.listServiceCategories.mockResolvedValue([
+      { id: "category-1", name: "Saç", sortOrder: 10, isActive: true },
+      { id: "category-2", name: "Genel", sortOrder: 20, isActive: true },
+    ]);
+    api.listServices.mockResolvedValue([managedService, generalService]);
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Hizmetler" }));
+    expect(await screen.findByRole("region", { name: "Saç kategorisi" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Genel kategorisi" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Tümü" })).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Hizmet kategorisi filtresi"), {
+      target: { value: "category-2" },
+    });
+    expect(screen.queryByRole("region", { name: "Saç kategorisi" })).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Genel kategorisi" })).toHaveTextContent(
+      "Manikür",
+    );
+  });
+
+  it("renames a category without moving its services", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Hizmetler" }));
+    const category = await screen.findByRole("region", { name: "Saç kategorisi" });
+    fireEvent.click(
+      within(category).getAllByRole("button", { name: "Düzenle" })[0],
+    );
+    fireEvent.change(screen.getByLabelText("Kategori adı"), {
+      target: { value: "Saç Bakımı" },
+    });
+    fireEvent.click(within(category).getByRole("button", { name: "Kaydet" }));
+    await waitFor(() =>
+      expect(api.updateServiceCategory).toHaveBeenCalledWith("category-1", {
+        name: "Saç Bakımı",
+        isActive: true,
+      }),
+    );
+    expect(await screen.findByRole("region", { name: "Saç Bakımı kategorisi" })).toHaveTextContent(
+      "Saç Kesimi",
+    );
+  });
+
+  it("moves a service by saving its one selected category", async () => {
+    api.listServiceCategories.mockResolvedValue([
+      { id: "category-1", name: "Saç", sortOrder: 10, isActive: true },
+      { id: "category-2", name: "Genel", sortOrder: 20, isActive: true },
+    ]);
+    api.updateService.mockResolvedValue({
+      ...managedService,
+      categoryId: "category-2",
+      categoryName: "Genel",
+    });
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Hizmetler" }));
+    const category = await screen.findByRole("region", { name: "Saç kategorisi" });
+    fireEvent.click(
+      within(category).getAllByRole("button", { name: "Düzenle" }).at(-1)!,
+    );
+    fireEvent.change(screen.getByLabelText("Hizmet kategorisi"), {
+      target: { value: "category-2" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Hizmeti Güncelle" }));
+    await waitFor(() =>
+      expect(api.updateService).toHaveBeenCalledWith(
+        "service-1",
+        expect.objectContaining({ categoryId: "category-2" }),
+      ),
+    );
   });
 
   it("keeps inactive services out of new assignments and can persist staff assignment and hours", async () => {

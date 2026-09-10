@@ -2333,6 +2333,31 @@ fn create_category_tx(
     get_category(connection, &id)
 }
 
+fn update_category_tx(
+    connection: &mut Connection,
+    id: &str,
+    input: CategoryInput,
+) -> Result<ServiceCategory, AppError> {
+    let existing = get_category(connection, id)
+        .map_err(|_| AppError::NotFound("CATEGORY_NOT_FOUND".to_string()))?;
+    let name = normalize_text(&input.name, "name", 2, 120)?;
+    let key = name_key(&name);
+    if existing.name == name && existing.is_active == input.is_active.unwrap_or(existing.is_active) {
+        return Ok(existing);
+    }
+    connection.execute(
+        "UPDATE service_categories SET name=?1,name_key=?2,is_active=?3,updated_at=?4 WHERE id=?5",
+        params![
+            name,
+            key,
+            bool_to_i64(input.is_active.unwrap_or(existing.is_active)),
+            now_iso(),
+            id
+        ],
+    )?;
+    get_category(connection, id)
+}
+
 fn get_category(connection: &Connection, id: &str) -> Result<ServiceCategory, AppError> {
     connection
         .query_row(
@@ -4719,6 +4744,15 @@ fn service_category_create(
 }
 
 #[tauri::command]
+fn service_category_update(
+    id: String,
+    input: CategoryInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<ServiceCategory, AppError> {
+    run_business_mutation(&state, |connection| update_category_tx(connection, &id, input))
+}
+
+#[tauri::command]
 fn service_category_list(
     status: Option<String>,
     state: tauri::State<'_, AppState>,
@@ -5904,6 +5938,7 @@ pub fn run() {
             staff_time_off_update,
             staff_time_off_remove,
             service_category_create,
+            service_category_update,
             service_category_list,
             service_create,
             service_update,
@@ -7883,6 +7918,31 @@ mod tests {
         let inactive =
             customer_set_active_for_test(&connection, &customer.id, false).expect("inactive");
         assert!(!inactive.is_active);
+    }
+
+    #[test]
+    fn category_rename_preserves_its_id_and_service_assignment() {
+        let (_temp, mut connection) = open_temp();
+        let (_customer, _staff, service) = seed_core(&mut connection);
+        let category_id = service.category_id.clone();
+
+        let category = update_category_tx(
+            &mut connection,
+            &category_id,
+            CategoryInput {
+                name: "Cilt Bakimi Yeni".into(),
+                is_active: Some(true),
+            },
+        )
+        .expect("rename category");
+
+        assert_eq!(category.id, category_id);
+        assert_eq!(category.name, "Cilt Bakimi Yeni");
+        let refreshed_service = get_service(&connection, &service.id)
+            .expect("read service")
+            .expect("service remains");
+        assert_eq!(refreshed_service.category_id, category_id);
+        assert_eq!(refreshed_service.category_name, "Cilt Bakimi Yeni");
     }
 
     fn customer_set_active_for_test(

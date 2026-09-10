@@ -61,6 +61,7 @@ import {
   updateAppointment,
   updateBusinessProfile,
   updateCustomer,
+  updateServiceCategory,
   updateService,
   updateStaff,
   updateStaffTimeOff,
@@ -411,6 +412,11 @@ export function App() {
   const [servicePrice, setServicePrice] = useState("0");
   const [serviceSaving, setServiceSaving] = useState(false);
   const [newCategoryName, setNewCategoryName] = useState("");
+  const [serviceCategoryFilterId, setServiceCategoryFilterId] =
+    useState("all");
+  const [editingCategory, setEditingCategory] =
+    useState<ServiceCategory | null>(null);
+  const [editingCategoryName, setEditingCategoryName] = useState("");
   const [categorySaving, setCategorySaving] = useState(false);
   const [categoryError, setCategoryError] = useState("");
   const [adminStaff, setAdminStaff] = useState<Staff[]>([]);
@@ -1264,6 +1270,44 @@ export function App() {
       setCategorySaving(false);
     }
   }, [categorySaving, newCategoryName]);
+
+  const beginCategoryEdit = useCallback((category: ServiceCategory) => {
+    setEditingCategory(category);
+    setEditingCategoryName(category.name);
+    setCategoryError("");
+  }, []);
+
+  const saveCategoryRename = useCallback(async () => {
+    if (!editingCategory || categorySaving) return;
+    if (!editingCategoryName.trim()) {
+      setCategoryError("Kategori adı girin.");
+      return;
+    }
+    setCategorySaving(true);
+    setCategoryError("");
+    try {
+      const category = await updateServiceCategory(editingCategory.id, {
+        name: editingCategoryName.trim(),
+        isActive: editingCategory.isActive,
+      });
+      setServiceCategories((current) =>
+        current.map((item) => (item.id === category.id ? category : item)),
+      );
+      setAdminServices((current) =>
+        current.map((item) =>
+          item.categoryId === category.id
+            ? { ...item, categoryName: category.name }
+            : item,
+        ),
+      );
+      setEditingCategory(null);
+      setEditingCategoryName("");
+    } catch {
+      setCategoryError("Kategori kaydedilemedi. Aynı adla bir kategori olabilir.");
+    } finally {
+      setCategorySaving(false);
+    }
+  }, [categorySaving, editingCategory, editingCategoryName]);
 
   const saveService = useCallback(async () => {
     if (serviceSaving) return;
@@ -2250,17 +2294,6 @@ export function App() {
                   placeholder="05xx xxx xx xx"
                 />
               </label>
-              {!selectedCustomer && (
-                <label className="archive-filter">
-                  <input
-                    type="checkbox"
-                    checked={whatsappConsent}
-                    disabled={isSaving || !phone.trim()}
-                    onChange={(event) => setWhatsappConsent(event.target.checked)}
-                  />{" "}
-                  WhatsApp ile randevu hatırlatması gönderilebilir
-                </label>
-              )}
               <label className="archive-filter">
                 <input
                   type="checkbox"
@@ -2618,7 +2651,7 @@ export function App() {
                             <time>
                               {timeInIstanbul(appointment.startAtUtc)}
                             </time>
-                            <span>
+                            <span className="calendar-appointment-details">
                               <strong>{appointment.customerName}</strong>
                               <small>
                                 {appointment.services
@@ -2969,16 +3002,35 @@ export function App() {
                 <h2>Hizmetler</h2>
                 <p>Yeni randevularda kullanılacak aktif hizmetleri yönetin.</p>
               </div>
-              <label className="archive-filter">
-                <input
-                  type="checkbox"
-                  checked={showInactiveServices}
-                  onChange={(event) =>
-                    setShowInactiveServices(event.target.checked)
-                  }
-                />{" "}
-                Pasifleri göster
-              </label>
+              <div className="services-toolbar-controls">
+                <label className="form-field service-category-filter">
+                  <span>Kategori</span>
+                  <select
+                    aria-label="Hizmet kategorisi filtresi"
+                    value={serviceCategoryFilterId}
+                    onChange={(event) =>
+                      setServiceCategoryFilterId(event.target.value)
+                    }
+                  >
+                    <option value="all">Tümü</option>
+                    {serviceCategories.map((category) => (
+                      <option key={category.id} value={category.id}>
+                        {category.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="archive-filter">
+                  <input
+                    type="checkbox"
+                    checked={showInactiveServices}
+                    onChange={(event) =>
+                      setShowInactiveServices(event.target.checked)
+                    }
+                  />{" "}
+                  Pasifleri göster
+                </label>
+              </div>
             </div>
             <div
               className="calendar-mode"
@@ -3131,42 +3183,113 @@ export function App() {
                 ) : adminServices.length === 0 ? (
                   <p className="calendar-empty">Hizmet bulunamadı.</p>
                 ) : (
-                  <div className="management-list">
-                    {adminServices.map((item) => (
-                      <article className="management-row" key={item.id}>
-                        <div>
-                          <strong>{item.name}</strong>
-                          <p>
-                            {item.categoryName} · {item.durationMinutes ?? 0} dk
-                            ·{" "}
-                            {formatMinor(item.defaultPriceMinor, currencyCode)}
-                          </p>
-                        </div>
-                        <div className="row-actions">
-                          {!item.isActive && (
-                            <span className="status-badge status-cancelled">
-                              Pasif
-                            </span>
-                          )}
-                          <button
-                            type="button"
-                            className="dismiss-button"
-                            disabled={serviceSaving}
-                            onClick={() => beginServiceEdit(item)}
+                  <div className="service-category-grid">
+                    {serviceCategories
+                      .filter(
+                        (category) =>
+                          serviceCategoryFilterId === "all" ||
+                          category.id === serviceCategoryFilterId,
+                      )
+                      .map((category) => {
+                        const categoryServices = adminServices.filter(
+                          (item) => item.categoryId === category.id,
+                        );
+                        return (
+                          <section
+                            className="service-category-card"
+                            key={category.id}
+                            aria-label={`${category.name} kategorisi`}
                           >
-                            Düzenle
-                          </button>
-                          <button
-                            type="button"
-                            className="dismiss-button"
-                            disabled={serviceSaving}
-                            onClick={() => void setServiceActive(item)}
-                          >
-                            {item.isActive ? "Pasife Al" : "Aktifleştir"}
-                          </button>
-                        </div>
-                      </article>
-                    ))}
+                            <header className="service-category-heading">
+                              {editingCategory?.id === category.id ? (
+                                <label className="form-field">
+                                  <span>Kategori adı</span>
+                                  <input
+                                    aria-label="Kategori adı"
+                                    value={editingCategoryName}
+                                    disabled={categorySaving}
+                                    onChange={(event) =>
+                                      setEditingCategoryName(event.target.value)
+                                    }
+                                  />
+                                </label>
+                              ) : (
+                                <h3>{category.name}</h3>
+                              )}
+                              <div className="row-actions">
+                                {editingCategory?.id === category.id ? (
+                                  <>
+                                    <button
+                                      type="button"
+                                      className="dismiss-button"
+                                      disabled={categorySaving}
+                                      onClick={() => void saveCategoryRename()}
+                                    >
+                                      Kaydet
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="text-action"
+                                      disabled={categorySaving}
+                                      onClick={() => setEditingCategory(null)}
+                                    >
+                                      Vazgeç
+                                    </button>
+                                  </>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className="text-action"
+                                    onClick={() => beginCategoryEdit(category)}
+                                  >
+                                    Düzenle
+                                  </button>
+                                )}
+                              </div>
+                            </header>
+                            {categoryServices.length === 0 ? (
+                              <p className="calendar-empty">Bu kategoride hizmet yok.</p>
+                            ) : (
+                              <div className="management-list">
+                                {categoryServices.map((item) => (
+                                  <article className="management-row" key={item.id}>
+                                    <div>
+                                      <strong>{item.name}</strong>
+                                      <p>
+                                        {item.durationMinutes ?? 0} dk ·{" "}
+                                        {formatMinor(item.defaultPriceMinor, currencyCode)}
+                                      </p>
+                                    </div>
+                                    <div className="row-actions">
+                                      {!item.isActive && (
+                                        <span className="status-badge status-cancelled">
+                                          Pasif
+                                        </span>
+                                      )}
+                                      <button
+                                        type="button"
+                                        className="dismiss-button"
+                                        disabled={serviceSaving}
+                                        onClick={() => beginServiceEdit(item)}
+                                      >
+                                        Düzenle
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="dismiss-button"
+                                        disabled={serviceSaving}
+                                        onClick={() => void setServiceActive(item)}
+                                      >
+                                        {item.isActive ? "Pasife Al" : "Aktifleştir"}
+                                      </button>
+                                    </div>
+                                  </article>
+                                ))}
+                              </div>
+                            )}
+                          </section>
+                        );
+                      })}
                   </div>
                 )}
               </>

@@ -397,7 +397,7 @@ p {
   color: #235e55;
   font-weight: 750;
 }
-.calendar-appointment span {
+.calendar-appointment-details {
   display: grid;
   gap: 3px;
   min-width: 0;
@@ -435,12 +435,53 @@ p {
   font-size: 14px;
 }
 .calendar-week-day .calendar-appointment {
-  grid-template-columns: 1fr auto;
-  gap: 4px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
   padding: 10px;
 }
 .calendar-week-day .calendar-appointment time {
-  grid-column: 1 / -1;
+  grid-column: auto;
+}
+.calendar-week-day .calendar-edit-action {
+  justify-self: end;
+  align-self: end;
+}
+.services-toolbar-controls {
+  display: flex;
+  align-items: end;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.service-category-filter {
+  min-width: 180px;
+}
+.service-category-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+}
+.service-category-card {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  border: 1px solid #e5e0d8;
+  border-radius: 8px;
+  padding: 14px;
+  background: #fffdf9;
+}
+.service-category-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.service-category-heading h3 {
+  margin: 0;
+  color: #40514a;
+  font-size: 16px;
+}
+.service-category-heading .form-field {
+  flex: 1;
 }
 .customers-surface,
 .customer-history,
