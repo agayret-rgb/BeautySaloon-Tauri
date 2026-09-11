@@ -301,23 +301,14 @@ describe("New appointment flow", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("shows a bounded active customer list when the name field receives focus", async () => {
-    api.searchCustomers.mockResolvedValue([
-      existingCustomer,
-      {
-        ...existingCustomer,
-        id: "customer-archived",
-        firstName: "Arşiv",
-        lastName: "Müşteri",
-        isActive: false,
-      },
-    ]);
+  it("does not search or show customer results when the empty name field receives focus", async () => {
     await openForm();
     fireEvent.focus(screen.getByLabelText("Müşteri adı"));
-    await waitFor(() => expect(api.searchCustomers).toHaveBeenCalledWith(""));
-    expect(await screen.findByRole("list", { name: "Müşteri sonuçları" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Ayşe Yılmaz/ })).toBeInTheDocument();
-    expect(screen.queryByText("Arşiv Müşteri")).not.toBeInTheDocument();
+    await act(async () => {});
+    expect(api.searchCustomers).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("list", { name: "Müşteri sonuçları" }),
+    ).not.toBeInTheDocument();
   });
 
   it("searches bounded active customers and uses an existing customer id", async () => {
@@ -342,6 +333,118 @@ describe("New appointment flow", () => {
     expect(api.createCustomer).not.toHaveBeenCalled();
   });
 
+  it("closes suggestions after selection and clears the existing binding when text changes", async () => {
+    await openForm();
+    const customerInput = screen.getByLabelText("Müşteri adı");
+    fireEvent.change(customerInput, { target: { value: "Ayşe" } });
+    fireEvent.click(await screen.findByRole("button", { name: /Ayşe Yılmaz/ }));
+    expect(
+      screen.queryByRole("list", { name: "Müşteri sonuçları" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.change(customerInput, { target: { value: "Deniz Kaya" } });
+    await fillRequiredFields(false);
+    fireEvent.click(screen.getByRole("button", { name: "Randevuyu Kaydet" }));
+    await waitFor(() => expect(api.createCustomer).toHaveBeenCalledTimes(1));
+    expect(api.createAppointment).toHaveBeenCalledWith(
+      expect.objectContaining({ customerId: "customer-new" }),
+    );
+  });
+
+  it("keeps the new-customer path available when no saved customer matches", async () => {
+    api.searchCustomers.mockResolvedValueOnce([]);
+    await openForm();
+    fireEvent.change(screen.getByLabelText("Müşteri adı"), {
+      target: { value: "Deniz Kaya" },
+    });
+    await waitFor(() => expect(api.searchCustomers).toHaveBeenCalledWith("Deniz Kaya"));
+    expect(
+      screen.queryByRole("list", { name: "Müşteri sonuçları" }),
+    ).not.toBeInTheDocument();
+    await fillRequiredFields(false);
+    fireEvent.click(screen.getByRole("button", { name: "Randevuyu Kaydet" }));
+    await waitFor(() => expect(api.createCustomer).toHaveBeenCalledTimes(1));
+  });
+
+  it("supports Escape and keyboard selection in customer suggestions", async () => {
+    await openForm();
+    const customerInput = screen.getByLabelText("Müşteri adı");
+    fireEvent.change(customerInput, { target: { value: "Ayşe" } });
+    await screen.findByRole("list", { name: "Müşteri sonuçları" });
+    fireEvent.keyDown(customerInput, { key: "Escape" });
+    expect(
+      screen.queryByRole("list", { name: "Müşteri sonuçları" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.focus(customerInput);
+    await screen.findByRole("list", { name: "Müşteri sonuçları" });
+    fireEvent.keyDown(customerInput, { key: "ArrowDown" });
+    fireEvent.keyDown(customerInput, { key: "Enter" });
+    expect(customerInput).toHaveValue("Ayşe Yılmaz");
+    expect(
+      screen.queryByRole("list", { name: "Müşteri sonuçları" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it.each([
+    [
+      "eligible",
+      { ...existingCustomer, whatsappConsentConfirmed: true },
+      null,
+      false,
+    ],
+    [
+      "missing consent",
+      existingCustomer,
+      "WhatsApp gönderilemez — müşteri onayı bulunmuyor.",
+      true,
+    ],
+    [
+      "missing phone",
+      { ...existingCustomer, phone: null, whatsappConsentConfirmed: true },
+      "WhatsApp gönderilemez — müşterinin telefon numarası bulunmuyor.",
+      true,
+    ],
+    [
+      "invalid phone",
+      { ...existingCustomer, phone: "123", whatsappConsentConfirmed: true },
+      "WhatsApp gönderilemez — müşteri telefon numarası geçersiz.",
+      true,
+    ],
+    [
+      "disabled customer reminders",
+      {
+        ...existingCustomer,
+        whatsappReminderEnabled: false,
+        whatsappConsentConfirmed: true,
+      },
+      "WhatsApp gönderilemez — müşteri için WhatsApp hatırlatmaları kapalı.",
+      true,
+    ],
+  ])(
+    "shows the correct WhatsApp eligibility state for %s customers",
+    async (_state, customer, message, disabled) => {
+      api.searchCustomers.mockResolvedValueOnce([customer]);
+      await openForm();
+      fireEvent.change(screen.getByLabelText("Müşteri adı"), {
+        target: { value: customer.firstName },
+      });
+      fireEvent.click(
+        await screen.findByRole("button", { name: new RegExp(customer.firstName) }),
+      );
+      const preference = screen.getByLabelText(
+        "Bu randevu için WhatsApp hatırlatması",
+      );
+      if (disabled) expect(preference).toBeDisabled();
+      else expect(preference).not.toBeDisabled();
+      if (message) {
+        expect(screen.getByRole("status")).toHaveTextContent(message);
+      } else {
+        expect(screen.queryByRole("status")).not.toBeInTheDocument();
+      }
+    },
+  );
+
   it("searches existing customers by phone", async () => {
     await openForm();
     fireEvent.change(screen.getByLabelText("Müşteri adı"), {
@@ -364,7 +467,7 @@ describe("New appointment flow", () => {
   );
 
   it("keeps only the latest customer-search response", async () => {
-    let resolveEmpty: ((customers: Array<typeof existingCustomer>) => void) | undefined;
+    let resolveBroad: ((customers: Array<typeof existingCustomer>) => void) | undefined;
     let resolveSpecific: ((customers: Array<typeof existingCustomer>) => void) | undefined;
     const unrelated = {
       ...existingCustomer,
@@ -380,13 +483,15 @@ describe("New appointment flow", () => {
     };
     api.searchCustomers.mockImplementation((query: string) =>
       new Promise<Array<typeof existingCustomer>>((resolve) => {
-        if (query === "") resolveEmpty = resolve;
+        if (query === "Test") resolveBroad = resolve;
         if (query === "Test Müşterisi2") resolveSpecific = resolve;
       }),
     );
     await openForm();
-    fireEvent.focus(screen.getByLabelText("Müşteri adı"));
-    await waitFor(() => expect(api.searchCustomers).toHaveBeenCalledWith(""));
+    fireEvent.change(screen.getByLabelText("Müşteri adı"), {
+      target: { value: "Test" },
+    });
+    await waitFor(() => expect(api.searchCustomers).toHaveBeenCalledWith("Test"));
     fireEvent.change(screen.getByLabelText("Müşteri adı"), {
       target: { value: "Test Müşterisi2" },
     });
@@ -396,7 +501,7 @@ describe("New appointment flow", () => {
 
     await act(async () => resolveSpecific?.([target]));
     expect(await screen.findByRole("button", { name: /Test Müşterisi2/ })).toBeInTheDocument();
-    await act(async () => resolveEmpty?.([unrelated]));
+    await act(async () => resolveBroad?.([unrelated]));
     await waitFor(() =>
       expect(screen.queryByRole("button", { name: /Test Google Sync/ })).not.toBeInTheDocument(),
     );

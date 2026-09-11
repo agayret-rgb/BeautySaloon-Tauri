@@ -768,7 +768,8 @@ p {
   text-align: left;
   cursor: pointer;
 }
-.customer-results button:hover {
+.customer-results button:hover,
+.customer-results button.is-highlighted {
   background: #eff8f4;
 }
 .customer-results span {
@@ -799,6 +800,12 @@ p {
   border-radius: 6px;
   color: #8a2f24;
   background: #fff0ed;
+}
+.form-hint {
+  grid-column: 1 / -1;
+  margin: -4px 0 0;
+  color: #8a2f24;
+  font-size: 14px;
 }
 .management-surface,
 .management-list,

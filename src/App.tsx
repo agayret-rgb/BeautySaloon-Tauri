@@ -246,6 +246,32 @@ function customerPhoneLabel(phone: string | null): string {
   return phone;
 }
 
+function hasValidCustomerPhone(phone: string | null): boolean {
+  if (!phone) return false;
+  const digits = phone.replace(/\D/g, "");
+  const canonical = digits.startsWith("90")
+    ? digits.slice(2)
+    : digits.startsWith("0")
+      ? digits.slice(1)
+      : digits;
+  return /^5\d{9}$/.test(canonical);
+}
+
+function selectedCustomerWhatsappIneligibility(customer: Customer | null): string | null {
+  if (!customer) return null;
+  if (!customer.isActive)
+    return "WhatsApp gönderilemez — müşteri artık aktif değil.";
+  if (!customer.whatsappReminderEnabled)
+    return "WhatsApp gönderilemez — müşteri için WhatsApp hatırlatmaları kapalı.";
+  if (!customer.whatsappConsentConfirmed)
+    return "WhatsApp gönderilemez — müşteri onayı bulunmuyor.";
+  if (!customer.phone)
+    return "WhatsApp gönderilemez — müşterinin telefon numarası bulunmuyor.";
+  if (!hasValidCustomerPhone(customer.phone))
+    return "WhatsApp gönderilemez — müşteri telefon numarası geçersiz.";
+  return null;
+}
+
 function staffName(staff: Staff): string {
   return [staff.firstName, staff.lastName].filter(Boolean).join(" ");
 }
@@ -372,6 +398,7 @@ export function App() {
   const [customerPickerOpen, setCustomerPickerOpen] = useState(false);
   const [customerQuery, setCustomerQuery] = useState("");
   const [customerResults, setCustomerResults] = useState<Customer[]>([]);
+  const [customerResultIndex, setCustomerResultIndex] = useState(0);
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(
     null,
   );
@@ -825,22 +852,25 @@ export function App() {
 
   useEffect(() => {
     let current = true;
-    if (
-      !bookingOpen ||
-      selectedCustomer ||
-      (!customerPickerOpen && customerQuery.trim().length < 2)
-    ) {
+    const query = customerQuery.trim();
+    if (!bookingOpen || selectedCustomer || !customerPickerOpen || !query) {
       setCustomerResults([]);
+      setCustomerResultIndex(0);
       return;
     }
-    const query = customerQuery.trim();
     const timer = window.setTimeout(() => {
       void searchCustomers(query)
         .then((items) => {
-          if (current) setCustomerResults(items.filter((item) => item.isActive));
+          if (current) {
+            setCustomerResults(items.filter((item) => item.isActive));
+            setCustomerResultIndex(0);
+          }
         })
         .catch(() => {
-          if (current) setCustomerResults([]);
+          if (current) {
+            setCustomerResults([]);
+            setCustomerResultIndex(0);
+          }
         });
     }, 220);
     return () => {
@@ -849,9 +879,23 @@ export function App() {
     };
   }, [bookingOpen, customerPickerOpen, customerQuery, selectedCustomer]);
 
+  const selectBookingCustomer = useCallback((customer: Customer) => {
+    setSelectedCustomer(customer);
+    setCustomerQuery(customerName(customer));
+    setPhone(customer.phone ?? "");
+    setCustomerResults([]);
+    setCustomerResultIndex(0);
+    setCustomerPickerOpen(false);
+  }, []);
+
+  const bookingWhatsappIneligibility = selectedCustomerWhatsappIneligibility(
+    selectedCustomer,
+  );
+
   const resetBooking = useCallback(() => {
     setCustomerQuery("");
     setCustomerResults([]);
+    setCustomerResultIndex(0);
     setSelectedCustomer(null);
     setBookingInitialDraft(null);
     setCustomerPickerOpen(false);
@@ -2416,12 +2460,46 @@ export function App() {
                 <input
                   aria-label="Müşteri adı"
                   value={customerQuery}
-                  disabled={Boolean(selectedCustomer) || isSaving}
-                  onFocus={() => setCustomerPickerOpen(true)}
+                  disabled={isSaving}
+                  onFocus={() => {
+                    if (customerQuery.trim()) setCustomerPickerOpen(true);
+                  }}
                   onChange={(event) => {
+                    if (selectedCustomer) {
+                      setSelectedCustomer(null);
+                      setPhone("");
+                      setWhatsappConsent(false);
+                    }
                     setCustomerQuery(event.target.value);
-                    setCustomerPickerOpen(true);
+                    setCustomerResults([]);
+                    setCustomerResultIndex(0);
+                    setCustomerPickerOpen(Boolean(event.target.value.trim()));
                     setFormError("");
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") {
+                      setCustomerResults([]);
+                      setCustomerResultIndex(0);
+                      setCustomerPickerOpen(false);
+                      return;
+                    }
+                    if (customerResults.length === 0) return;
+                    if (event.key === "ArrowDown") {
+                      event.preventDefault();
+                      setCustomerResultIndex((current) =>
+                        Math.min(current + 1, customerResults.length - 1),
+                      );
+                    }
+                    if (event.key === "ArrowUp") {
+                      event.preventDefault();
+                      setCustomerResultIndex((current) => Math.max(current - 1, 0));
+                    }
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      selectBookingCustomer(
+                        customerResults[customerResultIndex] ?? customerResults[0],
+                      );
+                    }
                   }}
                   placeholder="Ad Soyad"
                 />
@@ -2447,13 +2525,18 @@ export function App() {
                 <input
                   type="checkbox"
                   checked={whatsappReminderEnabled}
-                  disabled={isSaving}
+                  disabled={isSaving || Boolean(bookingWhatsappIneligibility)}
                   onChange={(event) =>
                     setWhatsappReminderEnabled(event.target.checked)
                   }
                 />{" "}
                 Bu randevu için WhatsApp hatırlatması
               </label>
+              {bookingWhatsappIneligibility && (
+                <p className="form-hint" role="status">
+                  {bookingWhatsappIneligibility}
+                </p>
+              )}
               {selectedCustomer && (
                 <button
                   type="button"
@@ -2463,25 +2546,27 @@ export function App() {
                     setSelectedCustomer(null);
                     setCustomerQuery("");
                     setPhone("");
+                    setCustomerResults([]);
+                    setCustomerResultIndex(0);
                     setCustomerPickerOpen(false);
                   }}
                 >
                   Farklı müşteri seç
                 </button>
               )}
-              {customerResults.length > 0 && (
+              {customerPickerOpen &&
+                customerQuery.trim() &&
+                customerResults.length > 0 && (
                 <ul className="customer-results" aria-label="Müşteri sonuçları">
-                  {customerResults.map((customer) => (
+                  {customerResults.map((customer, index) => (
                     <li key={customer.id}>
                       <button
                         type="button"
-                        onClick={() => {
-                          setSelectedCustomer(customer);
-                          setCustomerQuery(customerName(customer));
-                          setPhone(customer.phone ?? "");
-                          setCustomerResults([]);
-                          setCustomerPickerOpen(false);
-                        }}
+                        className={
+                          index === customerResultIndex ? "is-highlighted" : undefined
+                        }
+                        onMouseEnter={() => setCustomerResultIndex(index)}
+                        onClick={() => selectBookingCustomer(customer)}
                       >
                         {customerName(customer)}
                         <span>{customerPhoneLabel(customer.phone)}</span>
