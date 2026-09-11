@@ -43,9 +43,9 @@ test("release metadata stays synchronized and Windows release uses the GUI subsy
     readFile(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"),
     readFile(new URL("../src-tauri/src/main.rs", import.meta.url), "utf8"),
   ]);
-  assert.match(packageJson, /"version": "1\.1\.3"/);
-  assert.match(cargoToml, /^version = "1\.1\.3"/m);
-  assert.match(tauriConfig, /"version": "1\.1\.3"/);
+  assert.match(packageJson, /"version": "1\.1\.4"/);
+  assert.match(cargoToml, /^version = "1\.1\.4"/m);
+  assert.match(tauriConfig, /"version": "1\.1\.4"/);
   assert.match(tauriConfig, /"identifier": "com\.beautysaloon\.desktop"/);
   assert.match(tauriConfig, /"installMode": "currentUser"/);
   assert.match(tauriConfig, /"allowDowngrades": false/);
