@@ -28,12 +28,15 @@ const ISTANBUL_OFFSET_MINUTES: i64 = 180;
 const APPOINTMENT_STATUS_CANCELLED: &str = "cancelled";
 const AUTOMATIC_BACKUP_INTERVAL: StdDuration = StdDuration::from_secs(15 * 60);
 const AUTOMATIC_REMINDER_INTERVAL: StdDuration = StdDuration::from_secs(15 * 60);
+const REMINDER_COORDINATOR_DIAGNOSTIC_FILE: &str = "reminder-coordinator-diagnostic.log";
+const REMINDER_COORDINATOR_DIAGNOSTIC_MAX_EVENTS: usize = 128;
 const SHUTDOWN_BACKUP_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const SHUTDOWN_BACKUP_POLL_INTERVAL: StdDuration = StdDuration::from_millis(25);
 const GOOGLE_OAUTH_CALLBACK_TIMEOUT: StdDuration = StdDuration::from_secs(15 * 60);
 const PACKAGED_RUNTIME_DEFAULT: &str =
     include_str!(concat!(env!("OUT_DIR"), "/runtime-default.json"));
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+static REMINDER_COORDINATOR_DIAGNOSTIC_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Error)]
 pub(crate) enum AppError {
@@ -194,6 +197,122 @@ enum ReminderCoordinatorSignal {
     Shutdown,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ReminderWakeRequestResult {
+    Sent,
+    Coalesced,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReminderCoordinatorDiagnostic {
+    WakeRequested {
+        registered: bool,
+        result: ReminderWakeRequestResult,
+    },
+    WakeReceived,
+    TimeoutTick,
+    CoordinatorDisconnected,
+    CoordinatorExit,
+    TickStarted,
+    RunningGuardSkip,
+    AutomaticEnabledYes,
+    AutomaticEnabledNo,
+    AutomaticEnabledReadError,
+    ReconcileFailed,
+    SupabaseConfigPresent,
+    SupabaseConfigMissing,
+    SessionPresent,
+    SessionMissing,
+    SessionReadError,
+    DispatcherStatusOkActive,
+    DispatcherStatusOkPaused,
+    DispatcherStatusAuthError,
+    DispatcherStatusNetworkError,
+    DispatcherStatusOtherError,
+    ProcessOrderedOutboxEntered,
+    ProcessOrderedOutboxCompleted,
+    ProcessOrderedOutboxFailed,
+}
+
+impl ReminderCoordinatorDiagnostic {
+    fn marker(self) -> &'static str {
+        match self {
+            Self::WakeRequested {
+                registered: true,
+                result: ReminderWakeRequestResult::Sent,
+            } => "wake_requested registered=true send_result=success",
+            Self::WakeRequested {
+                registered: true,
+                result: ReminderWakeRequestResult::Coalesced,
+            } => "wake_requested registered=true send_result=coalesced",
+            Self::WakeRequested {
+                registered: true,
+                result: ReminderWakeRequestResult::Unavailable,
+            } => "wake_requested registered=true send_result=failure",
+            Self::WakeRequested {
+                registered: false, ..
+            } => "wake_requested registered=false send_result=failure",
+            Self::WakeReceived => "wake_received",
+            Self::TimeoutTick => "timeout_tick",
+            Self::CoordinatorDisconnected => "coordinator_disconnected",
+            Self::CoordinatorExit => "coordinator_exit",
+            Self::TickStarted => "tick_started",
+            Self::RunningGuardSkip => "running_guard_skip",
+            Self::AutomaticEnabledYes => "automatic_enabled_yes",
+            Self::AutomaticEnabledNo => "automatic_enabled_no",
+            Self::AutomaticEnabledReadError => "automatic_enabled_read_error",
+            Self::ReconcileFailed => "reconcile_failed",
+            Self::SupabaseConfigPresent => "supabase_config_present",
+            Self::SupabaseConfigMissing => "supabase_config_missing",
+            Self::SessionPresent => "session_present",
+            Self::SessionMissing => "session_missing",
+            Self::SessionReadError => "session_read_error",
+            Self::DispatcherStatusOkActive => "dispatcher_status_ok_active",
+            Self::DispatcherStatusOkPaused => "dispatcher_status_ok_paused",
+            Self::DispatcherStatusAuthError => "dispatcher_status_auth_error",
+            Self::DispatcherStatusNetworkError => "dispatcher_status_network_error",
+            Self::DispatcherStatusOtherError => "dispatcher_status_other_error",
+            Self::ProcessOrderedOutboxEntered => "process_ordered_outbox_entered",
+            Self::ProcessOrderedOutboxCompleted => "process_ordered_outbox_completed",
+            Self::ProcessOrderedOutboxFailed => "process_ordered_outbox_failed",
+        }
+    }
+
+    fn is_allowed_marker(marker: &str) -> bool {
+        matches!(
+            marker,
+            "wake_requested registered=true send_result=success"
+                | "wake_requested registered=true send_result=coalesced"
+                | "wake_requested registered=true send_result=failure"
+                | "wake_requested registered=false send_result=failure"
+                | "wake_received"
+                | "timeout_tick"
+                | "coordinator_disconnected"
+                | "coordinator_exit"
+                | "tick_started"
+                | "running_guard_skip"
+                | "automatic_enabled_yes"
+                | "automatic_enabled_no"
+                | "automatic_enabled_read_error"
+                | "reconcile_failed"
+                | "supabase_config_present"
+                | "supabase_config_missing"
+                | "session_present"
+                | "session_missing"
+                | "session_read_error"
+                | "dispatcher_status_ok_active"
+                | "dispatcher_status_ok_paused"
+                | "dispatcher_status_auth_error"
+                | "dispatcher_status_network_error"
+                | "dispatcher_status_other_error"
+                | "process_ordered_outbox_entered"
+                | "process_ordered_outbox_completed"
+                | "process_ordered_outbox_failed"
+        )
+    }
+}
+
 impl ReminderCoordinator {
     fn register(&self) -> bool {
         self.registered
@@ -212,14 +331,16 @@ impl ReminderCoordinator {
         }
     }
 
-    fn request_wake(&self) -> bool {
-        if !self.registered.load(Ordering::Acquire)
-            || self
-                .wake_pending
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
+    fn request_wake(&self) -> ReminderWakeRequestResult {
+        if !self.registered.load(Ordering::Acquire) {
+            return ReminderWakeRequestResult::Unavailable;
+        }
+        if self
+            .wake_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
-            return false;
+            return ReminderWakeRequestResult::Coalesced;
         }
         let sent = self
             .signal_sender
@@ -230,7 +351,11 @@ impl ReminderCoordinator {
         if !sent {
             self.wake_pending.store(false, Ordering::Release);
         }
-        sent
+        if sent {
+            ReminderWakeRequestResult::Sent
+        } else {
+            ReminderWakeRequestResult::Unavailable
+        }
     }
 }
 
@@ -4243,41 +4368,191 @@ fn automatic_reminders_enabled(connection: &Connection) -> Result<bool, AppError
         .map_err(Into::into)
 }
 
+fn reminder_coordinator_diagnostic_path(database_path: &Path) -> Option<PathBuf> {
+    database_path
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join("logs").join(REMINDER_COORDINATOR_DIAGNOSTIC_FILE))
+}
+
+fn is_valid_reminder_coordinator_diagnostic_line(line: &str) -> bool {
+    let Some((timestamp, marker)) = line.split_once(' ') else {
+        return false;
+    };
+    chrono::DateTime::parse_from_rfc3339(timestamp).is_ok()
+        && ReminderCoordinatorDiagnostic::is_allowed_marker(marker)
+}
+
+fn record_reminder_coordinator_diagnostic(
+    database_path: &Path,
+    diagnostic: ReminderCoordinatorDiagnostic,
+) {
+    let Some(path) = reminder_coordinator_diagnostic_path(database_path) else {
+        return;
+    };
+    let Ok(_lock) = REMINDER_COORDINATOR_DIAGNOSTIC_LOCK.lock() else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+
+    let mut entries = fs::read_to_string(&path)
+        .ok()
+        .into_iter()
+        .flat_map(|content| content.lines().map(str::to_owned).collect::<Vec<_>>())
+        .filter(|line| is_valid_reminder_coordinator_diagnostic_line(line))
+        .collect::<Vec<_>>();
+    if entries.len() >= REMINDER_COORDINATOR_DIAGNOSTIC_MAX_EVENTS {
+        let first_retained = entries.len() - REMINDER_COORDINATOR_DIAGNOSTIC_MAX_EVENTS + 1;
+        entries.drain(0..first_retained);
+    }
+    entries.push(format!("{} {}", utc_iso(Utc::now()), diagnostic.marker()));
+    let _ = fs::write(path, format!("{}\n", entries.join("\n")));
+}
+
+fn dispatcher_status_diagnostic(error: &AppError) -> ReminderCoordinatorDiagnostic {
+    match error {
+        AppError::Validation(code) if code == "CLOUD_AUTH_INVALID" => {
+            ReminderCoordinatorDiagnostic::DispatcherStatusAuthError
+        }
+        AppError::Io(_) => ReminderCoordinatorDiagnostic::DispatcherStatusNetworkError,
+        AppError::Database(code)
+            if matches!(
+                code.as_str(),
+                "CLOUD_RATE_LIMITED" | "CLOUD_TEMPORARILY_UNAVAILABLE"
+            ) =>
+        {
+            ReminderCoordinatorDiagnostic::DispatcherStatusNetworkError
+        }
+        _ => ReminderCoordinatorDiagnostic::DispatcherStatusOtherError,
+    }
+}
+
 fn automatic_reminder_tick(database_path: &Path) -> Result<bool, AppError> {
     let connection = Connection::open(database_path)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
-    if !automatic_reminders_enabled(&connection)? {
-        return Ok(false);
+    match automatic_reminders_enabled(&connection) {
+        Ok(true) => record_reminder_coordinator_diagnostic(
+            database_path,
+            ReminderCoordinatorDiagnostic::AutomaticEnabledYes,
+        ),
+        Ok(false) => {
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::AutomaticEnabledNo,
+            );
+            return Ok(false);
+        }
+        Err(error) => {
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::AutomaticEnabledReadError,
+            );
+            return Err(error);
+        }
     }
     // Reconciliation is local-first. Cloud delivery is only attempted after the
     // authenticated dispatcher gate below proves that the provider is operational.
-    reconcile_all_reminders_mock(&connection)?;
+    if let Err(error) = reconcile_all_reminders_mock(&connection) {
+        record_reminder_coordinator_diagnostic(
+            database_path,
+            ReminderCoordinatorDiagnostic::ReconcileFailed,
+        );
+        return Err(error);
+    }
     let config = match supabase_config() {
-        Ok(config) => config,
-        Err(_) => return Ok(false),
+        Ok(config) => {
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::SupabaseConfigPresent,
+            );
+            config
+        }
+        Err(_) => {
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::SupabaseConfigMissing,
+            );
+            return Ok(false);
+        }
     };
     let protector = services::secure_store::WindowsDpapiProtector;
-    let Some(session) = services::secure_store::read_supabase_session(&connection, &protector)?
-    else {
-        return Ok(false);
+    let session = match services::secure_store::read_supabase_session(&connection, &protector) {
+        Ok(Some(session)) => {
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::SessionPresent,
+            );
+            session
+        }
+        Ok(None) => {
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::SessionMissing,
+            );
+            return Ok(false);
+        }
+        Err(error) => {
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::SessionReadError,
+            );
+            return Err(error);
+        }
     };
     let mut transport = services::google::ReqwestHttpTransport;
     let dispatcher =
         match services::reminder_cloud::read_dispatcher_status(&mut transport, &config, &session) {
             Ok(status) => status,
-            Err(_) => return Ok(false),
+            Err(error) => {
+                record_reminder_coordinator_diagnostic(
+                    database_path,
+                    dispatcher_status_diagnostic(&error),
+                );
+                return Ok(false);
+            }
         };
     if dispatcher.paused {
+        record_reminder_coordinator_diagnostic(
+            database_path,
+            ReminderCoordinatorDiagnostic::DispatcherStatusOkPaused,
+        );
         return Ok(false);
     }
-    services::reminder_cloud::process_ordered_outbox(
+    record_reminder_coordinator_diagnostic(
+        database_path,
+        ReminderCoordinatorDiagnostic::DispatcherStatusOkActive,
+    );
+    record_reminder_coordinator_diagnostic(
+        database_path,
+        ReminderCoordinatorDiagnostic::ProcessOrderedOutboxEntered,
+    );
+    match services::reminder_cloud::process_ordered_outbox(
         &connection,
         &mut transport,
         &config,
         &session,
         25,
-    )?;
-    Ok(true)
+    ) {
+        Ok(_) => {
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::ProcessOrderedOutboxCompleted,
+            );
+            Ok(true)
+        }
+        Err(error) => {
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::ProcessOrderedOutboxFailed,
+            );
+            Err(error)
+        }
+    }
 }
 
 fn appointment_has_pending_reminder_outbox(
@@ -4305,7 +4580,15 @@ fn request_reminder_projection(state: &AppState, appointment_id: &str) {
     };
     match has_pending_outbox {
         Ok(true) => {
-            let _ = state.reminder_coordinator.request_wake();
+            let registered = state
+                .reminder_coordinator
+                .registered
+                .load(Ordering::Acquire);
+            let result = state.reminder_coordinator.request_wake();
+            record_reminder_coordinator_diagnostic(
+                &state.database_path,
+                ReminderCoordinatorDiagnostic::WakeRequested { registered, result },
+            );
         }
         Ok(false) => {}
         Err(_) => safe_diagnostic("REMINDER_PROJECTION_WAKE_CHECK_FAILED"),
@@ -4326,23 +4609,56 @@ fn start_automatic_reminder_coordinator(
         .expect("reminder shutdown mutex poisoned") = Some(sender);
     std::thread::spawn(move || loop {
         match receiver.recv_timeout(AUTOMATIC_REMINDER_INTERVAL) {
-            Ok(ReminderCoordinatorSignal::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Ok(ReminderCoordinatorSignal::Shutdown) => {
+                record_reminder_coordinator_diagnostic(
+                    &database_path,
+                    ReminderCoordinatorDiagnostic::CoordinatorExit,
+                );
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                record_reminder_coordinator_diagnostic(
+                    &database_path,
+                    ReminderCoordinatorDiagnostic::CoordinatorDisconnected,
+                );
+                record_reminder_coordinator_diagnostic(
+                    &database_path,
+                    ReminderCoordinatorDiagnostic::CoordinatorExit,
+                );
                 break;
             }
             Ok(ReminderCoordinatorSignal::Wake) => {
                 coordinator.wake_pending.store(false, Ordering::Release);
+                record_reminder_coordinator_diagnostic(
+                    &database_path,
+                    ReminderCoordinatorDiagnostic::WakeReceived,
+                );
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                record_reminder_coordinator_diagnostic(
+                    &database_path,
+                    ReminderCoordinatorDiagnostic::TimeoutTick,
+                );
+            }
         }
         if coordinator
             .running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            record_reminder_coordinator_diagnostic(
+                &database_path,
+                ReminderCoordinatorDiagnostic::TickStarted,
+            );
             if automatic_reminder_tick(&database_path).is_err() {
                 safe_diagnostic("AUTOMATIC_REMINDER_PROJECTION_WARNING");
             }
             coordinator.running.store(false, Ordering::Release);
+        } else {
+            record_reminder_coordinator_diagnostic(
+                &database_path,
+                ReminderCoordinatorDiagnostic::RunningGuardSkip,
+            );
         }
     });
 }
@@ -6119,6 +6435,132 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let connection = open_database(&temp.path().join("core.db")).expect("open db");
         (temp, connection)
+    }
+
+    fn reminder_coordinator_diagnostic_test_database_path(temp: &tempfile::TempDir) -> PathBuf {
+        temp.path().join("database").join("salon-foundation.db")
+    }
+
+    fn read_reminder_coordinator_diagnostic(temp: &tempfile::TempDir) -> String {
+        fs::read_to_string(
+            temp.path()
+                .join("logs")
+                .join(REMINDER_COORDINATOR_DIAGNOSTIC_FILE),
+        )
+        .expect("read coordinator diagnostic")
+    }
+
+    #[test]
+    fn reminder_coordinator_telemetry_is_allowlisted_and_bounded() {
+        let temp = tempdir().expect("temp");
+        let database_path = reminder_coordinator_diagnostic_test_database_path(&temp);
+        let log_path = temp
+            .path()
+            .join("logs")
+            .join(REMINDER_COORDINATOR_DIAGNOSTIC_FILE);
+        fs::create_dir_all(log_path.parent().expect("log parent")).expect("create logs");
+        fs::write(&log_path, "not-a-diagnostic leaked-token-value\n").expect("seed log");
+
+        for _ in 0..(REMINDER_COORDINATOR_DIAGNOSTIC_MAX_EVENTS + 8) {
+            record_reminder_coordinator_diagnostic(
+                &database_path,
+                ReminderCoordinatorDiagnostic::TimeoutTick,
+            );
+        }
+        for diagnostic in [
+            ReminderCoordinatorDiagnostic::WakeRequested {
+                registered: true,
+                result: ReminderWakeRequestResult::Sent,
+            },
+            ReminderCoordinatorDiagnostic::WakeRequested {
+                registered: true,
+                result: ReminderWakeRequestResult::Coalesced,
+            },
+            ReminderCoordinatorDiagnostic::WakeRequested {
+                registered: false,
+                result: ReminderWakeRequestResult::Unavailable,
+            },
+            ReminderCoordinatorDiagnostic::WakeReceived,
+            ReminderCoordinatorDiagnostic::CoordinatorDisconnected,
+            ReminderCoordinatorDiagnostic::CoordinatorExit,
+            ReminderCoordinatorDiagnostic::TickStarted,
+            ReminderCoordinatorDiagnostic::RunningGuardSkip,
+            ReminderCoordinatorDiagnostic::AutomaticEnabledYes,
+            ReminderCoordinatorDiagnostic::AutomaticEnabledNo,
+            ReminderCoordinatorDiagnostic::AutomaticEnabledReadError,
+            ReminderCoordinatorDiagnostic::ReconcileFailed,
+            ReminderCoordinatorDiagnostic::SupabaseConfigPresent,
+            ReminderCoordinatorDiagnostic::SupabaseConfigMissing,
+            ReminderCoordinatorDiagnostic::SessionPresent,
+            ReminderCoordinatorDiagnostic::SessionMissing,
+            ReminderCoordinatorDiagnostic::SessionReadError,
+            ReminderCoordinatorDiagnostic::DispatcherStatusOkActive,
+            ReminderCoordinatorDiagnostic::DispatcherStatusOkPaused,
+            ReminderCoordinatorDiagnostic::DispatcherStatusAuthError,
+            ReminderCoordinatorDiagnostic::DispatcherStatusNetworkError,
+            ReminderCoordinatorDiagnostic::DispatcherStatusOtherError,
+            ReminderCoordinatorDiagnostic::ProcessOrderedOutboxEntered,
+            ReminderCoordinatorDiagnostic::ProcessOrderedOutboxCompleted,
+            ReminderCoordinatorDiagnostic::ProcessOrderedOutboxFailed,
+        ] {
+            record_reminder_coordinator_diagnostic(&database_path, diagnostic);
+        }
+
+        let content = read_reminder_coordinator_diagnostic(&temp);
+        let entries = content.lines().collect::<Vec<_>>();
+        assert_eq!(entries.len(), REMINDER_COORDINATOR_DIAGNOSTIC_MAX_EVENTS);
+        assert!(entries
+            .iter()
+            .all(|line| is_valid_reminder_coordinator_diagnostic_line(line)));
+        assert!(content.contains("wake_requested registered=true send_result=success"));
+        assert!(content.contains("wake_requested registered=true send_result=coalesced"));
+        assert!(content.contains("wake_requested registered=false send_result=failure"));
+        assert!(content.contains("wake_received"));
+        assert!(content.contains("timeout_tick"));
+        assert!(content.contains("coordinator_disconnected"));
+        assert!(content.contains("coordinator_exit"));
+        assert!(content.contains("tick_started"));
+        assert!(content.contains("running_guard_skip"));
+        assert!(content.contains("automatic_enabled_yes"));
+        assert!(content.contains("automatic_enabled_no"));
+        assert!(content.contains("automatic_enabled_read_error"));
+        assert!(content.contains("supabase_config_present"));
+        assert!(content.contains("supabase_config_missing"));
+        assert!(content.contains("session_present"));
+        assert!(content.contains("session_missing"));
+        assert!(content.contains("session_read_error"));
+        assert!(content.contains("dispatcher_status_ok_active"));
+        assert!(content.contains("dispatcher_status_ok_paused"));
+        assert!(content.contains("dispatcher_status_auth_error"));
+        assert!(content.contains("dispatcher_status_network_error"));
+        assert!(content.contains("dispatcher_status_other_error"));
+        assert!(content.contains("process_ordered_outbox_entered"));
+        assert!(content.contains("process_ordered_outbox_completed"));
+        assert!(content.contains("process_ordered_outbox_failed"));
+        assert!(!content.contains("leaked-token-value"));
+    }
+
+    #[test]
+    fn reminder_coordinator_telemetry_classifies_dispatcher_status_without_raw_errors() {
+        assert_eq!(
+            dispatcher_status_diagnostic(&AppError::Validation("CLOUD_AUTH_INVALID".into()))
+                .marker(),
+            "dispatcher_status_auth_error"
+        );
+        assert_eq!(
+            dispatcher_status_diagnostic(&AppError::Database(
+                "CLOUD_TEMPORARILY_UNAVAILABLE".into()
+            ))
+            .marker(),
+            "dispatcher_status_network_error"
+        );
+        assert_eq!(
+            dispatcher_status_diagnostic(&AppError::Database(
+                "provider-error token=secret-value".into()
+            ))
+            .marker(),
+            "dispatcher_status_other_error"
+        );
     }
 
     #[test]
@@ -9197,7 +9639,7 @@ mod tests {
 
     #[test]
     fn pending_near_term_outbox_requests_a_coalesced_projection_wake() {
-        let (_temp, mut connection) = open_temp();
+        let (temp, mut connection) = open_temp();
         let (mut customer, staff, service) = seed_core(&mut connection);
         customer = update_customer_tx(
             &mut connection,
@@ -9233,7 +9675,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         *coordinator.signal_sender.lock().expect("signal sender") = Some(sender);
         let state = AppState {
-            database_path: PathBuf::from("test.db"),
+            database_path: reminder_coordinator_diagnostic_test_database_path(&temp),
             sqlite: Mutex::new(connection),
             backup_coordinator: Arc::new(BackupCoordinator::default()),
             reminder_coordinator: coordinator,
@@ -9252,6 +9694,9 @@ mod tests {
             receiver.recv_timeout(StdDuration::from_millis(25)),
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
+        let diagnostic = read_reminder_coordinator_diagnostic(&temp);
+        assert!(diagnostic.contains("wake_requested registered=true send_result=success"));
+        assert!(diagnostic.contains("wake_requested registered=true send_result=coalesced"));
         let connection = state.sqlite.lock().expect("sqlite");
         let pending: i64 = connection
             .query_row(
@@ -9266,7 +9711,7 @@ mod tests {
     #[test]
     fn reminder_projection_wake_failure_preserves_local_outbox_and_ineligible_appointments_do_not_wake(
     ) {
-        let (_temp, mut connection) = open_temp();
+        let (temp, mut connection) = open_temp();
         let (mut customer, staff, service) = seed_core(&mut connection);
         customer = update_customer_tx(
             &mut connection,
@@ -9313,8 +9758,10 @@ mod tests {
         .expect("ineligible appointment");
         let coordinator = Arc::new(ReminderCoordinator::default());
         assert!(coordinator.register());
+        let blocked_root = temp.path().join("blocked-root");
+        fs::write(&blocked_root, "not a directory").expect("block telemetry path");
         let state = AppState {
-            database_path: PathBuf::from("test.db"),
+            database_path: blocked_root.join("database").join("salon-foundation.db"),
             sqlite: Mutex::new(connection),
             backup_coordinator: Arc::new(BackupCoordinator::default()),
             reminder_coordinator: coordinator.clone(),
