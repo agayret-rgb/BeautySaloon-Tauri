@@ -184,7 +184,14 @@ struct BackupCoordinator {
 struct ReminderCoordinator {
     registered: AtomicBool,
     running: AtomicBool,
-    shutdown_sender: Mutex<Option<mpsc::Sender<()>>>,
+    wake_pending: AtomicBool,
+    signal_sender: Mutex<Option<mpsc::Sender<ReminderCoordinatorSignal>>>,
+}
+
+#[derive(Debug)]
+enum ReminderCoordinatorSignal {
+    Wake,
+    Shutdown,
 }
 
 impl ReminderCoordinator {
@@ -196,13 +203,34 @@ impl ReminderCoordinator {
 
     fn stop(&self) {
         if let Some(sender) = self
-            .shutdown_sender
+            .signal_sender
             .lock()
             .expect("reminder shutdown mutex poisoned")
             .take()
         {
-            let _ = sender.send(());
+            let _ = sender.send(ReminderCoordinatorSignal::Shutdown);
         }
+    }
+
+    fn request_wake(&self) -> bool {
+        if !self.registered.load(Ordering::Acquire)
+            || self
+                .wake_pending
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        let sent = self
+            .signal_sender
+            .lock()
+            .expect("reminder signal mutex poisoned")
+            .as_ref()
+            .is_some_and(|sender| sender.send(ReminderCoordinatorSignal::Wake).is_ok());
+        if !sent {
+            self.wake_pending.store(false, Ordering::Release);
+        }
+        sent
     }
 }
 
@@ -4252,6 +4280,38 @@ fn automatic_reminder_tick(database_path: &Path) -> Result<bool, AppError> {
     Ok(true)
 }
 
+fn appointment_has_pending_reminder_outbox(
+    connection: &Connection,
+    appointment_id: &str,
+) -> Result<bool, AppError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM reminder_cloud_outbox o
+                INNER JOIN appointment_reminders r ON r.id=o.reminder_id
+                WHERE r.appointment_id=?1 AND o.sync_status='pending'
+            )",
+            params![appointment_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn request_reminder_projection(state: &AppState, appointment_id: &str) {
+    let has_pending_outbox = {
+        let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
+        appointment_has_pending_reminder_outbox(&connection, appointment_id)
+    };
+    match has_pending_outbox {
+        Ok(true) => {
+            let _ = state.reminder_coordinator.request_wake();
+        }
+        Ok(false) => {}
+        Err(_) => safe_diagnostic("REMINDER_PROJECTION_WAKE_CHECK_FAILED"),
+    }
+}
+
 fn start_automatic_reminder_coordinator(
     database_path: PathBuf,
     coordinator: Arc<ReminderCoordinator>,
@@ -4261,22 +4321,28 @@ fn start_automatic_reminder_coordinator(
     }
     let (sender, receiver) = mpsc::channel();
     *coordinator
-        .shutdown_sender
+        .signal_sender
         .lock()
         .expect("reminder shutdown mutex poisoned") = Some(sender);
     std::thread::spawn(move || loop {
         match receiver.recv_timeout(AUTOMATIC_REMINDER_INTERVAL) {
-            Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if coordinator
-                    .running
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    let _ = automatic_reminder_tick(&database_path);
-                    coordinator.running.store(false, Ordering::Release);
-                }
+            Ok(ReminderCoordinatorSignal::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break;
             }
+            Ok(ReminderCoordinatorSignal::Wake) => {
+                coordinator.wake_pending.store(false, Ordering::Release);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if coordinator
+            .running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            if automatic_reminder_tick(&database_path).is_err() {
+                safe_diagnostic("AUTOMATIC_REMINDER_PROJECTION_WARNING");
+            }
+            coordinator.running.store(false, Ordering::Release);
         }
     });
 }
@@ -4882,9 +4948,11 @@ fn appointment_create(
     input: AppointmentInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppointmentSummary, AppError> {
-    run_business_mutation(&state, |connection| {
+    let appointment = run_business_mutation(&state, |connection| {
         create_appointment_tx(connection, input)
-    })
+    })?;
+    request_reminder_projection(&state, &appointment.id);
+    Ok(appointment)
 }
 
 #[tauri::command]
@@ -4893,9 +4961,11 @@ fn appointment_update(
     input: AppointmentInput,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppointmentSummary, AppError> {
-    run_business_mutation(&state, |connection| {
+    let appointment = run_business_mutation(&state, |connection| {
         update_appointment_tx(connection, &id, input)
-    })
+    })?;
+    request_reminder_projection(&state, &appointment.id);
+    Ok(appointment)
 }
 
 #[tauri::command]
@@ -9080,6 +9150,25 @@ mod tests {
             .expect("single rescheduled outbox event");
         assert_eq!(rescheduled_outbox_count, 1);
 
+        let coordinator = Arc::new(ReminderCoordinator::default());
+        assert!(coordinator.register());
+        let (sender, receiver) = mpsc::channel();
+        *coordinator.signal_sender.lock().expect("signal sender") = Some(sender);
+        let state = AppState {
+            database_path: PathBuf::from("test.db"),
+            sqlite: Mutex::new(connection),
+            backup_coordinator: Arc::new(BackupCoordinator::default()),
+            reminder_coordinator: coordinator,
+        };
+        request_reminder_projection(&state, &appointment.id);
+        assert!(matches!(
+            receiver
+                .recv_timeout(StdDuration::from_millis(100))
+                .expect("rescheduled projection wake"),
+            ReminderCoordinatorSignal::Wake
+        ));
+        let connection = state.sqlite.lock().expect("sqlite");
+
         connection
             .execute(
                 "UPDATE appointments SET start_at_utc=?1 WHERE id=?2",
@@ -9104,6 +9193,155 @@ mod tests {
             )
             .expect("no deliverable outbox item");
         assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn pending_near_term_outbox_requests_a_coalesced_projection_wake() {
+        let (_temp, mut connection) = open_temp();
+        let (mut customer, staff, service) = seed_core(&mut connection);
+        customer = update_customer_tx(
+            &mut connection,
+            &customer.id,
+            CustomerInput {
+                first_name: customer.first_name,
+                last_name: customer.last_name,
+                phone: Some("05551112233".into()),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: Some(true),
+                whatsapp_consent_confirmed: Some(true),
+            },
+        )
+        .expect("consented customer");
+        let (local_date, local_time) = future_local_slot(2);
+        let appointment = create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id,
+                staff_id: staff.id,
+                local_date,
+                local_start_time: local_time,
+                service_ids: vec![service.id],
+                status: Some("planned".into()),
+                note: None,
+                whatsapp_reminder_enabled: Some(true),
+            },
+        )
+        .expect("near-term appointment");
+        let coordinator = Arc::new(ReminderCoordinator::default());
+        assert!(coordinator.register());
+        let (sender, receiver) = mpsc::channel();
+        *coordinator.signal_sender.lock().expect("signal sender") = Some(sender);
+        let state = AppState {
+            database_path: PathBuf::from("test.db"),
+            sqlite: Mutex::new(connection),
+            backup_coordinator: Arc::new(BackupCoordinator::default()),
+            reminder_coordinator: coordinator,
+        };
+
+        request_reminder_projection(&state, &appointment.id);
+        request_reminder_projection(&state, &appointment.id);
+
+        assert!(matches!(
+            receiver
+                .recv_timeout(StdDuration::from_millis(100))
+                .expect("projection wake"),
+            ReminderCoordinatorSignal::Wake
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(StdDuration::from_millis(25)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let connection = state.sqlite.lock().expect("sqlite");
+        let pending: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_cloud_outbox WHERE reminder_id IN (SELECT id FROM appointment_reminders WHERE appointment_id=?1) AND sync_status='pending'",
+                params![appointment.id],
+                |row| row.get(0),
+            )
+            .expect("pending outbox preserved");
+        assert_eq!(pending, 1);
+    }
+
+    #[test]
+    fn reminder_projection_wake_failure_preserves_local_outbox_and_ineligible_appointments_do_not_wake(
+    ) {
+        let (_temp, mut connection) = open_temp();
+        let (mut customer, staff, service) = seed_core(&mut connection);
+        customer = update_customer_tx(
+            &mut connection,
+            &customer.id,
+            CustomerInput {
+                first_name: customer.first_name,
+                last_name: customer.last_name,
+                phone: Some("05551112233".into()),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: Some(true),
+                whatsapp_consent_confirmed: Some(true),
+            },
+        )
+        .expect("consented customer");
+        let (local_date, local_time) = future_local_slot(2);
+        let eligible = create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id.clone(),
+                staff_id: staff.id.clone(),
+                local_date: local_date.clone(),
+                local_start_time: local_time.clone(),
+                service_ids: vec![service.id.clone()],
+                status: Some("planned".into()),
+                note: None,
+                whatsapp_reminder_enabled: Some(true),
+            },
+        )
+        .expect("eligible appointment");
+        let ineligible = create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id,
+                staff_id: staff.id,
+                local_date,
+                local_start_time: future_local_slot(3).1,
+                service_ids: vec![service.id],
+                status: Some("planned".into()),
+                note: None,
+                whatsapp_reminder_enabled: Some(false),
+            },
+        )
+        .expect("ineligible appointment");
+        let coordinator = Arc::new(ReminderCoordinator::default());
+        assert!(coordinator.register());
+        let state = AppState {
+            database_path: PathBuf::from("test.db"),
+            sqlite: Mutex::new(connection),
+            backup_coordinator: Arc::new(BackupCoordinator::default()),
+            reminder_coordinator: coordinator.clone(),
+        };
+
+        request_reminder_projection(&state, &eligible.id);
+        assert!(!coordinator.wake_pending.load(Ordering::Acquire));
+        request_reminder_projection(&state, &ineligible.id);
+        assert!(!coordinator.wake_pending.load(Ordering::Acquire));
+
+        let connection = state.sqlite.lock().expect("sqlite");
+        let eligible_pending: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_cloud_outbox WHERE reminder_id IN (SELECT id FROM appointment_reminders WHERE appointment_id=?1) AND sync_status='pending'",
+                params![eligible.id],
+                |row| row.get(0),
+            )
+            .expect("eligible pending outbox preserved");
+        let ineligible_pending: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_cloud_outbox WHERE reminder_id IN (SELECT id FROM appointment_reminders WHERE appointment_id=?1) AND sync_status='pending'",
+                params![ineligible.id],
+                |row| row.get(0),
+            )
+            .expect("no ineligible outbox");
+        assert_eq!(eligible_pending, 1);
+        assert_eq!(ineligible_pending, 0);
     }
 
     #[test]
