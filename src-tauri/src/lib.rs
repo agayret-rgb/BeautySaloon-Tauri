@@ -4521,8 +4521,8 @@ where
             return Err(error);
         }
     }
-    // Reconciliation is local-first. Cloud delivery is only attempted after the
-    // authenticated dispatcher gate below proves that the provider is operational.
+    // Reconciliation and projection are local-first. Dispatcher state controls
+    // cloud claim/send, not whether pending local work reaches the cloud.
     if let Err(error) = reconcile_all_reminders_mock(&connection) {
         record_reminder_coordinator_diagnostic(
             database_path,
@@ -4647,12 +4647,12 @@ where
             database_path,
             ReminderCoordinatorDiagnostic::DispatcherStatusOkPaused,
         );
-        return Ok(false);
+    } else {
+        record_reminder_coordinator_diagnostic(
+            database_path,
+            ReminderCoordinatorDiagnostic::DispatcherStatusOkActive,
+        );
     }
-    record_reminder_coordinator_diagnostic(
-        database_path,
-        ReminderCoordinatorDiagnostic::DispatcherStatusOkActive,
-    );
     record_reminder_coordinator_diagnostic(
         database_path,
         ReminderCoordinatorDiagnostic::ProcessOrderedOutboxEntered,
@@ -7357,6 +7357,13 @@ mod tests {
         }
     }
 
+    fn dispatcher_paused_response() -> services::google::HttpResponse {
+        services::google::HttpResponse {
+            status: 200,
+            body: br#"{"data":{"paused":true}}"#.to_vec(),
+        }
+    }
+
     fn reminder_upsert_pending_response() -> services::google::HttpResponse {
         services::google::HttpResponse {
             status: 200,
@@ -7389,6 +7396,61 @@ mod tests {
         assert!(diagnostic.contains("process_ordered_outbox_entered"));
         assert!(diagnostic.contains("process_ordered_outbox_completed"));
         assert!(!diagnostic.contains("auth_refresh_started"));
+    }
+
+    #[test]
+    fn automatic_reminder_tick_projects_pending_outbox_when_dispatcher_is_paused() {
+        let (temp, database_path, protector) = automatic_reminder_tick_test_setup();
+        let mut transport = services::google::FakeHttpTransport::new(vec![
+            dispatcher_paused_response(),
+            reminder_upsert_pending_response(),
+        ]);
+
+        assert!(
+            automatic_reminder_tick_with(&database_path, &protector, &mut transport, || Ok(
+                test_supabase_config()
+            ),)
+            .expect("paused dispatcher tick")
+        );
+
+        assert_eq!(transport.requests.len(), 2);
+        assert!(transport
+            .requests
+            .iter()
+            .all(|request| !request.url.contains("graph.facebook.com")));
+        let diagnostic = read_reminder_coordinator_diagnostic(&temp);
+        assert!(diagnostic.contains("dispatcher_status_ok_paused"));
+        assert!(diagnostic.contains("process_ordered_outbox_entered"));
+        assert!(diagnostic.contains("process_ordered_outbox_completed"));
+    }
+
+    #[test]
+    fn automatic_reminder_tick_keeps_outbox_pending_when_projection_is_unavailable() {
+        let (_temp, database_path, protector) = automatic_reminder_tick_test_setup();
+        let mut transport = services::google::FakeHttpTransport::new(vec![
+            dispatcher_active_response(),
+            services::google::HttpResponse {
+                status: 503,
+                body: Vec::new(),
+            },
+        ]);
+
+        assert!(
+            automatic_reminder_tick_with(&database_path, &protector, &mut transport, || Ok(
+                test_supabase_config()
+            ),)
+            .expect("temporary projection failure")
+        );
+
+        let connection = open_database(&database_path).expect("open database");
+        let pending: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_cloud_outbox WHERE sync_status='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pending outbox");
+        assert_eq!(pending, 1);
     }
 
     #[test]
