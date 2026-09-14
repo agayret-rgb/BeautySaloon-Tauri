@@ -230,6 +230,11 @@ enum ReminderCoordinatorDiagnostic {
     DispatcherStatusAuthError,
     DispatcherStatusNetworkError,
     DispatcherStatusOtherError,
+    AuthRefreshStarted,
+    AuthRefreshSucceeded,
+    AuthRefreshFailed,
+    DispatcherStatusRetrySucceeded,
+    DispatcherStatusRetryFailed,
     ProcessOrderedOutboxEntered,
     ProcessOrderedOutboxCompleted,
     ProcessOrderedOutboxFailed,
@@ -273,6 +278,11 @@ impl ReminderCoordinatorDiagnostic {
             Self::DispatcherStatusAuthError => "dispatcher_status_auth_error",
             Self::DispatcherStatusNetworkError => "dispatcher_status_network_error",
             Self::DispatcherStatusOtherError => "dispatcher_status_other_error",
+            Self::AuthRefreshStarted => "auth_refresh_started",
+            Self::AuthRefreshSucceeded => "auth_refresh_succeeded",
+            Self::AuthRefreshFailed => "auth_refresh_failed",
+            Self::DispatcherStatusRetrySucceeded => "dispatcher_status_retry_succeeded",
+            Self::DispatcherStatusRetryFailed => "dispatcher_status_retry_failed",
             Self::ProcessOrderedOutboxEntered => "process_ordered_outbox_entered",
             Self::ProcessOrderedOutboxCompleted => "process_ordered_outbox_completed",
             Self::ProcessOrderedOutboxFailed => "process_ordered_outbox_failed",
@@ -306,6 +316,11 @@ impl ReminderCoordinatorDiagnostic {
                 | "dispatcher_status_auth_error"
                 | "dispatcher_status_network_error"
                 | "dispatcher_status_other_error"
+                | "auth_refresh_started"
+                | "auth_refresh_succeeded"
+                | "auth_refresh_failed"
+                | "dispatcher_status_retry_succeeded"
+                | "dispatcher_status_retry_failed"
                 | "process_ordered_outbox_entered"
                 | "process_ordered_outbox_completed"
                 | "process_ordered_outbox_failed"
@@ -4432,7 +4447,58 @@ fn dispatcher_status_diagnostic(error: &AppError) -> ReminderCoordinatorDiagnost
     }
 }
 
-fn automatic_reminder_tick(database_path: &Path) -> Result<bool, AppError> {
+enum DispatcherStatusReadOutcome {
+    Initial(services::reminder_cloud::DispatcherStatus),
+    Refreshed(services::reminder_cloud::DispatcherStatus),
+}
+
+enum DispatcherStatusReadError {
+    Initial(AppError),
+    Refresh(AppError),
+    Retry(AppError),
+}
+
+impl DispatcherStatusReadError {
+    fn into_app_error(self) -> AppError {
+        match self {
+            Self::Initial(error) | Self::Refresh(error) | Self::Retry(error) => error,
+        }
+    }
+}
+
+fn read_dispatcher_status_with_single_refresh(
+    connection: &Connection,
+    protector: &dyn services::secure_store::SecretProtector,
+    transport: &mut dyn services::google::HttpTransport,
+    config: &services::supabase::SupabaseConfig,
+    session: &mut services::supabase::SupabaseSession,
+) -> Result<DispatcherStatusReadOutcome, DispatcherStatusReadError> {
+    match services::reminder_cloud::read_dispatcher_status(transport, config, session) {
+        Ok(status) => Ok(DispatcherStatusReadOutcome::Initial(status)),
+        Err(AppError::Validation(code)) if code == "CLOUD_AUTH_INVALID" => {
+            let refreshed =
+                services::supabase::refresh_session(transport, config, &session.refresh_token)
+                    .map_err(DispatcherStatusReadError::Refresh)?;
+            services::secure_store::store_supabase_session(connection, protector, &refreshed)
+                .map_err(DispatcherStatusReadError::Refresh)?;
+            *session = refreshed;
+            services::reminder_cloud::read_dispatcher_status(transport, config, session)
+                .map(DispatcherStatusReadOutcome::Refreshed)
+                .map_err(DispatcherStatusReadError::Retry)
+        }
+        Err(error) => Err(DispatcherStatusReadError::Initial(error)),
+    }
+}
+
+fn automatic_reminder_tick_with<F>(
+    database_path: &Path,
+    protector: &dyn services::secure_store::SecretProtector,
+    transport: &mut dyn services::google::HttpTransport,
+    config_loader: F,
+) -> Result<bool, AppError>
+where
+    F: FnOnce() -> Result<services::supabase::SupabaseConfig, AppError>,
+{
     let connection = Connection::open(database_path)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     match automatic_reminders_enabled(&connection) {
@@ -4464,7 +4530,7 @@ fn automatic_reminder_tick(database_path: &Path) -> Result<bool, AppError> {
         );
         return Err(error);
     }
-    let config = match supabase_config() {
+    let config = match config_loader() {
         Ok(config) => {
             record_reminder_coordinator_diagnostic(
                 database_path,
@@ -4480,8 +4546,7 @@ fn automatic_reminder_tick(database_path: &Path) -> Result<bool, AppError> {
             return Ok(false);
         }
     };
-    let protector = services::secure_store::WindowsDpapiProtector;
-    let session = match services::secure_store::read_supabase_session(&connection, &protector) {
+    let mut session = match services::secure_store::read_supabase_session(&connection, protector) {
         Ok(Some(session)) => {
             record_reminder_coordinator_diagnostic(
                 database_path,
@@ -4504,18 +4569,79 @@ fn automatic_reminder_tick(database_path: &Path) -> Result<bool, AppError> {
             return Err(error);
         }
     };
-    let mut transport = services::google::ReqwestHttpTransport;
-    let dispatcher =
-        match services::reminder_cloud::read_dispatcher_status(&mut transport, &config, &session) {
-            Ok(status) => status,
-            Err(error) => {
-                record_reminder_coordinator_diagnostic(
-                    database_path,
-                    dispatcher_status_diagnostic(&error),
-                );
-                return Ok(false);
-            }
-        };
+    let dispatcher = match read_dispatcher_status_with_single_refresh(
+        &connection,
+        protector,
+        transport,
+        &config,
+        &mut session,
+    ) {
+        Ok(DispatcherStatusReadOutcome::Initial(status)) => status,
+        Ok(DispatcherStatusReadOutcome::Refreshed(status)) => {
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::DispatcherStatusAuthError,
+            );
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::AuthRefreshStarted,
+            );
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::AuthRefreshSucceeded,
+            );
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::DispatcherStatusRetrySucceeded,
+            );
+            status
+        }
+        Err(DispatcherStatusReadError::Initial(error)) => {
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                dispatcher_status_diagnostic(&error),
+            );
+            return Ok(false);
+        }
+        Err(DispatcherStatusReadError::Refresh(_error)) => {
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::DispatcherStatusAuthError,
+            );
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::AuthRefreshStarted,
+            );
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::AuthRefreshFailed,
+            );
+            return Ok(false);
+        }
+        Err(DispatcherStatusReadError::Retry(error)) => {
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::DispatcherStatusAuthError,
+            );
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::AuthRefreshStarted,
+            );
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::AuthRefreshSucceeded,
+            );
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                ReminderCoordinatorDiagnostic::DispatcherStatusRetryFailed,
+            );
+            record_reminder_coordinator_diagnostic(
+                database_path,
+                dispatcher_status_diagnostic(&error),
+            );
+            return Ok(false);
+        }
+    };
     if dispatcher.paused {
         record_reminder_coordinator_diagnostic(
             database_path,
@@ -4533,7 +4659,7 @@ fn automatic_reminder_tick(database_path: &Path) -> Result<bool, AppError> {
     );
     match services::reminder_cloud::process_ordered_outbox(
         &connection,
-        &mut transport,
+        transport,
         &config,
         &session,
         25,
@@ -4553,6 +4679,12 @@ fn automatic_reminder_tick(database_path: &Path) -> Result<bool, AppError> {
             Err(error)
         }
     }
+}
+
+fn automatic_reminder_tick(database_path: &Path) -> Result<bool, AppError> {
+    let protector = services::secure_store::WindowsDpapiProtector;
+    let mut transport = services::google::ReqwestHttpTransport;
+    automatic_reminder_tick_with(database_path, &protector, &mut transport, supabase_config)
 }
 
 fn appointment_has_pending_reminder_outbox(
@@ -6224,22 +6356,21 @@ fn dispatcher_status(
     let connection = state.sqlite.lock().expect("sqlite mutex poisoned");
     let config = supabase_config()?;
     let protector = services::secure_store::WindowsDpapiProtector;
-    let session = services::secure_store::read_supabase_session(&connection, &protector)?
+    let mut session = services::secure_store::read_supabase_session(&connection, &protector)?
         .ok_or_else(|| AppError::Validation("CLOUD_SESSION_MISSING".to_string()))?;
     let mut transport = services::google::ReqwestHttpTransport;
-    match services::reminder_cloud::read_dispatcher_status(&mut transport, &config, &session) {
-        Ok(status) => Ok(status),
-        Err(AppError::Validation(code)) if code == "CLOUD_AUTH_INVALID" => {
-            let refreshed = services::supabase::refresh_session(
-                &mut transport,
-                &config,
-                &session.refresh_token,
-            )?;
-            services::secure_store::store_supabase_session(&connection, &protector, &refreshed)?;
-            services::reminder_cloud::read_dispatcher_status(&mut transport, &config, &refreshed)
-        }
-        Err(error) => Err(error),
-    }
+    read_dispatcher_status_with_single_refresh(
+        &connection,
+        &protector,
+        &mut transport,
+        &config,
+        &mut session,
+    )
+    .map(|outcome| match outcome {
+        DispatcherStatusReadOutcome::Initial(status)
+        | DispatcherStatusReadOutcome::Refreshed(status) => status,
+    })
+    .map_err(DispatcherStatusReadError::into_app_error)
 }
 
 #[tauri::command]
@@ -6499,6 +6630,11 @@ mod tests {
             ReminderCoordinatorDiagnostic::DispatcherStatusAuthError,
             ReminderCoordinatorDiagnostic::DispatcherStatusNetworkError,
             ReminderCoordinatorDiagnostic::DispatcherStatusOtherError,
+            ReminderCoordinatorDiagnostic::AuthRefreshStarted,
+            ReminderCoordinatorDiagnostic::AuthRefreshSucceeded,
+            ReminderCoordinatorDiagnostic::AuthRefreshFailed,
+            ReminderCoordinatorDiagnostic::DispatcherStatusRetrySucceeded,
+            ReminderCoordinatorDiagnostic::DispatcherStatusRetryFailed,
             ReminderCoordinatorDiagnostic::ProcessOrderedOutboxEntered,
             ReminderCoordinatorDiagnostic::ProcessOrderedOutboxCompleted,
             ReminderCoordinatorDiagnostic::ProcessOrderedOutboxFailed,
@@ -6534,6 +6670,11 @@ mod tests {
         assert!(content.contains("dispatcher_status_auth_error"));
         assert!(content.contains("dispatcher_status_network_error"));
         assert!(content.contains("dispatcher_status_other_error"));
+        assert!(content.contains("auth_refresh_started"));
+        assert!(content.contains("auth_refresh_succeeded"));
+        assert!(content.contains("auth_refresh_failed"));
+        assert!(content.contains("dispatcher_status_retry_succeeded"));
+        assert!(content.contains("dispatcher_status_retry_failed"));
         assert!(content.contains("process_ordered_outbox_entered"));
         assert!(content.contains("process_ordered_outbox_completed"));
         assert!(content.contains("process_ordered_outbox_failed"));
@@ -7151,6 +7292,238 @@ mod tests {
             refresh_token: "test-refresh-token".into(),
             expires_at: None,
         }
+    }
+
+    fn automatic_reminder_tick_test_setup() -> (
+        tempfile::TempDir,
+        PathBuf,
+        services::secure_store::TestProtector,
+    ) {
+        let temp = tempdir().expect("temp");
+        let database_path = reminder_coordinator_diagnostic_test_database_path(&temp);
+        fs::create_dir_all(database_path.parent().expect("database parent"))
+            .expect("create database directory");
+        let mut connection = open_database(&database_path).expect("open database");
+        connection
+            .execute(
+                "UPDATE whatsapp_settings SET automatic_reminder_enabled=1 WHERE id=1",
+                [],
+            )
+            .expect("enable automatic reminders");
+        let (mut customer, staff, service) = seed_core(&mut connection);
+        customer = update_customer_tx(
+            &mut connection,
+            &customer.id,
+            CustomerInput {
+                first_name: customer.first_name,
+                last_name: customer.last_name,
+                phone: Some("05551112233".into()),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: Some(true),
+                whatsapp_consent_confirmed: Some(true),
+            },
+        )
+        .expect("consented customer");
+        let (local_date, local_start_time) = future_local_slot(2);
+        create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id,
+                staff_id: staff.id,
+                local_date,
+                local_start_time,
+                service_ids: vec![service.id],
+                status: Some("planned".into()),
+                note: None,
+                whatsapp_reminder_enabled: Some(true),
+            },
+        )
+        .expect("pending reminder appointment");
+        let protector = services::secure_store::TestProtector;
+        services::secure_store::store_supabase_session(
+            &connection,
+            &protector,
+            &test_supabase_session(),
+        )
+        .expect("store session");
+        (temp, database_path, protector)
+    }
+
+    fn dispatcher_active_response() -> services::google::HttpResponse {
+        services::google::HttpResponse {
+            status: 200,
+            body: br#"{"data":{"paused":false}}"#.to_vec(),
+        }
+    }
+
+    fn reminder_upsert_pending_response() -> services::google::HttpResponse {
+        services::google::HttpResponse {
+            status: 200,
+            body: br#"{"data":{"revision":1,"status":"pending","remoteUpdatedAtUtc":"2026-09-14T00:00:00.000Z"}}"#.to_vec(),
+        }
+    }
+
+    #[test]
+    fn automatic_reminder_tick_uses_valid_session_without_refresh_and_processes_outbox() {
+        let (temp, database_path, protector) = automatic_reminder_tick_test_setup();
+        let mut transport = services::google::FakeHttpTransport::new(vec![
+            dispatcher_active_response(),
+            reminder_upsert_pending_response(),
+        ]);
+
+        assert!(
+            automatic_reminder_tick_with(&database_path, &protector, &mut transport, || Ok(
+                test_supabase_config()
+            ),)
+            .expect("tick")
+        );
+
+        assert_eq!(transport.requests.len(), 2);
+        assert!(!transport
+            .requests
+            .iter()
+            .any(|request| request.url.contains("grant_type=refresh_token")));
+        let diagnostic = read_reminder_coordinator_diagnostic(&temp);
+        assert!(diagnostic.contains("dispatcher_status_ok_active"));
+        assert!(diagnostic.contains("process_ordered_outbox_entered"));
+        assert!(diagnostic.contains("process_ordered_outbox_completed"));
+        assert!(!diagnostic.contains("auth_refresh_started"));
+    }
+
+    #[test]
+    fn automatic_reminder_tick_refreshes_once_then_projects_pending_outbox() {
+        let (temp, database_path, protector) = automatic_reminder_tick_test_setup();
+        let mut transport = services::google::FakeHttpTransport::new(vec![
+            services::google::HttpResponse {
+                status: 401,
+                body: Vec::new(),
+            },
+            services::google::HttpResponse {
+                status: 200,
+                body: br#"{"access_token":"refreshed-access","refresh_token":"refreshed-refresh","expires_at":1800000000}"#
+                    .to_vec(),
+            },
+            dispatcher_active_response(),
+            reminder_upsert_pending_response(),
+        ]);
+
+        assert!(
+            automatic_reminder_tick_with(&database_path, &protector, &mut transport, || Ok(
+                test_supabase_config()
+            ),)
+            .expect("refreshed tick")
+        );
+
+        assert_eq!(transport.requests.len(), 4);
+        assert_eq!(
+            transport
+                .requests
+                .iter()
+                .filter(|request| request.url.contains("grant_type=refresh_token"))
+                .count(),
+            1
+        );
+        let connection = open_database(&database_path).expect("open refreshed database");
+        let stored = services::secure_store::read_supabase_session(&connection, &protector)
+            .expect("read refreshed session")
+            .expect("stored refreshed session");
+        assert_eq!(stored.access_token, "refreshed-access");
+        let diagnostic = read_reminder_coordinator_diagnostic(&temp);
+        assert!(diagnostic.contains("dispatcher_status_auth_error"));
+        assert!(diagnostic.contains("auth_refresh_started"));
+        assert!(diagnostic.contains("auth_refresh_succeeded"));
+        assert!(diagnostic.contains("dispatcher_status_retry_succeeded"));
+        assert!(diagnostic.contains("process_ordered_outbox_completed"));
+        assert!(!diagnostic.contains("refreshed-access"));
+        assert!(!diagnostic.contains("refreshed-refresh"));
+    }
+
+    #[test]
+    fn automatic_reminder_tick_keeps_outbox_pending_when_refresh_fails() {
+        let (temp, database_path, protector) = automatic_reminder_tick_test_setup();
+        let mut transport = services::google::FakeHttpTransport::new(vec![
+            services::google::HttpResponse {
+                status: 401,
+                body: Vec::new(),
+            },
+            services::google::HttpResponse {
+                status: 401,
+                body: Vec::new(),
+            },
+        ]);
+
+        assert!(
+            !automatic_reminder_tick_with(&database_path, &protector, &mut transport, || Ok(
+                test_supabase_config()
+            ),)
+            .expect("closed tick")
+        );
+
+        assert_eq!(transport.requests.len(), 2);
+        let connection = open_database(&database_path).expect("open database");
+        let pending: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_cloud_outbox WHERE sync_status='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pending outbox");
+        assert_eq!(pending, 1);
+        let diagnostic = read_reminder_coordinator_diagnostic(&temp);
+        assert!(diagnostic.contains("auth_refresh_started"));
+        assert!(diagnostic.contains("auth_refresh_failed"));
+        assert!(!diagnostic.contains("process_ordered_outbox_entered"));
+    }
+
+    #[test]
+    fn automatic_reminder_tick_stops_after_one_refresh_when_dispatcher_retry_fails() {
+        let (temp, database_path, protector) = automatic_reminder_tick_test_setup();
+        let mut transport = services::google::FakeHttpTransport::new(vec![
+            services::google::HttpResponse {
+                status: 401,
+                body: Vec::new(),
+            },
+            services::google::HttpResponse {
+                status: 200,
+                body: br#"{"access_token":"refreshed-access","refresh_token":"refreshed-refresh","expires_at":1800000000}"#
+                    .to_vec(),
+            },
+            services::google::HttpResponse {
+                status: 401,
+                body: Vec::new(),
+            },
+        ]);
+
+        assert!(
+            !automatic_reminder_tick_with(&database_path, &protector, &mut transport, || Ok(
+                test_supabase_config()
+            ),)
+            .expect("closed retry tick")
+        );
+
+        assert_eq!(transport.requests.len(), 3);
+        assert_eq!(
+            transport
+                .requests
+                .iter()
+                .filter(|request| request.url.contains("grant_type=refresh_token"))
+                .count(),
+            1
+        );
+        let connection = open_database(&database_path).expect("open database");
+        let pending: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_cloud_outbox WHERE sync_status='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pending outbox");
+        assert_eq!(pending, 1);
+        let diagnostic = read_reminder_coordinator_diagnostic(&temp);
+        assert!(diagnostic.contains("auth_refresh_succeeded"));
+        assert!(diagnostic.contains("dispatcher_status_retry_failed"));
+        assert!(!diagnostic.contains("process_ordered_outbox_entered"));
     }
 
     #[test]
