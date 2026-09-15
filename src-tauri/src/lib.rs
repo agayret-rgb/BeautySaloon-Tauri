@@ -1405,9 +1405,7 @@ fn migrate_v15_service_pricing(connection: &Connection) -> Result<(), AppError> 
 
 fn migrate_v14_customers_phone_nullable(connection: &Connection) -> Result<(), AppError> {
     if read_schema_version(connection)? >= 14
-        || table_columns(connection, "customers")?
-            .get("phone")
-            .is_none()
+        || !table_columns(connection, "customers")?.contains("phone")
     {
         return Ok(());
     }
@@ -2838,6 +2836,7 @@ fn assert_appointment_references(
     Ok(())
 }
 
+#[cfg(test)]
 fn appointment_duration_minutes(
     connection: &Connection,
     appointment_id: &str,
@@ -2860,6 +2859,7 @@ fn appointment_duration_minutes(
     Ok(duration)
 }
 
+#[cfg(test)]
 fn appointment_interval_from_local(
     local_date: &str,
     local_start_time: &str,
@@ -3265,8 +3265,7 @@ fn list_appointment_services_batched(
     if appointment_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let placeholders = std::iter::repeat("?")
-        .take(appointment_ids.len())
+    let placeholders = std::iter::repeat_n("?", appointment_ids.len())
         .collect::<Vec<_>>()
         .join(",");
     let mut statement = connection.prepare(&format!(
@@ -3353,8 +3352,7 @@ fn load_customer_history(
     }
 
     let appointment_ids: Vec<&str> = appointments.iter().map(|(id, ..)| id.as_str()).collect();
-    let placeholders = std::iter::repeat("?")
-        .take(appointment_ids.len())
+    let placeholders = std::iter::repeat_n("?", appointment_ids.len())
         .collect::<Vec<_>>()
         .join(",");
     let mut services_statement = connection.prepare(&format!(
@@ -4180,18 +4178,38 @@ fn upsert_cloud_outbox(
         )?;
         return Ok(());
     }
-    let compact_id: Option<String> = if action == "upsert" && last_synced_revision == 0 {
+    let compact_row: Option<(String, String)> = if action == "upsert" && last_synced_revision == 0 {
         connection
             .query_row(
-                "SELECT id FROM reminder_cloud_outbox WHERE reminder_id=?1 AND revision=1 AND action='upsert' AND sync_status='pending' AND last_attempt_at_utc IS NULL",
+                "SELECT current.id, current.sync_status
+                     FROM reminder_cloud_outbox current
+                     WHERE current.reminder_id=?1
+                       AND current.revision=1
+                       AND current.action='upsert'
+                       AND (
+                         (current.sync_status='pending' AND current.last_attempt_at_utc IS NULL)
+                         OR (
+                           current.sync_status='blocked'
+                           AND current.last_error_code='REMINDER_TOO_LATE'
+                           AND NOT EXISTS (
+                             SELECT 1 FROM reminder_cloud_outbox later
+                             WHERE later.reminder_id=current.reminder_id
+                               AND later.revision>1
+                               AND NOT (
+                                 later.sync_status='pending'
+                                 AND later.last_attempt_at_utc IS NULL
+                               )
+                           )
+                         )
+                       )",
                 params![reminder_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
     } else {
         None
     };
-    let revision = if compact_id.is_some() {
+    let revision = if compact_row.is_some() {
         1
     } else {
         next_revision
@@ -4219,10 +4237,34 @@ fn upsert_cloud_outbox(
         None
     };
     let payload_hash = pseudo_hash_64(&format!("{mutation_id}:{:?}", payload_json));
-    if let Some(id) = compact_id {
+    if let Some((id, previous_sync_status)) = compact_row {
+        if previous_sync_status == "blocked" {
+            connection.execute(
+                "DELETE FROM reminder_cloud_outbox
+                 WHERE reminder_id=?1
+                   AND revision>1
+                   AND sync_status='pending'
+                   AND last_attempt_at_utc IS NULL",
+                params![reminder_id],
+            )?;
+        }
         connection.execute(
-            "UPDATE reminder_cloud_outbox SET client_mutation_id=?1, payload_json=?2, payload_hash=?3, last_error_code=NULL, updated_at_utc=?4 WHERE id=?5",
+            "UPDATE reminder_cloud_outbox
+             SET client_mutation_id=?1,
+                 payload_json=?2,
+                 payload_hash=?3,
+                 sync_status='pending',
+                 last_attempt_at_utc=NULL,
+                 last_error_code=NULL,
+                 updated_at_utc=?4
+             WHERE id=?5",
             params![mutation_id, payload_json, payload_hash, now, id],
+        )?;
+        connection.execute(
+            "UPDATE reminder_cloud_state
+             SET next_revision=2, updated_at_utc=?1
+             WHERE reminder_id=?2",
+            params![now, reminder_id],
         )?;
         return Ok(());
     }
@@ -4236,6 +4278,46 @@ fn upsert_cloud_outbox(
         params![revision + 1, now, reminder_id],
     )?;
     Ok(())
+}
+
+fn latest_nonterminal_cloud_intent(
+    connection: &Connection,
+    reminder_id: &str,
+) -> Result<Option<(String, Option<serde_json::Value>)>, AppError> {
+    let row: Option<(String, Option<String>)> = connection
+        .query_row(
+            "SELECT action, payload_json
+             FROM reminder_cloud_outbox
+             WHERE reminder_id=?1 AND sync_status IN ('pending','in_flight','synced')
+             ORDER BY revision DESC
+             LIMIT 1",
+            params![reminder_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((action, payload_json)) = row else {
+        return Ok(None);
+    };
+    if action == "cancel" {
+        return Ok(Some((action, None)));
+    }
+    let payload_json =
+        payload_json.ok_or_else(|| AppError::Database("CLOUD_PAYLOAD_MISSING".to_string()))?;
+    let mut payload: serde_json::Value = serde_json::from_str(&payload_json)
+        .map_err(|_| AppError::Database("CLOUD_PAYLOAD_INVALID".to_string()))?;
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| AppError::Database("CLOUD_PAYLOAD_INVALID".to_string()))?;
+    for key in [
+        "apiVersion",
+        "reminderId",
+        "revision",
+        "clientMutationId",
+        "reactivateCancelled",
+    ] {
+        object.remove(key);
+    }
+    Ok(Some((action, Some(payload))))
 }
 
 fn reconcile_reminder_for_appointment(
@@ -4279,6 +4361,7 @@ fn reconcile_reminder_for_appointment(
     let start_at = chrono::DateTime::parse_from_rfc3339(&start_at)
         .map_err(|_| AppError::Validation("appointment start_at invalid".to_string()))?
         .with_timezone(&Utc);
+    let appointment_start_utc = utc_iso(start_at);
     let now_utc = Utc::now();
     let eligible = start_at > now_utc
         && matches!(status.as_str(), "planned" | "confirmed")
@@ -4287,31 +4370,81 @@ fn reconcile_reminder_for_appointment(
         && reminder_enabled == 1
         && consent == 1
         && normalize_phone(phone.as_deref(), true).is_ok();
-    let existing: Option<String> = connection
+    let existing: Option<(String, String, String)> = connection
         .query_row(
-            "SELECT id FROM appointment_reminders WHERE appointment_id=?1 AND channel='whatsapp' AND reminder_type='appointment_24h'",
+            "SELECT id, scheduled_for_utc, status
+             FROM appointment_reminders
+             WHERE appointment_id=?1 AND channel='whatsapp' AND reminder_type='appointment_24h'",
             params![appointment_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
+    let latest_intent = match existing.as_ref() {
+        Some((reminder_id, _, _)) => latest_nonterminal_cloud_intent(connection, reminder_id)?,
+        None => None,
+    };
     let now = now_iso();
     if eligible {
+        if existing.as_ref().is_some_and(|(_, _, reminder_status)| {
+            matches!(
+                reminder_status.as_str(),
+                "processing" | "sent" | "failed" | "uncertain"
+            )
+        }) {
+            return Ok(false);
+        }
         let nominal_scheduled = start_at - Duration::hours(24);
-        let near_term_immediate = nominal_scheduled <= now_utc;
-        let scheduled = if near_term_immediate {
-            now_utc
-        } else {
-            nominal_scheduled
-        };
-        let scheduled = utc_iso(scheduled);
-        let reminder_id = existing.unwrap_or_else(new_uuid);
-        connection.execute(
-            "INSERT INTO appointment_reminders (id, appointment_id, scheduled_for_utc, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'pending', ?4, ?4)
-             ON CONFLICT(appointment_id, channel, reminder_type)
-             DO UPDATE SET scheduled_for_utc=excluded.scheduled_for_utc, status='pending', cancelled_at_utc=NULL, updated_at=excluded.updated_at",
-            params![reminder_id, appointment_id, scheduled, now],
-        )?;
+        let preserved_schedule = latest_intent.as_ref().and_then(|(action, payload)| {
+            if action != "upsert" {
+                return None;
+            }
+            let payload = payload.as_ref()?;
+            if payload
+                .get("appointmentStartUtc")
+                .and_then(serde_json::Value::as_str)
+                != Some(appointment_start_utc.as_str())
+            {
+                return None;
+            }
+            let scheduled = payload
+                .get("scheduledForUtc")
+                .and_then(serde_json::Value::as_str)?;
+            chrono::DateTime::parse_from_rfc3339(scheduled).ok()?;
+            let near_term = payload
+                .get("nearTermImmediate")
+                .and_then(serde_json::Value::as_bool)?;
+            Some((scheduled.to_string(), near_term))
+        });
+        let (scheduled, near_term_immediate) = preserved_schedule.unwrap_or_else(|| {
+            let near_term = nominal_scheduled <= now_utc;
+            (
+                utc_iso(if near_term {
+                    now_utc
+                } else {
+                    nominal_scheduled
+                }),
+                near_term,
+            )
+        });
+        let reminder_id = existing
+            .as_ref()
+            .map(|(id, _, _)| id.clone())
+            .unwrap_or_else(new_uuid);
+        let local_changed =
+            existing
+                .as_ref()
+                .is_none_or(|(_, previous_scheduled, previous_status)| {
+                    previous_scheduled != &scheduled || previous_status.as_str() != "pending"
+                });
+        if local_changed {
+            connection.execute(
+                "INSERT INTO appointment_reminders (id, appointment_id, scheduled_for_utc, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'pending', ?4, ?4)
+                 ON CONFLICT(appointment_id, channel, reminder_type)
+                 DO UPDATE SET scheduled_for_utc=excluded.scheduled_for_utc, status='pending', cancelled_at_utc=NULL, updated_at=excluded.updated_at",
+                params![reminder_id, appointment_id, scheduled, now],
+            )?;
+        }
         let start = start_at + Duration::minutes(ISTANBUL_OFFSET_MINUTES);
         let service_summary: String = connection.query_row(
             "SELECT group_concat(service_name_snapshot, ', ') FROM (SELECT service_name_snapshot FROM appointment_services WHERE appointment_id=?1 ORDER BY sort_order ASC)",
@@ -4323,34 +4456,53 @@ fn reconcile_reminder_for_appointment(
             normalize_phone(phone.as_deref(), true)?
                 .ok_or_else(|| AppError::Validation("phone required".to_string()))?
         );
-        upsert_cloud_outbox(
-            connection,
-            &reminder_id,
-            "upsert",
-            Some(serde_json::json!({
-                "appointmentId": appointment_id,
-                "scheduledForUtc": scheduled,
-                "nearTermImmediate": near_term_immediate,
-                "appointmentStartUtc": utc_iso(start_at),
-                "recipient": recipient,
-                "template": {
-                    "name": "randevu_hatirlatma",
-                    "language": "tr",
-                    "parameters": [
-                        format!("{} {}", first_name.trim(), last_name.trim()),
-                        start.format("%d.%m.%Y").to_string(),
-                        start.format("%H:%M").to_string(),
-                        service_summary
-                    ]
-                }
-            })),
-        )?;
+        let payload = serde_json::json!({
+            "appointmentId": appointment_id,
+            "scheduledForUtc": scheduled,
+            "nearTermImmediate": near_term_immediate,
+            "appointmentStartUtc": appointment_start_utc,
+            "recipient": recipient,
+            "template": {
+                "name": "randevu_hatirlatma",
+                "language": "tr",
+                "parameters": [
+                    format!("{} {}", first_name.trim(), last_name.trim()),
+                    start.format("%d.%m.%Y").to_string(),
+                    start.format("%H:%M").to_string(),
+                    service_summary
+                ]
+            }
+        });
+        if latest_intent
+            .as_ref()
+            .is_some_and(|(action, latest_payload)| {
+                action == "upsert" && latest_payload.as_ref() == Some(&payload)
+            })
+        {
+            return Ok(local_changed);
+        }
+        upsert_cloud_outbox(connection, &reminder_id, "upsert", Some(payload))?;
         Ok(true)
-    } else if let Some(reminder_id) = existing {
-        connection.execute(
-            "UPDATE appointment_reminders SET status='cancelled', cancelled_at_utc=?1, updated_at=?1 WHERE id=?2",
-            params![now, reminder_id],
-        )?;
+    } else if let Some((reminder_id, _, reminder_status)) = existing {
+        if matches!(
+            reminder_status.as_str(),
+            "processing" | "sent" | "failed" | "uncertain"
+        ) {
+            return Ok(false);
+        }
+        let local_changed = reminder_status != "cancelled";
+        if local_changed {
+            connection.execute(
+                "UPDATE appointment_reminders SET status='cancelled', cancelled_at_utc=?1, updated_at=?1 WHERE id=?2",
+                params![now, reminder_id],
+            )?;
+        }
+        if latest_intent
+            .as_ref()
+            .is_some_and(|(action, _)| action == "cancel")
+        {
+            return Ok(local_changed);
+        }
         upsert_cloud_outbox(connection, &reminder_id, "cancel", None)?;
         Ok(true)
     } else {
@@ -5081,7 +5233,7 @@ fn find_customers(
     status: Option<&str>,
     limit: i64,
 ) -> Result<Vec<Customer>, AppError> {
-    let status_sql = match status.as_deref().unwrap_or("active") {
+    let status_sql = match status.unwrap_or("active") {
         "inactive" => "is_active = 0",
         "all" => "1 = 1",
         _ => "is_active = 1",
@@ -5792,9 +5944,9 @@ fn google_oauth_config(
         .ok_or_else(|| AppError::Validation("GOOGLE_CONFIG_MISSING".to_string()))
 }
 
-fn safe_diagnostic(marker: &str) {
+fn safe_diagnostic(_marker: &str) {
     #[cfg(debug_assertions)]
-    eprintln!("{marker}");
+    eprintln!("{_marker}");
 }
 
 fn supabase_config() -> Result<services::supabase::SupabaseConfig, AppError> {
@@ -5892,10 +6044,10 @@ async fn google_calendar_connect(
             .calendar_id
             .clone()
             .unwrap_or_else(|| "primary".to_string());
-        let mut connection = open_database(&database_path)?;
+        let connection = open_database(&database_path)?;
         let protector = services::secure_store::WindowsDpapiProtector;
         services::secure_store::upsert_secret(
-            &mut connection,
+            &connection,
             &protector,
             "google_calendar_refresh_token",
             &token_set.refresh_token,
@@ -5993,18 +6145,11 @@ fn process_google_outbox_item(
         return Ok(false);
     }
     let result = (|| {
-        let appointment = list_appointments_between(
-            connection,
-            None,
-            None,
-            None,
-            None,
-            Some(&appointment_id),
-            1,
-        )?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::NotFound("APPOINTMENT_NOT_FOUND".to_string()))?;
+        let appointment =
+            list_appointments_between(connection, None, None, None, None, Some(appointment_id), 1)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| AppError::NotFound("APPOINTMENT_NOT_FOUND".to_string()))?;
         let google_event_id: Option<String> = connection
             .query_row(
                 "SELECT google_event_id FROM appointment_google_calendar_sync WHERE appointment_id=?1",
@@ -6016,7 +6161,7 @@ fn process_google_outbox_item(
         if let Some(event_id) = google_event_id.as_deref() {
             services::google::reject_unrelated_event_mutation(
                 connection,
-                &appointment_id,
+                appointment_id,
                 event_id,
             )?;
         }
@@ -6031,7 +6176,7 @@ fn process_google_outbox_item(
             Ok(event_id) => {
                 services::google::mark_google_outbox_synced(
                     connection,
-                    &appointment_id,
+                    appointment_id,
                     &event_id,
                     &appointment.updated_at,
                 )?;
@@ -6167,7 +6312,7 @@ fn wait_for_oauth_callback(
                 let body = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>BeautySaloon</title><style>body{font-family:system-ui,-apple-system,sans-serif;text-align:center;padding:50px;background:#faf8f5;color:#2c2523}h2{color:#386641}p{color:#6c584c}</style></head><body><h2>Google Takvim Baglantisi Basarili</h2><p>Bu sekmeyi kapatip BeautySaloon uygulamasina donebilirsiniz.</p></body></html>";
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.as_bytes().len(),
+                    body.len(),
                     body
                 );
                 let _ = stream.write_all(response.as_bytes());
@@ -6374,8 +6519,7 @@ fn dispatcher_status(
 }
 
 #[tauri::command]
-fn cloud_request_otp(email: String, state: tauri::State<'_, AppState>) -> Result<bool, AppError> {
-    drop(state);
+fn cloud_request_otp(email: String, _state: tauri::State<'_, AppState>) -> Result<bool, AppError> {
     let config = supabase_config()?;
     let mut transport = services::google::ReqwestHttpTransport;
     services::supabase::request_email_otp(&mut transport, &config, &email)?;
@@ -9881,7 +10025,7 @@ mod tests {
         .expect("appointment");
         assert_eq!(
             reconcile_all_reminders_mock(&connection).expect("reconcile"),
-            1
+            0
         );
         let outbox_count: i64 = connection
             .query_row(
@@ -10070,6 +10214,242 @@ mod tests {
             )
             .expect("no deliverable outbox item");
         assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn synced_near_term_reconcile_does_not_create_revision_churn() {
+        let (_temp, mut connection) = open_temp();
+        let (mut customer, staff, service) = seed_core(&mut connection);
+        customer = update_customer_tx(
+            &mut connection,
+            &customer.id,
+            CustomerInput {
+                first_name: customer.first_name,
+                last_name: customer.last_name,
+                phone: Some("05551112233".into()),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: Some(true),
+                whatsapp_consent_confirmed: Some(true),
+            },
+        )
+        .expect("consented customer");
+        let (local_date, local_time) = future_local_slot(2);
+        let appointment = create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id,
+                staff_id: staff.id,
+                local_date,
+                local_start_time: local_time,
+                service_ids: vec![service.id],
+                status: Some("planned".into()),
+                note: None,
+                whatsapp_reminder_enabled: Some(true),
+            },
+        )
+        .expect("near-term appointment");
+        let (reminder_id, scheduled): (String, String) = connection
+            .query_row(
+                "SELECT id, scheduled_for_utc FROM appointment_reminders WHERE appointment_id=?1",
+                params![appointment.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("reminder");
+        connection
+            .execute(
+                "UPDATE reminder_cloud_outbox SET sync_status='synced' WHERE reminder_id=?1",
+                params![reminder_id],
+            )
+            .expect("mark synced");
+        connection
+            .execute(
+                "UPDATE reminder_cloud_state SET last_synced_revision=1, next_revision=2, last_remote_revision=1, last_remote_status='pending' WHERE reminder_id=?1",
+                params![reminder_id],
+            )
+            .expect("mark state synced");
+
+        reconcile_reminder_for_appointment(&connection, &appointment.id).expect("first reconcile");
+        reconcile_reminder_for_appointment(&connection, &appointment.id).expect("second reconcile");
+
+        let (count, next_revision, scheduled_after): (i64, i64, String) = connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM reminder_cloud_outbox WHERE reminder_id=?1),
+                   (SELECT next_revision FROM reminder_cloud_state WHERE reminder_id=?1),
+                   (SELECT scheduled_for_utc FROM appointment_reminders WHERE id=?1)",
+                params![reminder_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("stable projection state");
+        assert_eq!(count, 1);
+        assert_eq!(next_revision, 2);
+        assert_eq!(scheduled_after, scheduled);
+    }
+
+    #[test]
+    fn synced_cancel_reconcile_does_not_create_revision_churn() {
+        let (_temp, mut connection) = open_temp();
+        let (mut customer, staff, service) = seed_core(&mut connection);
+        customer = update_customer_tx(
+            &mut connection,
+            &customer.id,
+            CustomerInput {
+                first_name: customer.first_name,
+                last_name: customer.last_name,
+                phone: Some("05551112233".into()),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: Some(true),
+                whatsapp_consent_confirmed: Some(true),
+            },
+        )
+        .expect("consented customer");
+        let (local_date, local_time) = future_local_slot(26);
+        let appointment = create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id,
+                staff_id: staff.id,
+                local_date,
+                local_start_time: local_time,
+                service_ids: vec![service.id],
+                status: Some("planned".into()),
+                note: None,
+                whatsapp_reminder_enabled: Some(true),
+            },
+        )
+        .expect("appointment");
+        let reminder_id: String = connection
+            .query_row(
+                "SELECT id FROM appointment_reminders WHERE appointment_id=?1",
+                params![appointment.id],
+                |row| row.get(0),
+            )
+            .expect("reminder");
+        connection
+            .execute(
+                "UPDATE reminder_cloud_outbox SET sync_status='synced' WHERE reminder_id=?1",
+                params![reminder_id],
+            )
+            .expect("sync upsert");
+        connection
+            .execute(
+                "UPDATE reminder_cloud_state SET last_synced_revision=1, next_revision=2 WHERE reminder_id=?1",
+                params![reminder_id],
+            )
+            .expect("sync state");
+        connection
+            .execute(
+                "UPDATE appointments SET status='cancelled' WHERE id=?1",
+                params![appointment.id],
+            )
+            .expect("cancel appointment");
+
+        reconcile_reminder_for_appointment(&connection, &appointment.id).expect("enqueue cancel");
+        connection
+            .execute(
+                "UPDATE reminder_cloud_outbox SET sync_status='synced' WHERE reminder_id=?1 AND action='cancel'",
+                params![reminder_id],
+            )
+            .expect("sync cancel");
+        connection
+            .execute(
+                "UPDATE reminder_cloud_state SET last_synced_revision=2, next_revision=3 WHERE reminder_id=?1",
+                params![reminder_id],
+            )
+            .expect("sync cancel state");
+
+        reconcile_reminder_for_appointment(&connection, &appointment.id).expect("repeat reconcile");
+
+        let (count, next_revision): (i64, i64) = connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM reminder_cloud_outbox WHERE reminder_id=?1),
+                   (SELECT next_revision FROM reminder_cloud_state WHERE reminder_id=?1)",
+                params![reminder_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("stable cancel state");
+        assert_eq!(count, 2);
+        assert_eq!(next_revision, 3);
+    }
+
+    #[test]
+    fn sent_reminder_is_not_reset_or_reprojected_by_reconcile() {
+        let (_temp, mut connection) = open_temp();
+        let (mut customer, staff, service) = seed_core(&mut connection);
+        customer = update_customer_tx(
+            &mut connection,
+            &customer.id,
+            CustomerInput {
+                first_name: customer.first_name,
+                last_name: customer.last_name,
+                phone: Some("05551112233".into()),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: Some(true),
+                whatsapp_consent_confirmed: Some(true),
+            },
+        )
+        .expect("consented customer");
+        let (local_date, local_time) = future_local_slot(2);
+        let appointment = create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id,
+                staff_id: staff.id,
+                local_date,
+                local_start_time: local_time,
+                service_ids: vec![service.id],
+                status: Some("planned".into()),
+                note: None,
+                whatsapp_reminder_enabled: Some(true),
+            },
+        )
+        .expect("appointment");
+        let reminder_id: String = connection
+            .query_row(
+                "SELECT id FROM appointment_reminders WHERE appointment_id=?1",
+                params![appointment.id],
+                |row| row.get(0),
+            )
+            .expect("reminder");
+        connection
+            .execute(
+                "UPDATE reminder_cloud_outbox SET sync_status='synced' WHERE reminder_id=?1",
+                params![reminder_id],
+            )
+            .expect("sync upsert");
+        connection
+            .execute(
+                "UPDATE reminder_cloud_state SET last_synced_revision=1, next_revision=2, last_remote_revision=1, last_remote_status='sent' WHERE reminder_id=?1",
+                params![reminder_id],
+            )
+            .expect("remote sent");
+        connection
+            .execute(
+                "UPDATE appointment_reminders SET status='sent', sent_at_utc=?1 WHERE id=?2",
+                params![now_iso(), reminder_id],
+            )
+            .expect("local sent");
+
+        let changed = reconcile_reminder_for_appointment(&connection, &appointment.id)
+            .expect("reconcile sent reminder");
+        assert!(!changed);
+        let (status, count, next_revision): (String, i64, i64) = connection
+            .query_row(
+                "SELECT
+                   (SELECT status FROM appointment_reminders WHERE id=?1),
+                   (SELECT COUNT(*) FROM reminder_cloud_outbox WHERE reminder_id=?1),
+                   (SELECT next_revision FROM reminder_cloud_state WHERE reminder_id=?1)",
+                params![reminder_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("sent state stable");
+        assert_eq!(status, "sent");
+        assert_eq!(count, 1);
+        assert_eq!(next_revision, 2);
     }
 
     #[test]
@@ -10511,7 +10891,7 @@ mod tests {
         )
         .expect("create");
         services::google::mark_google_outbox_synced(
-            &mut connection,
+            &connection,
             &appointment.id,
             &created_id,
             &appointment.start_at_utc,
@@ -10704,6 +11084,449 @@ mod tests {
             )
             .expect("status");
         assert_eq!(local_status, "sent");
+    }
+
+    #[test]
+    fn reminder_too_late_is_terminal_for_item_but_does_not_poison_other_reminders() {
+        let (_temp, mut connection) = open_temp();
+        let (mut customer, staff, service) = seed_core(&mut connection);
+        customer = update_customer_tx(
+            &mut connection,
+            &customer.id,
+            CustomerInput {
+                first_name: customer.first_name,
+                last_name: customer.last_name,
+                phone: Some("05551112233".into()),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: Some(true),
+                whatsapp_consent_confirmed: Some(true),
+            },
+        )
+        .expect("customer");
+
+        for hours in [48, 72] {
+            let (local_date, local_start_time) = future_local_slot(hours);
+            create_appointment_tx(
+                &mut connection,
+                AppointmentInput {
+                    customer_id: customer.id.clone(),
+                    staff_id: staff.id.clone(),
+                    local_date,
+                    local_start_time,
+                    service_ids: vec![service.id.clone()],
+                    status: Some("confirmed".into()),
+                    note: None,
+                    whatsapp_reminder_enabled: Some(true),
+                },
+            )
+            .expect("appointment");
+        }
+
+        let ordered_ids = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id
+                     FROM reminder_cloud_outbox
+                     WHERE sync_status='pending'
+                     ORDER BY created_at_utc ASC, reminder_id ASC, revision ASC",
+                )
+                .expect("prepare");
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("ids")
+        };
+        assert_eq!(ordered_ids.len(), 2);
+
+        let config = services::supabase::SupabaseConfig {
+            project_url: "https://example.supabase.co".into(),
+            publishable_key: "pub-key-with-enough-length".into(),
+        };
+        let session = services::supabase::SupabaseSession {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: None,
+        };
+        let mut transport = services::google::FakeHttpTransport::new(vec![
+            services::google::HttpResponse {
+                status: 422,
+                body: br#"{"ok":false,"error":{"code":"REMINDER_TOO_LATE"}}"#.to_vec(),
+            },
+            services::google::HttpResponse {
+                status: 200,
+                body: br#"{"ok":true,"data":{"revision":1,"status":"pending"}}"#.to_vec(),
+            },
+        ]);
+
+        let result = services::reminder_cloud::process_ordered_outbox(
+            &connection,
+            &mut transport,
+            &config,
+            &session,
+            10,
+        )
+        .expect("process");
+
+        assert_eq!(result.blocked, 1);
+        assert_eq!(result.processed, 1);
+        assert!(!result.unauthorized);
+        assert_eq!(transport.requests.len(), 2);
+
+        let first: (String, Option<String>) = connection
+            .query_row(
+                "SELECT sync_status, last_error_code FROM reminder_cloud_outbox WHERE id=?1",
+                params![&ordered_ids[0]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("first");
+        assert_eq!(first.0, "blocked");
+        assert_eq!(first.1.as_deref(), Some("REMINDER_TOO_LATE"));
+
+        let second_status: String = connection
+            .query_row(
+                "SELECT sync_status FROM reminder_cloud_outbox WHERE id=?1",
+                params![&ordered_ids[1]],
+                |row| row.get(0),
+            )
+            .expect("second");
+        assert_eq!(second_status, "synced");
+    }
+
+    #[test]
+    fn reminder_terminal_cancel_is_blocked_without_poisoning_other_reminders() {
+        let (_temp, mut connection) = open_temp();
+        let (mut customer, staff, service) = seed_core(&mut connection);
+        customer = update_customer_tx(
+            &mut connection,
+            &customer.id,
+            CustomerInput {
+                first_name: customer.first_name,
+                last_name: customer.last_name,
+                phone: Some("05551112233".into()),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: Some(true),
+                whatsapp_consent_confirmed: Some(true),
+            },
+        )
+        .expect("customer");
+
+        let (first_date, first_time) = future_local_slot(48);
+        let first_appointment = create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id.clone(),
+                staff_id: staff.id.clone(),
+                local_date: first_date,
+                local_start_time: first_time,
+                service_ids: vec![service.id.clone()],
+                status: Some("confirmed".into()),
+                note: None,
+                whatsapp_reminder_enabled: Some(true),
+            },
+        )
+        .expect("first appointment");
+        let first_outbox_id: String = connection
+            .query_row(
+                "SELECT o.id
+                 FROM reminder_cloud_outbox o
+                 INNER JOIN appointment_reminders r ON r.id=o.reminder_id
+                 WHERE r.appointment_id=?1",
+                params![first_appointment.id],
+                |row| row.get(0),
+            )
+            .expect("first outbox");
+        connection
+            .execute(
+                "UPDATE reminder_cloud_outbox
+                 SET action='cancel', payload_json=NULL, created_at_utc='2000-01-01T00:00:00.000Z'
+                 WHERE id=?1",
+                params![first_outbox_id],
+            )
+            .expect("make terminal cancel first");
+
+        let (second_date, second_time) = future_local_slot(72);
+        create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id,
+                staff_id: staff.id,
+                local_date: second_date,
+                local_start_time: second_time,
+                service_ids: vec![service.id],
+                status: Some("confirmed".into()),
+                note: None,
+                whatsapp_reminder_enabled: Some(true),
+            },
+        )
+        .expect("second appointment");
+
+        let ordered_rows = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, action
+                     FROM reminder_cloud_outbox
+                     WHERE sync_status='pending'
+                     ORDER BY created_at_utc ASC, reminder_id ASC, revision ASC",
+                )
+                .expect("prepare");
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("rows")
+        };
+        assert_eq!(ordered_rows.len(), 2);
+        assert_eq!(ordered_rows[0].0, first_outbox_id);
+        assert_eq!(ordered_rows[0].1, "cancel");
+        assert_eq!(ordered_rows[1].1, "upsert");
+
+        let config = services::supabase::SupabaseConfig {
+            project_url: "https://example.supabase.co".into(),
+            publishable_key: "pub-key-with-enough-length".into(),
+        };
+        let session = services::supabase::SupabaseSession {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: None,
+        };
+        let mut transport = services::google::FakeHttpTransport::new(vec![
+            services::google::HttpResponse {
+                status: 409,
+                body: br#"{"ok":false,"error":{"code":"REMINDER_TERMINAL"}}"#.to_vec(),
+            },
+            services::google::HttpResponse {
+                status: 200,
+                body: br#"{"ok":true,"data":{"revision":1,"status":"pending"}}"#.to_vec(),
+            },
+        ]);
+
+        let result = services::reminder_cloud::process_ordered_outbox(
+            &connection,
+            &mut transport,
+            &config,
+            &session,
+            10,
+        )
+        .expect("process");
+
+        assert_eq!(result.blocked, 1);
+        assert_eq!(result.processed, 1);
+        assert_eq!(transport.requests.len(), 2);
+
+        let first: (String, Option<String>) = connection
+            .query_row(
+                "SELECT sync_status, last_error_code FROM reminder_cloud_outbox WHERE id=?1",
+                params![&ordered_rows[0].0],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("first");
+        assert_eq!(first.0, "blocked");
+        assert_eq!(first.1.as_deref(), Some("REMINDER_TERMINAL"));
+
+        let second_status: String = connection
+            .query_row(
+                "SELECT sync_status FROM reminder_cloud_outbox WHERE id=?1",
+                params![&ordered_rows[1].0],
+                |row| row.get(0),
+            )
+            .expect("second");
+        assert_eq!(second_status, "synced");
+    }
+
+    #[test]
+    fn cloud_auth_failure_remains_retryable_in_outbox() {
+        let (_temp, mut connection) = open_temp();
+        let (mut customer, staff, service) = seed_core(&mut connection);
+        customer = update_customer_tx(
+            &mut connection,
+            &customer.id,
+            CustomerInput {
+                first_name: customer.first_name,
+                last_name: customer.last_name,
+                phone: Some("05551112233".into()),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: Some(true),
+                whatsapp_consent_confirmed: Some(true),
+            },
+        )
+        .expect("customer");
+        let (local_date, local_start_time) = future_local_slot(48);
+        let appointment = create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id,
+                staff_id: staff.id,
+                local_date,
+                local_start_time,
+                service_ids: vec![service.id],
+                status: Some("confirmed".into()),
+                note: None,
+                whatsapp_reminder_enabled: Some(true),
+            },
+        )
+        .expect("appointment");
+        let outbox_id: String = connection
+            .query_row(
+                "SELECT o.id
+                 FROM reminder_cloud_outbox o
+                 INNER JOIN appointment_reminders r ON r.id=o.reminder_id
+                 WHERE r.appointment_id=?1",
+                params![appointment.id],
+                |row| row.get(0),
+            )
+            .expect("outbox");
+
+        let config = services::supabase::SupabaseConfig {
+            project_url: "https://example.supabase.co".into(),
+            publishable_key: "pub-key-with-enough-length".into(),
+        };
+        let session = services::supabase::SupabaseSession {
+            access_token: "expired".into(),
+            refresh_token: "refresh".into(),
+            expires_at: None,
+        };
+        let mut transport =
+            services::google::FakeHttpTransport::new(vec![services::google::HttpResponse {
+                status: 401,
+                body: br#"{"ok":false,"error":{"code":"AUTH_INVALID"}}"#.to_vec(),
+            }]);
+
+        let result = services::reminder_cloud::process_outbox_item(
+            &connection,
+            &mut transport,
+            &config,
+            &session,
+            &outbox_id,
+        )
+        .expect("process");
+
+        assert!(result.unauthorized);
+        assert_eq!(result.blocked, 0);
+        assert_eq!(result.processed, 0);
+        let state: (String, Option<String>) = connection
+            .query_row(
+                "SELECT sync_status, last_error_code FROM reminder_cloud_outbox WHERE id=?1",
+                params![outbox_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("state");
+        assert_eq!(state.0, "pending");
+        assert_eq!(state.1.as_deref(), Some("CLOUD_AUTH_INVALID"));
+    }
+
+    #[test]
+    fn unsynced_reminder_too_late_revision_one_can_be_recycled_safely() {
+        let (_temp, mut connection) = open_temp();
+        let (mut customer, staff, service) = seed_core(&mut connection);
+        customer = update_customer_tx(
+            &mut connection,
+            &customer.id,
+            CustomerInput {
+                first_name: customer.first_name,
+                last_name: customer.last_name,
+                phone: Some("05551112233".into()),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: Some(true),
+                whatsapp_consent_confirmed: Some(true),
+            },
+        )
+        .expect("customer");
+        let (local_date, local_start_time) = future_local_slot(48);
+        let appointment = create_appointment_tx(
+            &mut connection,
+            AppointmentInput {
+                customer_id: customer.id,
+                staff_id: staff.id,
+                local_date,
+                local_start_time,
+                service_ids: vec![service.id],
+                status: Some("confirmed".into()),
+                note: None,
+                whatsapp_reminder_enabled: Some(true),
+            },
+        )
+        .expect("appointment");
+        let reminder_id: String = connection
+            .query_row(
+                "SELECT id FROM appointment_reminders WHERE appointment_id=?1",
+                params![appointment.id],
+                |row| row.get(0),
+            )
+            .expect("reminder");
+        let original_outbox_id: String = connection
+            .query_row(
+                "SELECT id FROM reminder_cloud_outbox WHERE reminder_id=?1 AND revision=1",
+                params![reminder_id],
+                |row| row.get(0),
+            )
+            .expect("outbox");
+
+        connection
+            .execute(
+                "UPDATE reminder_cloud_outbox
+                 SET sync_status='blocked',
+                     last_attempt_at_utc=?1,
+                     last_error_code='REMINDER_TOO_LATE'
+                 WHERE id=?2",
+                params![now_iso(), original_outbox_id],
+            )
+            .expect("block");
+        connection
+            .execute(
+                "UPDATE reminder_cloud_state SET next_revision=3 WHERE reminder_id=?1",
+                params![reminder_id],
+            )
+            .expect("advance");
+
+        reconcile_reminder_for_appointment(&connection, &appointment.id).expect("reconcile");
+
+        let rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_cloud_outbox WHERE reminder_id=?1",
+                params![reminder_id],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(rows, 1);
+
+        let recycled: (String, i64, String, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT id, revision, sync_status, last_attempt_at_utc, last_error_code
+                 FROM reminder_cloud_outbox
+                 WHERE reminder_id=?1",
+                params![reminder_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("recycled");
+        assert_eq!(recycled.0, original_outbox_id);
+        assert_eq!(recycled.1, 1);
+        assert_eq!(recycled.2, "pending");
+        assert!(recycled.3.is_none());
+        assert!(recycled.4.is_none());
+
+        let next_revision: i64 = connection
+            .query_row(
+                "SELECT next_revision FROM reminder_cloud_state WHERE reminder_id=?1",
+                params![reminder_id],
+                |row| row.get(0),
+            )
+            .expect("next revision");
+        assert_eq!(next_revision, 2);
     }
 
     #[test]
@@ -12181,11 +13004,10 @@ mod tests {
         let archived = archive_customer(&mut connection, &customer.id).expect("archive customer");
         assert!(!archived.is_active);
         assert!(
-            get_customer(&connection, &customer.id)
+            !get_customer(&connection, &customer.id)
                 .expect("customer detail")
                 .expect("customer preserved")
                 .is_active
-                == false
         );
         assert!(customer_search_for_test(&connection, "ayse", "active")
             .expect("active customer list")

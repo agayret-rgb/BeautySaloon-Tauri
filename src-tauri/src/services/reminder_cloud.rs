@@ -110,6 +110,16 @@ fn sanitize_pause_reason(value: &str) -> Result<String, AppError> {
     Ok(value.to_string())
 }
 
+fn safe_cloud_error_code_from_body(body: &[u8]) -> Option<&'static str> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let code = value.get("error")?.get("code")?.as_str()?;
+    match code {
+        "REMINDER_TOO_LATE" => Some("REMINDER_TOO_LATE"),
+        "REMINDER_TERMINAL" => Some("REMINDER_TERMINAL"),
+        _ => None,
+    }
+}
+
 pub fn invoke_function(
     transport: &mut dyn HttpTransport,
     config: &SupabaseConfig,
@@ -136,7 +146,13 @@ pub fn invoke_function(
         500..=599 => Err(AppError::Database(
             "CLOUD_TEMPORARILY_UNAVAILABLE".to_string(),
         )),
-        _ => Err(AppError::Database("CLOUD_OPERATION_FAILED".to_string())),
+        _ => {
+            if let Some(code) = safe_cloud_error_code_from_body(&response.body) {
+                Err(AppError::Database(code.to_string()))
+            } else {
+                Err(AppError::Database("CLOUD_OPERATION_FAILED".to_string()))
+            }
+        }
     }
 }
 
@@ -288,13 +304,39 @@ pub(crate) fn process_outbox_item(
             status.processed += 1;
         }
         Err(AppError::Validation(code)) if code == "CLOUD_AUTH_INVALID" => {
-            connection.execute("UPDATE reminder_cloud_outbox SET sync_status='blocked', last_error_code=?1 WHERE id=?2", params![code, id])?;
+            connection.execute(
+                "UPDATE reminder_cloud_outbox
+                 SET sync_status='pending',
+                     last_error_code='CLOUD_AUTH_INVALID',
+                     updated_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id=?1",
+                params![id],
+            )?;
             status.unauthorized = true;
+        }
+        Err(AppError::Database(code))
+            if matches!(code.as_str(), "REMINDER_TOO_LATE" | "REMINDER_TERMINAL") =>
+        {
+            connection.execute(
+                "UPDATE reminder_cloud_outbox
+                 SET sync_status='blocked',
+                     last_error_code=?1,
+                     updated_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id=?2",
+                params![code, id],
+            )?;
             status.blocked += 1;
         }
         Err(error) => {
             let code = error.to_string();
-            connection.execute("UPDATE reminder_cloud_outbox SET sync_status='pending', last_error_code=?1 WHERE id=?2", params![code, id])?;
+            connection.execute(
+                "UPDATE reminder_cloud_outbox
+                 SET sync_status='pending',
+                     last_error_code=?1,
+                     updated_at_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id=?2",
+                params![code, id],
+            )?;
         }
     }
     Ok(status)
