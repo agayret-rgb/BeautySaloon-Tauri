@@ -2245,7 +2245,7 @@ fn create_customer_tx(
     let email = optional_text(input.email, 254)?;
     let notes = optional_text(input.notes, 2000)?;
     let now = now_iso();
-    let consent = input.whatsapp_consent_confirmed.unwrap_or(false);
+    let consent = input.whatsapp_consent_confirmed.unwrap_or(true);
     let id = new_uuid();
     let tx = connection.transaction()?;
     tx.execute(
@@ -2289,7 +2289,12 @@ fn update_customer_tx(
     let email = optional_text(input.email, 254)?;
     let notes = optional_text(input.notes, 2000)?;
     let now = now_iso();
-    let consent = input.whatsapp_consent_confirmed.unwrap_or(false);
+    let reminder_enabled = input
+        .whatsapp_reminder_enabled
+        .unwrap_or(existing.whatsapp_reminder_enabled);
+    let consent = input
+        .whatsapp_consent_confirmed
+        .unwrap_or(existing.whatsapp_consent_confirmed);
     let mut changed_fields = Vec::new();
     if existing.first_name != first_name {
         changed_fields.push("first_name");
@@ -2306,7 +2311,7 @@ fn update_customer_tx(
     if existing.notes != notes {
         changed_fields.push("notes");
     }
-    if existing.whatsapp_reminder_enabled != input.whatsapp_reminder_enabled.unwrap_or(true) {
+    if existing.whatsapp_reminder_enabled != reminder_enabled {
         changed_fields.push("whatsapp_reminder_enabled");
     }
     if existing.whatsapp_consent_confirmed != consent {
@@ -2318,7 +2323,7 @@ fn update_customer_tx(
     let tx = connection.transaction()?;
     tx.execute(
         "UPDATE customers SET first_name=?1,last_name=?2,phone=?3,email=?4,whatsapp_reminder_enabled=?5,whatsapp_consent_confirmed=?6,whatsapp_consent_recorded_at=CASE WHEN ?6 = 1 THEN COALESCE(whatsapp_consent_recorded_at, ?7) ELSE NULL END,notes=?8,updated_at=?7 WHERE id=?9",
-        params![first_name,last_name,phone,email,bool_to_i64(input.whatsapp_reminder_enabled.unwrap_or(true)),bool_to_i64(consent),now,notes,id],
+        params![first_name,last_name,phone,email,bool_to_i64(reminder_enabled),bool_to_i64(consent),now,notes,id],
     )
     .map_err(map_customer_phone_conflict)?;
     append_audit_event(
@@ -9053,6 +9058,77 @@ mod tests {
         let inactive =
             customer_set_active_for_test(&connection, &customer.id, false).expect("inactive");
         assert!(!inactive.is_active);
+    }
+
+    #[test]
+    fn customer_whatsapp_defaults_and_optional_updates_preserve_existing_values() {
+        let (_temp, mut connection) = open_temp();
+        let customer = create_customer_tx(
+            &mut connection,
+            CustomerInput {
+                first_name: "Yeni".into(),
+                last_name: "Musteri".into(),
+                phone: Some("05553334455".into()),
+                email: None,
+                notes: None,
+                whatsapp_reminder_enabled: None,
+                whatsapp_consent_confirmed: None,
+            },
+        )
+        .expect("create with defaults");
+        assert!(customer.whatsapp_reminder_enabled);
+        assert!(customer.whatsapp_consent_confirmed);
+
+        let preserved = update_customer_tx(
+            &mut connection,
+            &customer.id,
+            CustomerInput {
+                first_name: customer.first_name.clone(),
+                last_name: customer.last_name.clone(),
+                phone: customer.phone.clone(),
+                email: customer.email.clone(),
+                notes: customer.notes.clone(),
+                whatsapp_reminder_enabled: None,
+                whatsapp_consent_confirmed: None,
+            },
+        )
+        .expect("preserve optional values");
+        assert!(preserved.whatsapp_reminder_enabled);
+        assert!(preserved.whatsapp_consent_confirmed);
+
+        let disabled = update_customer_tx(
+            &mut connection,
+            &customer.id,
+            CustomerInput {
+                first_name: customer.first_name.clone(),
+                last_name: customer.last_name.clone(),
+                phone: customer.phone.clone(),
+                email: customer.email.clone(),
+                notes: customer.notes.clone(),
+                whatsapp_reminder_enabled: Some(false),
+                whatsapp_consent_confirmed: Some(false),
+            },
+        )
+        .expect("save explicit opt-out");
+        assert!(!disabled.whatsapp_reminder_enabled);
+        assert!(!disabled.whatsapp_consent_confirmed);
+
+        let preserved_opt_out = update_customer_tx(
+            &mut connection,
+            &customer.id,
+            CustomerInput {
+                first_name: customer.first_name,
+                last_name: customer.last_name,
+                phone: customer.phone,
+                email: customer.email,
+                notes: customer.notes,
+                whatsapp_reminder_enabled: None,
+                whatsapp_consent_confirmed: None,
+            },
+        )
+        .expect("preserve explicit opt-out");
+        assert!(!preserved_opt_out.whatsapp_reminder_enabled);
+        assert!(!preserved_opt_out.whatsapp_consent_confirmed);
     }
 
     #[test]

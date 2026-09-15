@@ -532,7 +532,11 @@ describe("New appointment flow", () => {
     fireEvent.click(screen.getByRole("button", { name: "Randevuyu Kaydet" }));
     await waitFor(() =>
       expect(api.createCustomer).toHaveBeenCalledWith(
-        expect.objectContaining({ phone: null }),
+        expect.objectContaining({
+          phone: null,
+          whatsappReminderEnabled: true,
+          whatsappConsentConfirmed: true,
+        }),
       ),
     );
     await waitFor(() =>
@@ -1172,6 +1176,12 @@ describe("Customer list, history and repeat booking", () => {
     api.createCustomer.mockResolvedValue(created);
     await openCustomers();
     fireEvent.click(screen.getByRole("button", { name: "Yeni Müşteri" }));
+    expect(
+      screen.getByRole("checkbox", { name: "WhatsApp hatırlatmaları" }),
+    ).toBeChecked();
+    expect(
+      screen.getByRole("checkbox", { name: "WhatsApp onayı alındı" }),
+    ).toBeChecked();
     fireEvent.change(screen.getByLabelText("Müşteri adı"), {
       target: { value: "Deniz" },
     });
@@ -1189,6 +1199,8 @@ describe("Customer list, history and repeat booking", () => {
           lastName: "Kaya",
           phone: null,
           notes: "Yeni not",
+          whatsappReminderEnabled: true,
+          whatsappConsentConfirmed: true,
         }),
       ),
     );
@@ -1239,6 +1251,42 @@ describe("Customer list, history and repeat booking", () => {
       expect(api.updateCustomer).toHaveBeenCalledWith(
         "customer-1",
         expect.objectContaining({ phone: null, notes: null }),
+      ),
+    );
+  });
+
+  it("loads and saves customer WhatsApp preferences", async () => {
+    const updated = {
+      ...existingCustomer,
+      whatsappReminderEnabled: false,
+      whatsappConsentConfirmed: true,
+    };
+    api.updateCustomer.mockResolvedValue(updated);
+    await openCustomers();
+    fireEvent.click(await screen.findByRole("button", { name: /Ayşe Yılmaz/ }));
+    await screen.findByRole("heading", { name: "Randevu Geçmişi" });
+    fireEvent.click(screen.getByRole("button", { name: "Düzenle" }));
+
+    const reminder = screen.getByRole("checkbox", {
+      name: "WhatsApp hatırlatmaları",
+    });
+    const consent = screen.getByRole("checkbox", {
+      name: "WhatsApp onayı alındı",
+    });
+    expect(reminder).toBeChecked();
+    expect(consent).not.toBeChecked();
+
+    fireEvent.click(reminder);
+    fireEvent.click(consent);
+    fireEvent.click(screen.getByRole("button", { name: "Müşteriyi Güncelle" }));
+
+    await waitFor(() =>
+      expect(api.updateCustomer).toHaveBeenCalledWith(
+        "customer-1",
+        expect.objectContaining({
+          whatsappReminderEnabled: false,
+          whatsappConsentConfirmed: true,
+        }),
       ),
     );
   });

@@ -390,6 +390,10 @@ export function App() {
   const [customerLastName, setCustomerLastName] = useState("");
   const [customerFormPhone, setCustomerFormPhone] = useState("");
   const [customerNotes, setCustomerNotes] = useState("");
+  const [customerWhatsappReminderEnabled, setCustomerWhatsappReminderEnabled] =
+    useState(true);
+  const [customerWhatsappConsentConfirmed, setCustomerWhatsappConsentConfirmed] =
+    useState(true);
   const [customerFormError, setCustomerFormError] = useState("");
   const [customerFormSaving, setCustomerFormSaving] = useState(false);
   const [bookingOpen, setBookingOpen] = useState(false);
@@ -1046,6 +1050,8 @@ export function App() {
     setCustomerLastName("");
     setCustomerFormPhone("");
     setCustomerNotes("");
+    setCustomerWhatsappReminderEnabled(true);
+    setCustomerWhatsappConsentConfirmed(true);
     setCustomerFormError("");
   }, []);
 
@@ -1056,6 +1062,8 @@ export function App() {
     setCustomerLastName(customer.lastName);
     setCustomerFormPhone(customer.phone ?? "");
     setCustomerNotes(customer.notes ?? "");
+    setCustomerWhatsappReminderEnabled(customer.whatsappReminderEnabled);
+    setCustomerWhatsappConsentConfirmed(customer.whatsappConsentConfirmed);
     setCustomerFormError("");
   }, []);
 
@@ -1072,16 +1080,13 @@ export function App() {
       lastName: customerLastName.trim(),
       phone: customerFormPhone.trim() || null,
       notes: customerNotes.trim() || null,
+      whatsappReminderEnabled: customerWhatsappReminderEnabled,
+      whatsappConsentConfirmed: customerWhatsappConsentConfirmed,
       ...(editingCustomer
         ? {
             email: editingCustomer.email,
-            whatsappReminderEnabled: editingCustomer.whatsappReminderEnabled,
-            whatsappConsentConfirmed: editingCustomer.whatsappConsentConfirmed,
           }
-        : {
-            whatsappReminderEnabled: true,
-            whatsappConsentConfirmed: false,
-          }),
+        : {}),
     };
     try {
       const saved = editingCustomer
@@ -1109,6 +1114,8 @@ export function App() {
     customerHistory?.customer.customerId,
     customerLastName,
     customerNotes,
+    customerWhatsappConsentConfirmed,
+    customerWhatsappReminderEnabled,
     editingCustomer,
     loadCustomerHistory,
     loadCustomers,
@@ -1135,7 +1142,8 @@ export function App() {
           firstName: nameParts[0],
           lastName: nameParts.slice(1).join(" "),
           phone: phone.trim() || null,
-          whatsappConsentConfirmed: whatsappConsent,
+          whatsappReminderEnabled: true,
+          whatsappConsentConfirmed: true,
         });
         setSelectedCustomer(customer);
       }
@@ -1174,7 +1182,6 @@ export function App() {
     localDate,
     localStartTime,
     phone,
-    whatsappConsent,
     whatsappReminderEnabled,
     resetBooking,
     selectedCustomer,
@@ -3163,6 +3170,28 @@ export function App() {
                           disabled={customerFormSaving}
                           onChange={(event) => setCustomerNotes(event.target.value)}
                         />
+                      </label>
+                      <label className="archive-filter">
+                        <input
+                          type="checkbox"
+                          checked={customerWhatsappReminderEnabled}
+                          disabled={customerFormSaving}
+                          onChange={(event) =>
+                            setCustomerWhatsappReminderEnabled(event.target.checked)
+                          }
+                        />{" "}
+                        WhatsApp hatırlatmaları
+                      </label>
+                      <label className="archive-filter">
+                        <input
+                          type="checkbox"
+                          checked={customerWhatsappConsentConfirmed}
+                          disabled={customerFormSaving}
+                          onChange={(event) =>
+                            setCustomerWhatsappConsentConfirmed(event.target.checked)
+                          }
+                        />{" "}
+                        WhatsApp onayı alındı
                       </label>
                     </div>
                     {customerFormError && (
